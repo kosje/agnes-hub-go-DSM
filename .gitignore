@@ -13,6 +13,9 @@ data/
 .probe/
 __pycache__/
 
+# NAS 口令（tools/deploy_nas.py 会读它，绝不提交）
+.nas_pass
+
 # fpk 构建产物（由 tools/build_fpk.py 生成，图标源文件在 assets/）
 fpk-bundle/
 dist/
