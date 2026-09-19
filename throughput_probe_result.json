@@ -1,0 +1,206 @@
+{
+  "min_interval": 2.8,
+  "batch_size": 6,
+  "results": [
+    {
+      "tag": "A1-seq-1acc-fast",
+      "accounts": 1,
+      "exec_sec": 0.3,
+      "mode": "seq",
+      "affinity": "session_then_key",
+      "elapsed_s": 16.98,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "A2-seq-2acc-fast",
+      "accounts": 2,
+      "exec_sec": 0.3,
+      "mode": "seq",
+      "affinity": "session_then_key",
+      "elapsed_s": 7.33,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "B1-burst-1acc-fast",
+      "accounts": 1,
+      "exec_sec": 0.3,
+      "mode": "burst",
+      "affinity": "session_then_key",
+      "elapsed_s": 16.98,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "B2-burst-2acc-fast",
+      "accounts": 2,
+      "exec_sec": 0.3,
+      "mode": "burst",
+      "affinity": "session_then_key",
+      "elapsed_s": 6.98,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "B3-burst-3acc-fast",
+      "accounts": 3,
+      "exec_sec": 0.3,
+      "mode": "burst",
+      "affinity": "session_then_key",
+      "elapsed_s": 3.65,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "C1-seq-1acc-real",
+      "accounts": 1,
+      "exec_sec": 4.0,
+      "mode": "seq",
+      "affinity": "session_then_key",
+      "elapsed_s": 24.08,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "C2-seq-2acc-real",
+      "accounts": 2,
+      "exec_sec": 4.0,
+      "mode": "seq",
+      "affinity": "session_then_key",
+      "elapsed_s": 24.06,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "D1-burst-1acc-real",
+      "accounts": 1,
+      "exec_sec": 4.0,
+      "mode": "burst",
+      "affinity": "session_then_key",
+      "elapsed_s": 20.68,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "D2-burst-2acc-real",
+      "accounts": 2,
+      "exec_sec": 4.0,
+      "mode": "burst",
+      "affinity": "session_then_key",
+      "elapsed_s": 10.68,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    },
+    {
+      "tag": "E2-burst-2acc-nosess",
+      "accounts": 2,
+      "exec_sec": 4.0,
+      "mode": "burst",
+      "affinity": "none",
+      "elapsed_s": 10.68,
+      "ok": 6,
+      "total": 6,
+      "codes": [
+        200,
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "upstream_hits": 6,
+      "upstream_429": 0
+    }
+  ]
+}

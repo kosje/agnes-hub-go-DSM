@@ -1,0 +1,1083 @@
+// Package config 负责 agnes-hub 的全部持久化状态。
+//
+// 设计沿用 Python 基线的约定（便于两个版本共用同一个 data 目录、平滑迁移）：
+//   - 全 JSON 文件存储，免 SSH 即可备份/迁移；
+//   - 所有写操作走「临时文件 + rename」原子写，断电不会写坏配置；
+//   - 运行期状态（冷却、在途数、池级校准）**不落盘**，只落有长期价值的字段。
+package config
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// 官方「实际可执行 RPM」基线
+//
+// 来源：AgnesAI-Labs/AgnesAI-Models → MODEL_CATALOG.md（限流表更新 2026-06-28）。
+// 注意官方限流表按「模型类型」而非单个模型 ID 给出，故 text 池由多个
+// 文本模型共用，绝不能按模型名各建一桶。
+// ---------------------------------------------------------------------------
+var RPMTable = map[string]map[string]float64{
+	"free": {
+		"text": 20, "image_1k": 20, "image_2k": 10, "image_3k": 1, "image_4k": 1, "video": 1,
+	},
+	"enterprise": {
+		"text": 40, "image_1k": 40, "image_2k": 20, "image_3k": 1, "image_4k": 1, "video": 2,
+	},
+	"tokenplan": {
+		"text": 1000, "image_1k": 100, "image_2k": 80, "image_3k": 1, "image_4k": 1, "video": 5,
+	},
+}
+
+// PoolClasses 是全部限流桶。顺序即控制台展示顺序。
+var PoolClasses = []string{"text", "image_1k", "image_2k", "image_3k", "image_4k", "video"}
+
+// AccessTypes 官方三档账号类型。
+var AccessTypes = []string{"free", "enterprise", "tokenplan"}
+
+// DefaultBaseURL / CNBaseURL 官方两个站点。
+const (
+	DefaultBaseURL = "https://apihub.agnes-ai.com/v1"
+	CNBaseURL      = "https://api.agnes-ai.cn/v1"
+)
+
+// ---------------------------------------------------------------------------
+// 数据模型
+// ---------------------------------------------------------------------------
+
+// ModelManifest 是账号声明的「真实可调用模型」清单，按模态分组。
+// 空数组是**有意义的**：表示该账号明示不支持该模态，调度器会把它排除出对应池。
+type ModelManifest struct {
+	Text  []string `json:"text"`
+	Image []string `json:"image"`
+	Video []string `json:"video"`
+}
+
+// For 取指定模态的清单。
+func (m ModelManifest) For(modality string) []string {
+	switch modality {
+	case "image":
+		return m.Image
+	case "video":
+		return m.Video
+	default:
+		return m.Text
+	}
+}
+
+// Clone 深拷贝，避免控制台改动直接污染内存里正在被调度读取的结构。
+//
+// 注意这里必须区分 nil 与空切片：`append([]string(nil), empty...)` 会把
+// **显式空数组变回 nil**，而本项目的语义里「空数组 = 明示不支持该模态、
+// nil = 还没声明（用默认值）」。用 append 实现会让管理端「清空某模态」
+// 的操作被静默还原成默认清单 —— 这类 bug 在运行时完全看不出异常，
+// 只表现为「配了不生效」。
+func (m ModelManifest) Clone() ModelManifest {
+	return ModelManifest{
+		Text:  cloneSlice(m.Text),
+		Image: cloneSlice(m.Image),
+		Video: cloneSlice(m.Video),
+	}
+}
+
+func cloneSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+// AccountStats 是长期累计的统计量（落盘）。
+type AccountStats struct {
+	Requests    int64   `json:"requests"`
+	Errors      int64   `json:"errors"`
+	RateLimited int64   `json:"rate_limited"`
+	LastError   string  `json:"last_error"`
+	LastUsedAt  float64 `json:"last_used_at"`
+}
+
+// Account 是一个上游账号。运行期状态全部放在 hub 里，这里只留需要落盘的字段。
+type Account struct {
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	APIKey          string             `json:"api_key"`
+	BaseURL         string             `json:"base_url"`
+	AccessType      string             `json:"access_type"`
+	Enabled         bool               `json:"enabled"`
+	Group           string             `json:"group,omitempty"`
+	ClassesEnabled  []string           `json:"classes_enabled"`
+	ModelManifest   ModelManifest      `json:"model_manifest"`
+	RPMOverrides    map[string]float64 `json:"rpm_overrides"`
+	MaxConcurrency  int                `json:"max_concurrency"`
+	LearnedFactor   float64            `json:"learned_factor"`
+	PoolFactors     map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
+	LastRateLimited float64            `json:"last_rate_limited_at"`
+	CreatedAt       float64            `json:"created_at"`
+	Stats           AccountStats       `json:"stats"`
+}
+
+// DownstreamKey 是签发给客户端的中转密钥。
+type DownstreamKey struct {
+	Key           string   `json:"key"`
+	Name          string   `json:"name"`
+	Enabled       bool     `json:"enabled"`
+	Classes       []string `json:"classes"`
+	DailyQuota    int64    `json:"daily_quota"`
+	TotalQuota    int64    `json:"total_quota"`
+	PinnedAccount string   `json:"pinned_account,omitempty"`
+	UsedTotal     int64    `json:"used_total"`
+	UsedToday     int64    `json:"used_today"`
+	UsedDate      string   `json:"used_date"`
+	CreatedAt     float64  `json:"created_at"`
+}
+
+// Binding 是「任务 → 账号」的粘性绑定。
+type Binding struct {
+	AccountID string  `json:"account_id"`
+	Updated   float64 `json:"updated"`
+}
+
+// VideoJob 是视频任务映射（下游 job_id → 上游 video_id + 承载账号）。
+type VideoJob struct {
+	JobID     string  `json:"job_id"`
+	VideoID   string  `json:"video_id"`
+	Model     string  `json:"model"`
+	AccountID string  `json:"account_id"`
+	Status    string  `json:"status"`
+	CreatedAt float64 `json:"created_at"`
+	RequestID string  `json:"request_id"`
+	Error     string  `json:"error,omitempty"`
+}
+
+// AutoIntentSettings 是 agnes-auto 的判定与适配配置。
+type AutoIntentSettings struct {
+	ContentScan      bool                `json:"content_scan"`
+	MinConfidence    float64             `json:"min_confidence"`
+	DefaultImageSize string              `json:"default_image_size"`
+	ImageInputField  string              `json:"image_input_field"`
+	VideoInputField  string              `json:"video_input_field"`
+	VideoWaitSec     int                 `json:"video_wait_sec"`
+	PreferredModels  map[string][]string `json:"preferred_models"`
+}
+
+// Settings 是全局设置。
+type Settings struct {
+	AdminPasswordHash    string             `json:"admin_password_hash"`
+	AdminPasswordSalt    string             `json:"admin_password_salt"`
+	MustChangePassword   bool               `json:"must_change_password"`
+	SafetyFactor         float64            `json:"safety_factor"`
+	PacingWindowSec      float64            `json:"pacing_window_sec"`
+	CalibrationEnabled   bool               `json:"calibration_enabled"`
+	PenaltyCooldownSec   float64            `json:"penalty_cooldown_sec"`
+	PenaltyFactor        float64            `json:"penalty_factor"`
+	MinLearnedFactor     float64            `json:"min_learned_factor"`
+	RecoverAfterSec      float64            `json:"recover_after_sec"`
+	RecoverSuccesses     int                `json:"recover_successes"`
+	QueueMaxWaitMS       int                `json:"queue_max_wait_ms"`
+	QueueMaxSize         int                `json:"queue_max_size"`
+	KeepaliveMS          int                `json:"keepalive_interval_ms"`
+	AffinityMode         string             `json:"affinity_mode"`
+	DefaultImageTier     string             `json:"default_image_tier"`
+	ModelAliases         map[string]string  `json:"model_aliases"`
+	AutoModelName        string             `json:"auto_model_name"`
+	AutoIntent           AutoIntentSettings `json:"auto_intent"`
+	ModelManifestDefault ModelManifest      `json:"model_manifest_default"`
+	RetryMax             int                `json:"retry_max"`
+	RetryBaseBackoffMS   int                `json:"retry_base_backoff_ms"`
+	RetryMaxBackoffMS    int                `json:"retry_max_backoff_ms"`
+	ImageConcurrency     int                `json:"image_concurrency"`
+	VideoMaxInFlight     int                `json:"video_max_inflight"`
+	BreakerReviveSec     int                `json:"breaker_revive_sec"`
+	VideoPollPath        string             `json:"video_poll_path"`
+	VideoPollWithModel   bool               `json:"video_poll_include_model_name"`
+	VideoPollIntervalMS  int                `json:"video_poll_interval_ms"`
+	LogRetentionDays     int                `json:"log_retention_days"`
+	SessionTTLHours      float64            `json:"session_ttl_hours"`
+	ProbeModel           string             `json:"probe_model"`
+}
+
+// DefaultSettings 返回出厂设置。
+func DefaultSettings() Settings {
+	return Settings{
+		MustChangePassword: true,
+		SafetyFactor:       0.9,
+		PacingWindowSec:    60,
+		CalibrationEnabled: true,
+		PenaltyCooldownSec: 65,
+		PenaltyFactor:      0.8,
+		MinLearnedFactor:   0.5,
+		RecoverAfterSec:    300,
+		RecoverSuccesses:   20,
+		QueueMaxWaitMS:     120000,
+		QueueMaxSize:       200,
+		KeepaliveMS:        5000,
+		AffinityMode:       "session_then_key",
+		DefaultImageTier:   "1k",
+		ModelAliases:       map[string]string{},
+		AutoModelName:      "agnes-auto",
+		AutoIntent: AutoIntentSettings{
+			ContentScan:      true,
+			MinConfidence:    0.6,
+			DefaultImageSize: "1K",
+			ImageInputField:  "image",
+			VideoInputField:  "image",
+			VideoWaitSec:     0,
+			PreferredModels: map[string][]string{
+				"text":  {"agnes-2.5-flash", "agnes-2.0-flash"},
+				"image": {"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
+				"video": {"agnes-video-2.5-flash", "agnes-video-v2.0"},
+			},
+		},
+		ModelManifestDefault: ModelManifest{
+			Text:  []string{"agnes-2.5-flash", "agnes-2.0-flash", "agnes-3.0-flash"},
+			Image: []string{"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
+			Video: []string{"agnes-video-2.5-flash", "agnes-video-2.5", "agnes-video-v2.0"},
+		},
+		RetryMax:            3,
+		RetryBaseBackoffMS:  500,
+		RetryMaxBackoffMS:   8000,
+		ImageConcurrency:    4,
+		VideoMaxInFlight:    2,
+		BreakerReviveSec:    1800,
+		VideoPollPath:       "/agnesapi",
+		VideoPollWithModel:  true,
+		VideoPollIntervalMS: 10000,
+		LogRetentionDays:    7,
+		SessionTTLHours:     72,
+		ProbeModel:          "agnes-2.5-flash",
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+// Store 是全部持久化状态的唯一真源。
+type Store struct {
+	mu       sync.RWMutex
+	Dir      string
+	Settings Settings
+	Accounts []*Account
+	Keys     []*DownstreamKey
+	Bindings map[string]Binding
+	Jobs     map[string]*VideoJob
+}
+
+// NewStore 载入（或初始化）data 目录。
+func NewStore(dir string) (*Store, error) {
+	s := &Store{
+		Dir:      dir,
+		Settings: DefaultSettings(),
+		Bindings: map[string]Binding{},
+		Jobs:     map[string]*VideoJob{},
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	if s.Settings.AdminPasswordHash == "" {
+		salt := randHex(8)
+		s.Settings.AdminPasswordSalt = salt
+		s.Settings.AdminPasswordHash = HashPassword("admin123", salt)
+		s.Settings.MustChangePassword = true
+		if err := s.saveSettingsLocked(); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+func (s *Store) path(name string) string { return filepath.Join(s.Dir, name) }
+
+func (s *Store) load() error {
+	snap := DefaultSettings()
+	if err := readJSON(s.path("settings.json"), &snap); err != nil {
+		return err
+	}
+	// 向后兼容：旧配置文件缺字段时用默认值补齐
+	normalizeSettings(&snap)
+	s.Settings = snap
+
+	s.Accounts = nil
+	if err := readJSON(s.path("accounts.json"), &s.Accounts); err != nil {
+		return err
+	}
+	s.Keys = nil
+	if err := readJSON(s.path("downstream_keys.json"), &s.Keys); err != nil {
+		return err
+	}
+	s.Bindings = map[string]Binding{}
+	if err := readJSON(s.path("bindings.json"), &s.Bindings); err != nil {
+		return err
+	}
+	s.Jobs = map[string]*VideoJob{}
+	if err := readJSON(s.path("video_jobs.json"), &s.Jobs); err != nil {
+		return err
+	}
+	for _, a := range s.Accounts {
+		normalizeAccount(a, s.Settings)
+	}
+	return nil
+}
+
+// normalizeSettings 补齐缺失字段（Go 的 json.Unmarshal 不会覆盖已存在字段，
+// 但 map/切片为空时需要显式兜底，否则限流会静默失效）。
+func normalizeSettings(v *Settings) {
+	d := DefaultSettings()
+	if v.SafetyFactor <= 0 {
+		v.SafetyFactor = d.SafetyFactor
+	}
+	if v.PacingWindowSec <= 0 {
+		v.PacingWindowSec = d.PacingWindowSec
+	}
+	if v.MinLearnedFactor <= 0 {
+		v.MinLearnedFactor = d.MinLearnedFactor
+	}
+	if v.PenaltyCooldownSec <= 0 {
+		v.PenaltyCooldownSec = d.PenaltyCooldownSec
+	}
+	if v.PenaltyFactor <= 0 {
+		v.PenaltyFactor = d.PenaltyFactor
+	}
+	if v.QueueMaxWaitMS <= 0 {
+		v.QueueMaxWaitMS = d.QueueMaxWaitMS
+	}
+	if v.QueueMaxSize <= 0 {
+		v.QueueMaxSize = d.QueueMaxSize
+	}
+	if v.KeepaliveMS <= 0 {
+		v.KeepaliveMS = d.KeepaliveMS
+	}
+	if v.AffinityMode == "" {
+		v.AffinityMode = d.AffinityMode
+	}
+	if v.DefaultImageTier == "" {
+		v.DefaultImageTier = d.DefaultImageTier
+	}
+	if v.ModelAliases == nil {
+		v.ModelAliases = map[string]string{}
+	}
+	if v.AutoModelName == "" {
+		v.AutoModelName = d.AutoModelName
+	}
+	if v.AutoIntent.PreferredModels == nil {
+		v.AutoIntent.PreferredModels = d.AutoIntent.PreferredModels
+	}
+	if v.AutoIntent.DefaultImageSize == "" {
+		v.AutoIntent.DefaultImageSize = d.AutoIntent.DefaultImageSize
+	}
+	if v.AutoIntent.MinConfidence <= 0 {
+		v.AutoIntent.MinConfidence = d.AutoIntent.MinConfidence
+	}
+	if v.ModelManifestDefault.Text == nil && v.ModelManifestDefault.Image == nil &&
+		v.ModelManifestDefault.Video == nil {
+		v.ModelManifestDefault = d.ModelManifestDefault
+	}
+	if v.RetryMax < 0 {
+		v.RetryMax = d.RetryMax
+	}
+	if v.RetryBaseBackoffMS <= 0 {
+		v.RetryBaseBackoffMS = d.RetryBaseBackoffMS
+	}
+	if v.RetryMaxBackoffMS <= 0 {
+		v.RetryMaxBackoffMS = d.RetryMaxBackoffMS
+	}
+	if v.ImageConcurrency <= 0 {
+		v.ImageConcurrency = d.ImageConcurrency
+	}
+	if v.VideoMaxInFlight <= 0 {
+		v.VideoMaxInFlight = d.VideoMaxInFlight
+	}
+	if v.BreakerReviveSec <= 0 {
+		v.BreakerReviveSec = d.BreakerReviveSec
+	}
+	if v.VideoPollPath == "" {
+		v.VideoPollPath = d.VideoPollPath
+	}
+	if v.VideoPollIntervalMS <= 0 {
+		v.VideoPollIntervalMS = d.VideoPollIntervalMS
+	}
+	if v.SessionTTLHours <= 0 {
+		v.SessionTTLHours = d.SessionTTLHours
+	}
+	if v.ProbeModel == "" {
+		v.ProbeModel = d.ProbeModel
+	}
+}
+
+// normalizeAccount 补齐缺失字段。
+//
+// model_manifest 的语义：**缺失（nil）→ 用默认清单补齐**（视为「还没声明」）；
+// **非 nil 的空切片 → 保留为空**（视为「明示不支持该模态」）。
+func normalizeAccount(a *Account, s Settings) {
+	if a.AccessType == "" {
+		if _, ok := RPMTable[a.AccessType]; !ok {
+			a.AccessType = "free"
+		}
+	}
+	if _, ok := RPMTable[a.AccessType]; !ok {
+		a.AccessType = "free"
+	}
+	if a.ClassesEnabled == nil {
+		a.ClassesEnabled = append([]string(nil), PoolClasses...)
+	}
+	if a.RPMOverrides == nil {
+		a.RPMOverrides = map[string]float64{}
+	}
+	if a.MaxConcurrency <= 0 {
+		a.MaxConcurrency = 8
+	}
+	if a.LearnedFactor <= 0 {
+		a.LearnedFactor = 1.0
+	}
+	if a.PoolFactors == nil {
+		a.PoolFactors = map[string]float64{}
+	}
+	if a.BaseURL == "" {
+		a.BaseURL = DefaultBaseURL
+	}
+	if a.ModelManifest.Text == nil {
+		a.ModelManifest.Text = append([]string(nil), s.ModelManifestDefault.Text...)
+	}
+	if a.ModelManifest.Image == nil {
+		a.ModelManifest.Image = append([]string(nil), s.ModelManifestDefault.Image...)
+	}
+	if a.ModelManifest.Video == nil {
+		a.ModelManifest.Video = append([]string(nil), s.ModelManifestDefault.Video...)
+	}
+}
+
+// ---- 原子写 ----
+
+func writeJSON(path string, payload any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	buf, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func readJSON(path string, out any) error {
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(strings.TrimSpace(string(buf))) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(buf, out); err != nil {
+		// 坏文件不应让服务起不来：备份后按默认值继续
+		_ = os.WriteFile(path+".broken", buf, 0o644)
+		return nil
+	}
+	return nil
+}
+
+func (s *Store) saveSettingsLocked() error { return writeJSON(s.path("settings.json"), s.Settings) }
+
+// SaveSettings 落盘设置。
+func (s *Store) SaveSettings() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveSettingsLocked()
+}
+
+// SaveAccounts 落盘账号池。
+func (s *Store) SaveAccounts() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveAccountsLocked()
+}
+
+func (s *Store) saveAccountsLocked() error { return writeJSON(s.path("accounts.json"), s.Accounts) }
+
+// SaveKeys 落盘下游密钥。
+func (s *Store) SaveKeys() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveKeysLocked()
+}
+
+func (s *Store) saveKeysLocked() error { return writeJSON(s.path("downstream_keys.json"), s.Keys) }
+
+// SaveBindings 落盘粘性绑定。
+func (s *Store) SaveBindings() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveBindingsLocked()
+}
+
+func (s *Store) saveBindingsLocked() error { return writeJSON(s.path("bindings.json"), s.Bindings) }
+
+// SaveJobs 落盘视频任务映射。
+func (s *Store) SaveJobs() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.saveJobsLocked()
+}
+
+func (s *Store) saveJobsLocked() error { return writeJSON(s.path("video_jobs.json"), s.Jobs) }
+
+// ---- 只读快照 ----
+
+// SettingsSnapshot 返回设置的深拷贝，避免调用方直接改内存对象。
+func (s *Store) SettingsSnapshot() Settings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := s.Settings
+	out.ModelAliases = cloneMap(s.Settings.ModelAliases)
+	out.AutoIntent.PreferredModels = cloneListMap(s.Settings.AutoIntent.PreferredModels)
+	out.ModelManifestDefault = s.Settings.ModelManifestDefault.Clone()
+	return out
+}
+
+// AccountsSnapshot 返回账号池的深拷贝（含 api_key，仅服务端内部使用）。
+func (s *Store) AccountsSnapshot() []*Account {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*Account, 0, len(s.Accounts))
+	for _, a := range s.Accounts {
+		out = append(out, a.Clone())
+	}
+	return out
+}
+
+// Clone 深拷贝账号。
+func (a *Account) Clone() *Account {
+	cp := *a
+	cp.ClassesEnabled = cloneSlice(a.ClassesEnabled)
+	cp.ModelManifest = a.ModelManifest.Clone()
+	cp.RPMOverrides = cloneMap(a.RPMOverrides)
+	cp.PoolFactors = cloneMap(a.PoolFactors)
+	return &cp
+}
+
+func cloneMap[V any](in map[string]V) map[string]V {
+	if in == nil {
+		return map[string]V{}
+	}
+	out := make(map[string]V, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneListMap(in map[string][]string) map[string][]string {
+	if in == nil {
+		return map[string][]string{}
+	}
+	out := make(map[string][]string, len(in))
+	for k, v := range in {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+// AccountByID 按 ID 取账号（返回内部指针，改动后需自行落盘）。
+func (s *Store) AccountByID(id string) *Account {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			return a
+		}
+	}
+	return nil
+}
+
+// MutateAccount 在写锁内修改账号并落盘，避免控制台与调度器读改竞争。
+func (s *Store) MutateAccount(id string, fn func(*Account) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			if fn(a) {
+				_ = s.saveAccountsLocked()
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// MutateAccountMap 批量写回 (账号 × 池) 二维校准因子。
+//
+// 入参 key 形如 "<account_id>|<pool_class>"。做成批量接口是为了降低写放大：
+// 高频 429 时若每次都重写整个 accounts.json，磁盘与 CPU 都会被无谓消耗。
+func (s *Store) MutateAccountMap(values map[string]float64, keys []string) {
+	type pair struct{ id, cls string }
+	pairs := make([]pair, 0, len(keys))
+	for _, k := range keys {
+		parts := strings.SplitN(k, "|", 2)
+		if len(parts) == 2 {
+			pairs = append(pairs, pair{parts[0], parts[1]})
+		}
+	}
+	if len(pairs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.Accounts {
+		for _, p := range pairs {
+			if a.ID != p.id {
+				continue
+			}
+			if a.PoolFactors == nil {
+				a.PoolFactors = map[string]float64{}
+			}
+			a.PoolFactors[p.cls] = values[p.id+"|"+p.cls]
+		}
+	}
+	_ = s.saveAccountsLocked()
+}
+
+// AddAccount 新增账号。
+func (s *Store) AddAccount(name, apiKey, accessType, baseURL string, manifest *ModelManifest) *Account {
+	if _, ok := RPMTable[accessType]; !ok {
+		accessType = "free"
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = DefaultBaseURL
+	}
+	a := &Account{
+		ID:             NewID("acc"),
+		Name:           orDefault(name, "未命名账号"),
+		APIKey:         strings.TrimSpace(apiKey),
+		BaseURL:        strings.TrimRight(baseURL, "/"),
+		AccessType:     accessType,
+		Enabled:        true,
+		ClassesEnabled: append([]string(nil), PoolClasses...),
+		RPMOverrides:   map[string]float64{},
+		MaxConcurrency: 8,
+		LearnedFactor:  1,
+		PoolFactors:    map[string]float64{},
+		CreatedAt:      float64(time.Now().UnixNano()) / 1e9,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if manifest != nil {
+		a.ModelManifest = manifest.Clone()
+	}
+	normalizeAccount(a, s.Settings)
+	s.Accounts = append(s.Accounts, a)
+	_ = s.saveAccountsLocked()
+	return a
+}
+
+// DeleteAccount 删除账号。
+func (s *Store) DeleteAccount(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, a := range s.Accounts {
+		if a.ID == id {
+			s.Accounts = append(s.Accounts[:i], s.Accounts[i+1:]...)
+			_ = s.saveAccountsLocked()
+			return true
+		}
+	}
+	return false
+}
+
+// RPMFor 取该账号在该池的基线 RPM（先看覆盖，再看档位表）。
+func (s *Store) RPMFor(a *Account, poolClass string) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return rpmFor(a, poolClass)
+}
+
+func rpmFor(a *Account, poolClass string) float64 {
+	if v, ok := a.RPMOverrides[poolClass]; ok && v > 0 {
+		return v
+	}
+	table, ok := RPMTable[a.AccessType]
+	if !ok {
+		table = RPMTable["free"]
+	}
+	if v, ok := table[poolClass]; ok {
+		return v
+	}
+	return 1
+}
+
+// ---- 下游密钥 ----
+
+// KeyByValue 按密钥值查找（常量时间比较）。
+func (s *Store) KeyByValue(value string) *DownstreamKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, k := range s.Keys {
+		if subtleEqual(k.Key, value) {
+			return k
+		}
+	}
+	return nil
+}
+
+// AddKey 签发下游密钥。
+func (s *Store) AddKey(name string, classes []string, daily, total int64, pinned string) *DownstreamKey {
+	if len(classes) == 0 {
+		classes = []string{"*"}
+	}
+	item := &DownstreamKey{
+		Key:           "sk-agnes-" + randHex(24),
+		Name:          orDefault(name, "未命名密钥"),
+		Enabled:       true,
+		Classes:       classes,
+		DailyQuota:    daily,
+		TotalQuota:    total,
+		PinnedAccount: pinned,
+		UsedDate:      time.Now().Format("2006-01-02"),
+		CreatedAt:     float64(time.Now().UnixNano()) / 1e9,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Keys = append(s.Keys, item)
+	_ = s.saveKeysLocked()
+	return item
+}
+
+// DeleteKey 删除密钥。
+func (s *Store) DeleteKey(value string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, k := range s.Keys {
+		if k.Key == value {
+			s.Keys = append(s.Keys[:i], s.Keys[i+1:]...)
+			_ = s.saveKeysLocked()
+			return true
+		}
+	}
+	return false
+}
+
+// MutateKey 修改密钥并落盘。
+func (s *Store) MutateKey(value string, fn func(*DownstreamKey) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range s.Keys {
+		if k.Key == value {
+			if fn(k) {
+				_ = s.saveKeysLocked()
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// KeysSnapshot 返回密钥列表深拷贝。
+func (s *Store) KeysSnapshot() []*DownstreamKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*DownstreamKey, 0, len(s.Keys))
+	for _, k := range s.Keys {
+		cp := *k
+		cp.Classes = append([]string(nil), k.Classes...)
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// KeyAllowsClass 判断密钥是否允许调用该池。
+func KeyAllowsClass(k *DownstreamKey, poolClass string) bool {
+	if k == nil {
+		return false
+	}
+	if len(k.Classes) == 0 {
+		return true
+	}
+	for _, c := range k.Classes {
+		if c == "*" || c == poolClass {
+			return true
+		}
+	}
+	return false
+}
+
+// QuotaExceeded 返回超限原因（空串表示未超限）。
+func (s *Store) QuotaExceeded(k *DownstreamKey) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	today := time.Now().Format("2006-01-02")
+	usedToday := int64(0)
+	if k.UsedDate == today {
+		usedToday = k.UsedToday
+	}
+	if k.DailyQuota > 0 && usedToday >= k.DailyQuota {
+		return fmt.Sprintf("下游密钥已达每日额度上限（%d）", k.DailyQuota)
+	}
+	if k.TotalQuota > 0 && k.UsedTotal >= k.TotalQuota {
+		return fmt.Sprintf("下游密钥已达总额度上限（%d）", k.TotalQuota)
+	}
+	return ""
+}
+
+// ChargeKey 记账（按天滚动）。
+func (s *Store) ChargeKey(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	today := time.Now().Format("2006-01-02")
+	for _, k := range s.Keys {
+		if k.Key == value {
+			if k.UsedDate != today {
+				k.UsedDate = today
+				k.UsedToday = 0
+			}
+			k.UsedTotal++
+			k.UsedToday++
+			_ = s.saveKeysLocked()
+			return
+		}
+	}
+}
+
+// ---- 粘性绑定 ----
+
+// Bind 写入绑定。
+func (s *Store) Bind(sessionKey, accountID string) {
+	if sessionKey == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Bindings == nil {
+		s.Bindings = map[string]Binding{}
+	}
+	s.Bindings[sessionKey] = Binding{AccountID: accountID, Updated: float64(time.Now().UnixNano()) / 1e9}
+	s.gcBindingsLocked()
+	_ = s.saveBindingsLocked()
+}
+
+// BindingsGet 读取绑定。
+func (s *Store) BindingsGet(sessionKey string) (Binding, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, ok := s.Bindings[sessionKey]
+	return b, ok
+}
+
+func (s *Store) gcBindingsLocked() {
+	ttl := s.Settings.SessionTTLHours * 3600
+	if ttl <= 0 {
+		return
+	}
+	cutoff := float64(time.Now().UnixNano())/1e9 - ttl
+	for k, v := range s.Bindings {
+		if v.Updated < cutoff {
+			delete(s.Bindings, k)
+		}
+	}
+}
+
+// BindingsSnapshot 返回绑定列表（供控制台展示）。
+func (s *Store) BindingsSnapshot() map[string]Binding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneMap(s.Bindings)
+}
+
+// ClearBindings 清空全部绑定。
+func (s *Store) ClearBindings() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Bindings = map[string]Binding{}
+	_ = s.saveBindingsLocked()
+}
+
+// ---- 视频任务 ----
+
+// PutJob 记录视频任务。
+func (s *Store) PutJob(job *VideoJob) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Jobs == nil {
+		s.Jobs = map[string]*VideoJob{}
+	}
+	s.Jobs[job.JobID] = job
+	_ = s.saveJobsLocked()
+}
+
+// JobByID 取视频任务。
+func (s *Store) JobByID(id string) (*VideoJob, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	j, ok := s.Jobs[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *j
+	return &cp, true
+}
+
+// JobByVideoID 按上游 video_id 反查任务。
+func (s *Store) JobByVideoID(videoID string) (*VideoJob, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, j := range s.Jobs {
+		if j.VideoID == videoID {
+			cp := *j
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
+// JobsSnapshot 返回全部任务。
+func (s *Store) JobsSnapshot() []*VideoJob {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*VideoJob, 0, len(s.Jobs))
+	for _, j := range s.Jobs {
+		cp := *j
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+// ---- 用量日志 ----
+
+// AppendUsage 追加一行 JSONL（失败不影响主链路）。
+func (s *Store) AppendUsage(record map[string]any) {
+	buf, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.Write(append(buf, '\n'))
+}
+
+// TailUsage 读取最近 n 条日志（倒序）。
+func (s *Store) TailUsage(n int) []map[string]any {
+	buf, err := os.ReadFile(s.path("usage.jsonl"))
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimRight(string(buf), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	out := make([]map[string]any, 0, len(lines))
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// ---- 密码 ----
+
+// HashPassword 口令散列（与 Python 基线一致：sha256(salt+password)）。
+func HashPassword(password, salt string) string {
+	sum := sha256.Sum256([]byte(salt + password))
+	return hex.EncodeToString(sum[:])
+}
+
+// VerifyPassword 校验口令。
+func (s *Store) VerifyPassword(password string) bool {
+	s.mu.RLock()
+	hash, salt := s.Settings.AdminPasswordHash, s.Settings.AdminPasswordSalt
+	s.mu.RUnlock()
+	if hash == "" {
+		return false
+	}
+	return subtleEqual(hash, HashPassword(password, salt))
+}
+
+// SetPassword 改密。
+func (s *Store) SetPassword(password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	salt := randHex(8)
+	s.Settings.AdminPasswordSalt = salt
+	s.Settings.AdminPasswordHash = HashPassword(password, salt)
+	s.Settings.MustChangePassword = false
+	return s.saveSettingsLocked()
+}
+
+// SessionToken 派生会话令牌（改密即全端失效）。
+func (s *Store) SessionToken() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sum := sha256.Sum256([]byte(s.Settings.AdminPasswordSalt + ":" + s.Settings.AdminPasswordHash + ":agnes-hub"))
+	return hex.EncodeToString(sum[:])
+}
+
+// ---- 设置写入 ----
+
+// UpdateSettings 用回调在写锁内修改设置并落盘。
+func (s *Store) UpdateSettings(fn func(*Settings)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(&s.Settings)
+	normalizeSettings(&s.Settings)
+	return s.saveSettingsLocked()
+}
+
+// ---- 小工具 ----
+
+// NewID 生成带前缀的随机 ID。
+func NewID(prefix string) string { return prefix + "_" + randHex(6) }
+
+func randHex(n int) string {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}
+
+func orDefault(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
+}
+
+// subtleEqual 常量时间字符串比较，避免密钥被时序侧信道推断。
+func subtleEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}

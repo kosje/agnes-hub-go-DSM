@@ -1,0 +1,889 @@
+// Package hub 是调度核心：候选筛选、粘性路由与溢出、槽位领取、故障熔断、二维自适应校准。
+//
+// 与 Python 基线相比的四处关键修正（都是会在真实多账号场景下静默失效的缺陷）：
+//
+//	B1 软粘性 + 溢出。旧实现命中绑定就直接返回该账号，不检查惩罚、不比较负载，
+//	   而客户端默认不发会话头 → 同一把下游 Key 的全部请求永久绑到同一个账号，
+//	   配了 5 个账号实际只有 1 个在工作；且绑定账号一旦 429，请求会集体睡过
+//	   冷却而不是切到健康账号。现在绑定只是「优先候选」，超过溢出阈值即改派并更新绑定。
+//	B2 校准因子降维到 (账号 × 池)。旧实现是一个账号级标量被六个池共用 → 视频池
+//	   （只有 1 RPM、最容易 429）一次限流会把该账号的文本池也砍掉 20%。
+//	B3 并发信号量按模态分离。旧实现账号级一把 → 视频轮询会把文本请求挤住。
+//	B4 排队准入提前到领号之前（见 pacer.Reserve）→ 超时的请求不再白烧 RPM 槽位。
+package hub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"agneshub/internal/config"
+	"agneshub/internal/pacer"
+	"agneshub/internal/pool"
+)
+
+// ErrNoCapacity 该池下没有任何可用账号。
+var ErrNoCapacity = errors.New("没有可用账号")
+
+// ErrQueueFull / ErrQueueTimeout 真背压。
+var (
+	ErrQueueFull    = errors.New("排队已满")
+	ErrQueueTimeout = errors.New("排队等待超过上限")
+)
+
+// Metrics 是运行指标。
+type Metrics struct {
+	RequestsTotal  atomic.Int64
+	RequestsOK     atomic.Int64
+	RequestsError  atomic.Int64
+	Upstream429    atomic.Int64
+	QueuedTotal    atomic.Int64
+	QueueTimeout   atomic.Int64
+	QueueOverflow  atomic.Int64
+	WaitMS         atomic.Int64
+	Spillovers     atomic.Int64
+	BreakerOpened  atomic.Int64
+	BreakerRevived atomic.Int64
+	StartedAt      time.Time
+}
+
+// Hub 是调度器。
+type Hub struct {
+	store *config.Store
+	cfg   atomic.Pointer[config.Settings]
+
+	mu            sync.Mutex
+	pacers        map[string]*pacer.Pacer
+	sems          map[string]chan struct{}
+	penaltyUntil  map[string]time.Time
+	last429       map[string]time.Time
+	inflight      map[string]int
+	poolFactors   map[string]float64
+	successes     map[string]int
+	reviveAt      map[string]time.Time
+	pendingFactor map[string]bool
+
+	Metrics Metrics
+}
+
+// New 构造调度器。
+func New(store *config.Store) *Hub {
+	h := &Hub{
+		store:         store,
+		pacers:        map[string]*pacer.Pacer{},
+		sems:          map[string]chan struct{}{},
+		penaltyUntil:  map[string]time.Time{},
+		last429:       map[string]time.Time{},
+		inflight:      map[string]int{},
+		poolFactors:   map[string]float64{},
+		successes:     map[string]int{},
+		reviveAt:      map[string]time.Time{},
+		pendingFactor: map[string]bool{},
+	}
+	h.Metrics.StartedAt = time.Now()
+	h.Reload()
+	return h
+}
+
+func key(parts ...string) string { return strings.Join(parts, "|") }
+
+// Settings 返回缓存的设置快照（热路径不重复拷贝 map）。
+func (h *Hub) Settings() config.Settings {
+	if p := h.cfg.Load(); p != nil {
+		return *p
+	}
+	return h.store.SettingsSnapshot()
+}
+
+// Reload 重新读取设置与账号配置，重建节拍器与信号量。
+//
+// 保留已有 Pacer 的排队状态（reconfigure 而非重建），否则调参会清空正在排队的请求。
+func (h *Hub) Reload() {
+	settings := h.store.SettingsSnapshot()
+	h.cfg.Store(&settings)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	live := map[string]bool{}
+	for _, a := range h.store.AccountsSnapshot() {
+		// 池因子初始化（首次见到该账号时从落盘值装载）
+		for _, cls := range config.PoolClasses {
+			k := key(a.ID, cls)
+			live[k] = true
+			if _, ok := h.poolFactors[k]; !ok {
+				if v, ok := a.PoolFactors[cls]; ok && v > 0 {
+					h.poolFactors[k] = v
+				} else {
+					h.poolFactors[k] = 1.0
+				}
+			}
+			rpm := h.effectiveRPMLocked(a, cls, settings)
+			if p, ok := h.pacers[k]; ok {
+				p.Reconfigure(rpm, settings.PacingWindowSec)
+			} else {
+				h.pacers[k] = pacer.New(rpm, settings.PacingWindowSec)
+			}
+		}
+		for _, modality := range []string{"text", "image", "video"} {
+			sk := key(a.ID, modality)
+			live[sk] = true
+			if cap := h.concurrencyFor(a, modality, settings); cap > 0 {
+				if ch, ok := h.sems[sk]; ok && cap == capOf(ch) {
+					continue
+				}
+				h.sems[sk] = make(chan struct{}, cap)
+			}
+		}
+	}
+	for k := range h.pacers {
+		if !live[k] {
+			delete(h.pacers, k)
+		}
+	}
+	for k := range h.sems {
+		if !live[k] {
+			delete(h.sems, k)
+		}
+	}
+}
+
+func capOf(ch chan struct{}) int { return cap(ch) }
+
+func (h *Hub) concurrencyFor(a *config.Account, modality string, s config.Settings) int {
+	switch modality {
+	case "image":
+		if s.ImageConcurrency > 0 && s.ImageConcurrency < a.MaxConcurrency {
+			return s.ImageConcurrency
+		}
+		return a.MaxConcurrency
+	case "video":
+		if s.VideoMaxInFlight > 0 {
+			return s.VideoMaxInFlight
+		}
+		return 1
+	default:
+		return maxInt(1, a.MaxConcurrency)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 有效 RPM 与二维校准
+// ---------------------------------------------------------------------------
+
+// learnedFactorOf 账号级保守系数：只来自旧数据迁移或管理端手工设置。
+//
+// 运行期自适应**刻意不再改写它** —— 它乘在全部池上，一旦被单个池的 429 写入，
+// 惩罚就会横向传染（见 OnRateLimited 的说明）。自适应一律走 poolFactors。
+func (h *Hub) learnedFactorOf(a *config.Account) float64 {
+	if a.LearnedFactor <= 0 {
+		return 1
+	}
+	return a.LearnedFactor
+}
+
+func (h *Hub) effectiveRPMLocked(a *config.Account, poolClass string, s config.Settings) float64 {
+	base := baseRPM(a, poolClass)
+	factor := h.poolFactors[key(a.ID, poolClass)]
+	if factor <= 0 {
+		factor = 1
+	}
+	safety := s.SafetyFactor
+	if safety <= 0 {
+		safety = 0.9
+	}
+	return math.Max(0.01, base*safety*h.learnedFactorOf(a)*factor)
+}
+
+func baseRPM(a *config.Account, poolClass string) float64 {
+	if v, ok := a.RPMOverrides[poolClass]; ok && v > 0 {
+		return v
+	}
+	table, ok := config.RPMTable[a.AccessType]
+	if !ok {
+		table = config.RPMTable["free"]
+	}
+	if v, ok := table[poolClass]; ok {
+		return v
+	}
+	return 1
+}
+
+// EffectiveRPM 对外暴露的有效 RPM。
+func (h *Hub) EffectiveRPM(a *config.Account, poolClass string) float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.effectiveRPMLocked(a, poolClass, h.Settings())
+}
+
+// Pacer 取（或惰性创建）某账号某池的节拍器。
+func (h *Hub) Pacer(a *config.Account, poolClass string) *pacer.Pacer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	k := key(a.ID, poolClass)
+	if p, ok := h.pacers[k]; ok {
+		return p
+	}
+	p := pacer.New(h.effectiveRPMLocked(a, poolClass, h.Settings()), h.Settings().PacingWindowSec)
+	h.pacers[k] = p
+	return p
+}
+
+// Semaphore 取（或惰性创建）某账号某模态的并发信号量。
+func (h *Hub) Semaphore(a *config.Account, modality string) chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	k := key(a.ID, modality)
+	if ch, ok := h.sems[k]; ok {
+		return ch
+	}
+	ch := make(chan struct{}, maxInt(1, h.concurrencyFor(a, modality, h.Settings())))
+	h.sems[k] = ch
+	return ch
+}
+
+// ---------------------------------------------------------------------------
+// 候选筛选
+// ---------------------------------------------------------------------------
+
+// DeclaredModels 账号在 model_manifest 里声明的、属于该池的模型。
+//
+// 刻意返回非 nil 空切片而不是 nil：这个结果会直接进控制台 JSON，
+// nil 会序列化成 `null`，前端拿到 null 再做 `.length` / 迭代就会炸。
+func (h *Hub) DeclaredModels(a *config.Account, poolClass string) []string {
+	modality := pool.ModalityOfPool(poolClass)
+	manifest := pool.ManifestOf(a, h.Settings())
+	out := []string{}
+	for _, m := range manifest.For(modality) {
+		if strings.TrimSpace(m) != "" {
+			out = append(out, strings.TrimSpace(m))
+		}
+	}
+	return out
+}
+
+// Capable 账号能否承载该池：既要在 classes_enabled 里，也要声明了对应模态的模型。
+//
+// 第二条是「多账号按模态分工」的落点：未声明（或主动清空）某模态的账号不再被
+// 调度到该模态的池，避免把生图请求打到只买了文本额度的账号上白白触发 403。
+func (h *Hub) Capable(a *config.Account, poolClass string) bool {
+	enabled := false
+	for _, c := range a.ClassesEnabled {
+		if c == poolClass || c == "*" {
+			enabled = true
+			break
+		}
+	}
+	if len(a.ClassesEnabled) == 0 {
+		enabled = true
+	}
+	if !enabled {
+		return false
+	}
+	return len(h.DeclaredModels(a, poolClass)) > 0
+}
+
+// Declares 账号是否声明了某个具体模型。
+func (h *Hub) Declares(a *config.Account, poolClass, model string) bool {
+	if model == "" {
+		return false
+	}
+	for _, m := range h.DeclaredModels(a, poolClass) {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
+// Candidates 候选账号。requiredModel 非空时优先返回声明了该模型的账号；
+// 若无人声明则退回「声明了该模态」的全集 —— 宁可让上游给出明确错误，
+// 也不要因为配置漏填就把请求挡在门外。
+func (h *Hub) Candidates(poolClass string, exclude map[string]bool, requiredModel string) []*config.Account {
+	h.mu.Lock()
+	now := time.Now()
+	// 熔断到期自动复活（被动触发，避免依赖后台定时器）
+	var revive []string
+	for id, at := range h.reviveAt {
+		if !at.IsZero() && now.After(at) {
+			revive = append(revive, id)
+		}
+	}
+	for _, id := range revive {
+		delete(h.reviveAt, id)
+	}
+	h.mu.Unlock()
+	for _, id := range revive {
+		h.tryRevive(id)
+	}
+
+	var base []*config.Account
+	for _, a := range h.store.AccountsSnapshot() {
+		if !a.Enabled || strings.TrimSpace(a.APIKey) == "" {
+			continue
+		}
+		if exclude != nil && exclude[a.ID] {
+			continue
+		}
+		if !h.Capable(a, poolClass) {
+			continue
+		}
+		base = append(base, a)
+	}
+	if requiredModel != "" && len(base) > 0 {
+		var declared []*config.Account
+		for _, a := range base {
+			if h.Declares(a, poolClass, requiredModel) {
+				declared = append(declared, a)
+			}
+		}
+		if len(declared) > 0 {
+			return declared
+		}
+	}
+	return base
+}
+
+func (h *Hub) tryRevive(id string) {
+	h.store.MutateAccount(id, func(a *config.Account) bool {
+		if a.Enabled {
+			return false
+		}
+		// 自动复活：置回启用，但**不做清零**——保留已下调的校准系数，
+		// 让该账号以更慢的节拍试探恢复，而不是复活瞬间再撞一次 429。
+		a.Enabled = true
+		a.Stats.LastError = "熔断冷却结束，已自动复活（低速试探）"
+		return true
+	})
+	h.Metrics.BreakerRevived.Add(1)
+	h.Reload()
+}
+
+// StartMaintenance 启动后台维护：熔断复活 + 到期绑定清理 + 因子落盘。
+func (h *Hub) StartMaintenance(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				h.flushFactors()
+				return
+			case <-ticker.C:
+				h.flushFactors()
+			}
+		}
+	}()
+}
+
+// flushFactors 把二维校准因子合并落盘（降写放大：30 秒一次批量写，而不是每次 429 都写）。
+func (h *Hub) flushFactors() {
+	h.mu.Lock()
+	dirty := make([]string, 0, len(h.pendingFactor))
+	for k := range h.pendingFactor {
+		dirty = append(dirty, k)
+	}
+	h.pendingFactor = map[string]bool{}
+	values := make(map[string]float64, len(dirty))
+	for _, k := range dirty {
+		values[k] = h.poolFactors[k]
+	}
+	h.mu.Unlock()
+	if len(dirty) == 0 {
+		return
+	}
+	h.store.MutateAccountMap(values, dirty)
+}
+
+// BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。
+func (h *Hub) BindFactor(accountID, poolClass string, value float64) {
+	h.mu.Lock()
+	h.poolFactors[key(accountID, poolClass)] = value
+	h.pendingFactor[key(accountID, poolClass)] = true
+	h.mu.Unlock()
+	h.flushFactors()
+}
+
+// FactorOf 读取二维校准因子。
+func (h *Hub) FactorOf(accountID, poolClass string) float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	v := h.poolFactors[key(accountID, poolClass)]
+	if v <= 0 {
+		return 1
+	}
+	return v
+}
+
+// ResetFactors 把某账号全部池的校准因子复位为 1。
+func (h *Hub) ResetFactors(accountID string) {
+	h.mu.Lock()
+	for _, cls := range config.PoolClasses {
+		h.poolFactors[key(accountID, cls)] = 1.0
+		h.pendingFactor[key(accountID, cls)] = true
+	}
+	h.mu.Unlock()
+	h.flushFactors()
+}
+
+// ---------------------------------------------------------------------------
+// 粘性会话
+// ---------------------------------------------------------------------------
+
+// SessionKey 计算粘性键（口径 C：先看会话头，无则回落下游 Key）。
+func (h *Hub) SessionKey(headers map[string]string, downstreamKey string) string {
+	mode := strings.ToLower(h.Settings().AffinityMode)
+	if mode == "none" {
+		return ""
+	}
+	session := strings.TrimSpace(headers["x-agnes-session"])
+	if session == "" {
+		session = strings.TrimSpace(headers["x-session-id"])
+	}
+	if session == "" {
+		session = strings.TrimSpace(headers["x-task-id"])
+	}
+	switch mode {
+	case "key":
+		return "key:" + downstreamKey
+	case "session":
+		if session != "" {
+			return "ses:" + session
+		}
+		return ""
+	default: // session_then_key
+		if session != "" {
+			return "ses:" + session
+		}
+		return "key:" + downstreamKey
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 选账号（软粘性 + 溢出）
+// ---------------------------------------------------------------------------
+
+const spillPenalty = 3 * time.Second // 绑定账号预计等待超过此值就让位
+
+// PickResult 是选号结果。
+type PickResult struct {
+	Account *config.Account
+	Penalty time.Duration
+	Spilled bool // 本次是否从粘性绑定溢出了出去
+	Bound   *config.Account
+}
+
+// Pick 选择账号。
+//
+// 优先级：钉死账号 > 粘性绑定（未溢出）> 预计等待最短。
+// 全部账号处于冷却时**不退化为报错**，而是等最早解冻的那个 ——
+// 无人值守场景下「等一下」远好于「任务断掉」。
+func (h *Hub) Pick(sessionKey, poolClass, pinned, requiredModel string, exclude map[string]bool) (PickResult, error) {
+	if pinned != "" && (exclude == nil || !exclude[pinned]) {
+		if a := h.store.AccountByID(pinned); a != nil && a.Enabled && strings.TrimSpace(a.APIKey) != "" &&
+			h.Capable(a, poolClass) && (exclude == nil || !exclude[pinned]) {
+			return PickResult{Account: a, Penalty: h.PenaltyRemaining(a.ID)}, nil
+		}
+	}
+
+	var bound *config.Account
+	if sessionKey != "" {
+		if b, ok := h.store.BindingsGet(sessionKey); ok {
+			if a := h.store.AccountByID(b.AccountID); a != nil && a.Enabled &&
+				strings.TrimSpace(a.APIKey) != "" && h.Capable(a, poolClass) &&
+				(exclude == nil || !exclude[a.ID]) {
+				bound = a
+			}
+		}
+	}
+
+	healthy := func(list []*config.Account) []*config.Account {
+		var out []*config.Account
+		for _, a := range list {
+			if h.PenaltyRemaining(a.ID) <= 0 {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+
+	candidates := h.Candidates(poolClass, exclude, requiredModel)
+	poolCandidates := healthy(candidates)
+
+	// --- 软粘性：绑定账号健康且不拥堵时沿用，否则溢出改派 ---
+	if bound != nil && h.PenaltyRemaining(bound.ID) <= 0 {
+		wait := h.Pacer(bound, poolClass).ProjectedWait()
+		alt := bestOf(h, poolCandidates, poolClass, bound.ID)
+		if wait <= spillPenalty || alt == nil {
+			return PickResult{Account: bound, Penalty: 0, Bound: bound}, nil
+		}
+		h.Metrics.Spillovers.Add(1)
+		h.store.Bind(sessionKey, alt.ID)
+		return PickResult{Account: alt, Penalty: h.PenaltyRemaining(alt.ID), Spilled: true, Bound: bound}, nil
+	}
+
+	final := poolCandidates
+	if len(final) == 0 {
+		// 忽略 exclude 再来一轮：单账号 / 全员冷却时，等待远好于直接失败
+		final = healthy(h.Candidates(poolClass, nil, requiredModel))
+		if len(final) == 0 {
+			all := h.Candidates(poolClass, nil, requiredModel)
+			if len(all) == 0 {
+				return PickResult{}, fmt.Errorf("%w：池分类 %s 下没有可用账号（未配置 / 已停用 / 未声明该模态）",
+					ErrNoCapacity, poolClass)
+			}
+			var bestAcc *config.Account
+			var bestWait time.Duration
+			for i, a := range all {
+				w := h.PenaltyRemaining(a.ID)
+				if i == 0 || w < bestWait {
+					bestAcc, bestWait = a, w
+				}
+			}
+			return PickResult{Account: bestAcc, Penalty: bestWait}, nil
+		}
+	}
+
+	chosen := bestOf(h, final, poolClass, "")
+	if chosen == nil {
+		return PickResult{}, fmt.Errorf("%w：池分类 %s 无可用账号", ErrNoCapacity, poolClass)
+	}
+	if sessionKey != "" {
+		h.store.Bind(sessionKey, chosen.ID)
+	}
+	return PickResult{Account: chosen, Penalty: h.PenaltyRemaining(chosen.ID)}, nil
+}
+
+// bestOf 在候选里挑预计等待最短者；同等待时比在途请求数。
+func bestOf(h *Hub, candidates []*config.Account, poolClass, skipID string) *config.Account {
+	var best *config.Account
+	var bestWait time.Duration
+	bestInflight := 0
+	for _, a := range candidates {
+		if a.ID == skipID {
+			continue
+		}
+		w := h.Pacer(a, poolClass).ProjectedWait()
+		inflight := h.Inflight(a.ID)
+		if best == nil || w < bestWait || (w == bestWait && inflight < bestInflight) {
+			best, bestWait, bestInflight = a, w, inflight
+		}
+	}
+	return best
+}
+
+// PenaltyRemaining 该账号的冷却剩余时长。
+func (h *Hub) PenaltyRemaining(accountID string) time.Duration {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	until, ok := h.penaltyUntil[accountID]
+	if !ok {
+		return 0
+	}
+	if d := time.Until(until); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// Inflight 该账号当前在途请求数。
+func (h *Hub) Inflight(accountID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.inflight[accountID]
+}
+
+// TrackInflight 调整在途计数。
+func (h *Hub) TrackInflight(accountID string, delta int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.inflight[accountID] = maxInt(0, h.inflight[accountID]+delta)
+}
+
+// ---------------------------------------------------------------------------
+// 领槽位
+// ---------------------------------------------------------------------------
+
+// Acquire 等待并领取一个发送槽位，返回排队等待时长。
+func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) (time.Duration, error) {
+	s := h.Settings()
+	maxWait := time.Duration(s.QueueMaxWaitMS) * time.Millisecond
+	limitMS := s.QueueMaxWaitMS
+
+	started := time.Now()
+	if penalty := h.PenaltyRemaining(a.ID); penalty > 0 {
+		select {
+		case <-time.After(penalty):
+		case <-ctx.Done():
+			return time.Since(started), ctx.Err()
+		}
+	}
+	waited, err := h.Pacer(a, poolClass).Reserve(ctx, maxWait-time.Since(started), s.QueueMaxSize)
+	if err != nil {
+		switch {
+		case errors.Is(err, pacer.ErrQueueFull):
+			h.Metrics.QueueOverflow.Add(1)
+			return time.Since(started), fmt.Errorf("%w（上限 %d）", ErrQueueFull, s.QueueMaxSize)
+		case errors.Is(err, pacer.ErrTooLong):
+			h.Metrics.QueueTimeout.Add(1)
+			return time.Since(started), fmt.Errorf("%w %dms（实际需等待 %s）", ErrQueueTimeout, limitMS, waited)
+		default:
+			return time.Since(started), err
+		}
+	}
+	total := time.Since(started)
+	if total > maxWait {
+		h.Metrics.QueueTimeout.Add(1)
+		return total, fmt.Errorf("%w %dms（实际 %s）", ErrQueueTimeout, limitMS, total)
+	}
+	if total > 1500*time.Millisecond {
+		h.Metrics.QueuedTotal.Add(1)
+	}
+	_ = waited
+	return total, nil
+}
+
+// ---------------------------------------------------------------------------
+// 反馈：429 / 成功 / 鉴权失败
+// ---------------------------------------------------------------------------
+
+// OnRateLimited 上游真的返回了 429 —— 我们高估了边界，触发该 (账号 × 池) 的自适应下调。
+//
+// 关键：只下调出问题的那一个池，且**绝不改写账号级系数**。
+// effectiveRPM = 基线 × 安全系数 × 账号级系数 × 池因子，只要账号级系数被写一次，
+// 惩罚就会横向传染到该账号的全部池：视频池只有 1 RPM、最容易 429，一次视频限流
+// 会连带把文本池砍掉 20% —— 这正是「配了多账号、文本却一起变慢」的根因。
+// 因此这里只动 pool_factors[池]。
+func (h *Hub) OnRateLimited(a *config.Account, poolClass string) {
+	s := h.Settings()
+	h.Metrics.Upstream429.Add(1)
+
+	floor := s.MinLearnedFactor
+	if floor <= 0 {
+		floor = 0.5
+	}
+	penalty := s.PenaltyFactor
+	if penalty <= 0 {
+		penalty = 0.8
+	}
+	cooldown := time.Duration(s.PenaltyCooldownSec * float64(time.Second))
+
+	h.mu.Lock()
+	k := key(a.ID, poolClass)
+	factor := h.poolFactors[k]
+	if factor <= 0 {
+		factor = 1
+	}
+	if s.CalibrationEnabled {
+		factor = math.Max(floor, factor*penalty)
+		h.poolFactors[k] = factor
+		h.pendingFactor[k] = true
+	}
+	h.last429[k] = time.Now()
+	h.successes[k] = 0
+	h.penaltyUntil[a.ID] = time.Now().Add(cooldown)
+	h.mu.Unlock()
+
+	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+		acc.Stats.RateLimited++
+		acc.LastRateLimited = float64(time.Now().UnixNano()) / 1e9
+		if s.CalibrationEnabled {
+			// 立即落盘该池因子（不等 30s 批量 flush），保证进程重启后校准不丢；
+			// 但只写这一个池键，不做账号级降权。
+			if acc.PoolFactors == nil {
+				acc.PoolFactors = map[string]float64{}
+			}
+			acc.PoolFactors[poolClass] = factor
+		}
+		return true
+	})
+	h.Reload()
+}
+
+// OnSuccess 按「成功次数」回升校准因子（而非按墙钟 —— 墙钟回升在低流量账号上
+// 永远等不到，表现为「校准砍下去就再也回不来」）。
+func (h *Hub) OnSuccess(a *config.Account, poolClass string) {
+	s := h.Settings()
+	if !s.CalibrationEnabled {
+		return
+	}
+	need := s.RecoverSuccesses
+	if need <= 0 {
+		need = 20
+	}
+	h.mu.Lock()
+	k := key(a.ID, poolClass)
+	h.successes[k]++
+	current := h.poolFactors[k]
+	if current <= 0 {
+		current = 1
+	}
+	recovered := false
+	if h.successes[k] >= need && current < 1 {
+		step := 0.05
+		h.poolFactors[k] = math.Min(1, current+step)
+		h.successes[k] = 0
+		h.pendingFactor[k] = true
+		recovered = true
+	}
+	h.mu.Unlock()
+	if recovered {
+		p := h.Pacer(a, poolClass)
+		p.Reconfigure(h.EffectiveRPM(a, poolClass), s.PacingWindowSec)
+	}
+}
+
+// OnAuthFailure 401/403/402 不可重试：立即熔断并安排自动复活。
+func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
+	s := h.Settings()
+	reviveAfter := time.Duration(s.BreakerReviveSec) * time.Second
+	if reviveAfter <= 0 {
+		reviveAfter = 30 * time.Minute
+	}
+	h.mu.Lock()
+	h.reviveAt[a.ID] = time.Now().Add(reviveAfter)
+	h.mu.Unlock()
+	h.Metrics.BreakerOpened.Add(1)
+
+	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+		acc.Enabled = false
+		acc.Stats.Errors++
+		acc.Stats.LastError = truncate(reason, 200) +
+			fmt.Sprintf("（已熔断，%s 后自动复活低速试探）", reviveAfter)
+		return true
+	})
+	h.Reload()
+}
+
+// NoteError 记录一次性错误（不熔断）。
+func (h *Hub) NoteError(a *config.Account, reason string) {
+	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+		acc.Stats.Errors++
+		acc.Stats.LastError = truncate(reason, 200)
+		return true
+	})
+}
+
+// NoteSuccess 记一次成功（统计）。
+func (h *Hub) NoteSuccess(a *config.Account) {
+	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+		acc.Stats.Requests++
+		acc.Stats.LastUsedAt = float64(time.Now().UnixNano()) / 1e9
+		return true
+	})
+	h.Metrics.RequestsOK.Add(1)
+}
+
+// ---------------------------------------------------------------------------
+// 观测
+// ---------------------------------------------------------------------------
+
+// Snapshot 生成控制台总览。
+func (h *Hub) Snapshot() map[string]any {
+	s := h.Settings()
+	accounts := make([]map[string]any, 0)
+	for _, a := range h.store.AccountsSnapshot() {
+		buckets := map[string]any{}
+		for _, cls := range config.PoolClasses {
+			p := h.Pacer(a, cls)
+			buckets[cls] = map[string]any{
+				"rpm":               round2(p.RPM()),
+				"waiting":           p.Waiting(),
+				"projected_wait_ms": p.ProjectedWait().Milliseconds(),
+				"factor":            round3(h.FactorOf(a.ID, cls)),
+				"declared":          h.DeclaredModels(a, cls),
+			}
+		}
+		accounts = append(accounts, map[string]any{
+			"id":                   a.ID,
+			"name":                 a.Name,
+			"group":                a.Group,
+			"enabled":              a.Enabled,
+			"access_type":          a.AccessType,
+			"classes_enabled":      a.ClassesEnabled,
+			"model_manifest":       a.ModelManifest,
+			"learned_factor":       round3(a.LearnedFactor),
+			"penalty_remaining_ms": h.PenaltyRemaining(a.ID).Milliseconds(),
+			"inflight":             h.Inflight(a.ID),
+			"stats":                a.Stats,
+			"buckets":              buckets,
+		})
+	}
+	total := h.Metrics.RequestsTotal.Load()
+	if total == 0 {
+		total = 1
+	}
+	return map[string]any{
+		"metrics": map[string]any{
+			"started_at":      h.Metrics.StartedAt.Format("2006-01-02 15:04:05"),
+			"uptime_sec":      int(time.Since(h.Metrics.StartedAt).Seconds()),
+			"requests_total":  h.Metrics.RequestsTotal.Load(),
+			"requests_ok":     h.Metrics.RequestsOK.Load(),
+			"requests_error":  h.Metrics.RequestsError.Load(),
+			"upstream_429":    h.Metrics.Upstream429.Load(),
+			"queued_total":    h.Metrics.QueuedTotal.Load(),
+			"queue_timeout":   h.Metrics.QueueTimeout.Load(),
+			"queue_overflow":  h.Metrics.QueueOverflow.Load(),
+			"spillovers":      h.Metrics.Spillovers.Load(),
+			"breaker_opened":  h.Metrics.BreakerOpened.Load(),
+			"breaker_revived": h.Metrics.BreakerRevived.Load(),
+			"wait_ms_total":   h.Metrics.WaitMS.Load(),
+		},
+		"avg_wait_ms":  h.Metrics.WaitMS.Load() / total,
+		"accounts":     accounts,
+		"bindings":     len(h.store.BindingsSnapshot()),
+		"keys":         len(h.store.KeysSnapshot()),
+		"pool_classes": config.PoolClasses,
+		"auto_routing": map[string]any{
+			"enabled":        true,
+			"model_name":     s.AutoModelName,
+			"content_scan":   s.AutoIntent.ContentScan,
+			"min_confidence": s.AutoIntent.MinConfidence,
+		},
+	}
+}
+
+// QueueView 队列视图。
+func (h *Hub) QueueView() []map[string]any {
+	var out []map[string]any
+	for _, a := range h.store.AccountsSnapshot() {
+		for _, cls := range config.PoolClasses {
+			p := h.Pacer(a, cls)
+			if p.Waiting() == 0 {
+				continue
+			}
+			out = append(out, map[string]any{
+				"account":           a.Name,
+				"account_id":        a.ID,
+				"pool_class":        cls,
+				"waiting":           p.Waiting(),
+				"rpm":               round2(p.RPM()),
+				"projected_wait_ms": p.ProjectedWait().Milliseconds(),
+			})
+		}
+	}
+	return out
+}
+
+func round2(v float64) float64 { return math.Round(v*100) / 100 }
+func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}

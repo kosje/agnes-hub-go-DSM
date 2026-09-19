@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>agnes-hub 控制台</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --line:#e4e7ec; --ink:#1c2430; --muted:#65717f;
+    --brand:#2f6fed; --brand-soft:#eaf1ff; --good:#12805c; --good-soft:#e7f6ef;
+    --warn:#a86400; --warn-soft:#fdf3e2; --bad:#c0293b; --bad-soft:#fdecee;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  a{color:var(--brand)}
+  h1,h2,h3{margin:0 0 10px;font-weight:650}
+  h1{font-size:18px}h2{font-size:15px}h3{font-size:13px;color:var(--muted);text-transform:none}
+  code,pre{font-family:var(--mono);font-size:12px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .spread{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+  .grid{display:grid;gap:12px}
+  .g4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .kpi .v{font-size:24px;font-weight:700;font-family:var(--mono)}
+  .kpi .k{color:var(--muted);font-size:12px;margin-bottom:4px}
+  button{font:inherit;padding:7px 13px;border-radius:9px;border:1px solid var(--line);
+    background:#fff;color:var(--ink);cursor:pointer}
+  button:hover{border-color:#c9cfd8}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  button.primary:hover{filter:brightness(1.06)}
+  button.danger{color:var(--bad);border-color:#f0cdd2}
+  button.sm{padding:4px 9px;font-size:12px;border-radius:7px}
+  input,select,textarea{font:inherit;padding:7px 10px;border:1px solid var(--line);
+    border-radius:9px;background:#fff;color:var(--ink);width:100%}
+  textarea{font-family:var(--mono);font-size:12px;min-height:90px;resize:vertical}
+  label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:12px;color:var(--muted);font-weight:600;background:#fafbfc}
+  tr:last-child td{border-bottom:none}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;
+    background:#eef1f5;color:var(--muted);white-space:nowrap}
+  .pill.ok{background:var(--good-soft);color:var(--good)}
+  .pill.off{background:var(--bad-soft);color:var(--bad)}
+  .pill.info{background:var(--brand-soft);color:var(--brand)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .muted{color:var(--muted)}
+  .mono{font-family:var(--mono)}
+  .scroll{overflow:auto;max-height:520px}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  .tabs button{border-radius:999px;padding:6px 14px}
+  .tabs button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .hide{display:none!important}
+  .banner{padding:10px 12px;border-radius:10px;font-size:13px;margin-bottom:12px}
+  .banner.warn{background:var(--warn-soft);color:var(--warn)}
+  .banner.good{background:var(--good-soft);color:var(--good)}
+  .banner.bad{background:var(--bad-soft);color:var(--bad)}
+  .bar{height:7px;border-radius:999px;background:#eef1f5;overflow:hidden;min-width:70px}
+  .bar>i{display:block;height:100%;background:var(--brand)}
+  .login{max-width:380px;margin:8vh auto}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  details summary{cursor:pointer;color:var(--brand);font-size:13px}
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+const POOLS = ["text","image_1k","image_2k","image_3k","image_4k","video"];
+const MODALITIES = ["text","image","video"];
+const state = { tab:"overview", session:null, stats:null, accounts:null, keys:[], logs:[], settings:null, jobs:[], bindings:[] };
+
+/* ---------------- 基础 ---------------- */
+async function api(path, opts={}){
+  const r = await fetch(path, {credentials:"same-origin",
+    headers:{"Content-Type":"application/json"}, ...opts});
+  const text = await r.text();
+  let data = null;
+  try{ data = text ? JSON.parse(text) : null; }catch(e){ data = {raw:text}; }
+  if(!r.ok){
+    const msg = (data && data.error && data.error.message) || ("HTTP "+r.status);
+    const err = new Error(msg); err.status = r.status; err.data = data; throw err;
+  }
+  return data;
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function num(n){ return Number(n||0).toLocaleString("en-US"); }
+function toast(msg, kind){ const el=document.getElementById("toast"); if(!el) return;
+  el.className = "banner "+(kind||"good"); el.textContent = msg; el.classList.remove("hide");
+  clearTimeout(el._t); el._t=setTimeout(()=>el.classList.add("hide"), 4200); }
+
+/* ---------------- 登录 ---------------- */
+function renderLogin(mustChange){
+  document.getElementById("app").innerHTML = `
+  <div class="login">
+    <div class="card">
+      <h1>agnes-hub 控制台</h1>
+      <p class="muted">Agnes AI 多账号聚合中转 · RPM 排队限流网关</p>
+      <div id="toast" class="hide"></div>
+      <label>管理员密码</label>
+      <input id="pw" type="password" placeholder="初始密码 admin123" autocomplete="current-password">
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btnLogin">登录</button>
+        ${mustChange?`<span class="pill warn">首次登录请改密</span>`:""}
+      </div>
+      <div class="hint">登录状态保持 7 天；改密后所有会话立即失效。</div>
+    </div>
+  </div>`;
+  const go = async ()=>{
+    try{
+      const r = await api("/api/login",{method:"POST",body:JSON.stringify({password:document.getElementById("pw").value})});
+      state.session = {logged_in:true, must_change_password:r.must_change_password};
+      await boot();
+    }catch(e){ toast(e.message,"bad"); }
+  };
+  document.getElementById("btnLogin").onclick = go;
+  document.getElementById("pw").onkeydown = e=>{ if(e.key==="Enter") go(); };
+  document.getElementById("pw").focus();
+}
+
+/* ---------------- 主框架 ---------------- */
+const TABS = [
+  ["overview","总览"],["accounts","账号池"],["keys","下游密钥"],
+  ["queue","队列"],["jobs","视频任务"],["intent","意图测试"],["logs","日志"],["settings","设置"]
+];
+function renderShell(){
+  document.getElementById("app").innerHTML = `
+  <div style="max-width:1240px;margin:0 auto;padding:20px">
+    <div class="spread" style="margin-bottom:14px">
+      <div>
+        <h1>agnes-hub 控制台</h1>
+        <div class="muted" id="subline">加载中…</div>
+      </div>
+      <div class="row">
+        <button class="sm" id="btnRefresh">刷新</button>
+        <button class="sm" id="btnPw">修改密码</button>
+        <button class="sm danger" id="btnLogout">退出</button>
+      </div>
+    </div>
+    <div id="mustChange" class="hide"></div>
+    <div id="toast" class="hide"></div>
+    <div class="tabs" id="tabs"></div>
+    <div id="view"></div>
+  </div>`;
+  const tabs = document.getElementById("tabs");
+  tabs.innerHTML = TABS.map(([k,label])=>`<button data-tab="${k}" class="${state.tab===k?"on":""}">${label}</button>`).join("");
+  tabs.querySelectorAll("button").forEach(b=>b.onclick=()=>{ state.tab=b.dataset.tab; renderShell(); refresh(); });
+  document.getElementById("btnRefresh").onclick = ()=>refresh();
+  document.getElementById("btnLogout").onclick = async ()=>{ await api("/api/logout",{method:"POST"}); location.reload(); };
+  document.getElementById("btnPw").onclick = changePassword;
+  if(state.session?.must_change_password){
+    const el = document.getElementById("mustChange");
+    el.className = "banner warn";
+    el.innerHTML = `当前仍在使用初始密码 <b>admin123</b>，请立即修改。<button class="sm primary" style="margin-left:8px" onclick="changePassword()">去修改</button>`;
+  }
+}
+async function changePassword(){
+  const a = prompt("输入新密码（至少 6 位）"); if(!a) return;
+  const b = prompt("再输入一次确认"); if(a!==b){ alert("两次输入不一致"); return; }
+  try{ await api("/api/password",{method:"POST",body:JSON.stringify({new_password:a})});
+    state.session.must_change_password=false; toast("密码已修改","good"); renderShell(); }
+  catch(e){ alert(e.message); }
+}
+
+/* ---------------- 总览 ---------------- */
+function viewOverview(){
+  const s = state.stats || {}, m = s.metrics || {};
+  const uls = m.upstream_429 || 0;
+  const banner = uls === 0
+    ? `<div class="banner good">上游 429 次数为 0 —— 限流排队生效，客户端没有被限流过。</div>`
+    : `<div class="banner warn">上游已返回 ${uls} 次 429。系统会自动下调该账号该池的节拍（其它池不受影响），并已把客户端请求排队而非报错。</div>`;
+  const accRows = (s.accounts||[]).map(a=>{
+    const buckets = a.buckets||{};
+    const active = POOLS.filter(p=>buckets[p] && buckets[p].rpm>0);
+    const bars = active.map(p=>{
+      const b = buckets[p]||{};
+      const load = Math.min(100, Math.round((b.waiting? (b.projected_wait_ms/1000)*100/6 : 0)));
+      return `<div style="margin-bottom:4px">
+        <span class="pill ${b.factor<1?"warn":""}">${esc(p)} · ${b.rpm} RPM</span>
+        <span class="muted" style="font-size:11px">排队 ${b.waiting} 人 · 预计 ${Math.round((b.projected_wait_ms||0)/100)/10}s · 校准 ${b.factor}</span>
+        <div class="bar"><i style="width:${load}%"></i></div>
+      </div>`;
+    }).join("");
+    const declared = MODALITIES.map(mod=>{
+      const list = [];
+      active.forEach(p=>{ (buckets[p]?.declared||[]).forEach(x=>{ if(!list.includes(x)) list.push(x); }); });
+      return list.length? `<div class="muted" style="font-size:11px">${esc(mod)}: <span class="mono">${esc(list.join(", "))}</span></div>`:"";
+    }).join("");
+    return `<tr>
+      <td><b>${esc(a.name)}</b>${a.group?` <span class="pill">${esc(a.group)}</span>`:""}
+        <div class="muted" style="font-size:11px">${esc(a.access_type)}</div></td>
+      <td>${a.enabled?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}
+        ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却 ${Math.round(a.penalty_remaining_ms/1000)}s</span>`:""}</td>
+      <td style="min-width:210px">${bars||'<span class="muted">无可用池</span>'}${declared}</td>
+      <td class="mono">${num(a.stats?.requests)} / 错误 ${num(a.stats?.errors)} / 限流 ${num(a.stats?.rate_limited)}</td>
+    </tr>`;
+  }).join("");
+  return `
+  ${banner}
+  <div class="grid g4" style="margin-bottom:14px">
+    <div class="kpi"><div class="k">请求总数</div><div class="v">${num(m.requests_total)}</div></div>
+    <div class="kpi"><div class="k">成功</div><div class="v">${num(m.requests_ok)}</div></div>
+    <div class="kpi"><div class="k" style="color:${uls?"var(--good)":"var(--muted)"}">上游 429</div><div class="v" style="color:${uls?"var(--good)":"inherit"}">${num(uls)}</div></div>
+    <div class="kpi"><div class="k">排队过</div><div class="v">${num(m.queued_total)}</div></div>
+    <div class="kpi"><div class="k">平均等待</div><div class="v">${num(s.avg_wait_ms)}<span style="font-size:13px">ms</span></div></div>
+    <div class="kpi"><div class="k">粘性溢出</div><div class="v">${num(m.spillovers)}</div><div class="muted" style="font-size:11px">绑定账号拥堵时改派次数</div></div>
+    <div class="kpi"><div class="k">熔断 / 复活</div><div class="v">${num(m.breaker_opened)} / ${num(m.breaker_revived)}</div></div>
+    <div class="kpi"><div class="k">账号 / 密钥</div><div class="v">${num((s.accounts||[]).length)} / ${num(s.keys)}</div></div>
+  </div>
+  <div class="card">
+    <h2>账号负载</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>账号</th><th>状态</th><th>各池节拍与已声明模型</th><th>累计</th></tr></thead>
+      <tbody>${accRows||'<tr><td colspan="4" class="muted">还没有账号，请到「账号池」添加</td></tr>'}</tbody>
+    </table></div>
+  </div>`;
+}
+
+/* ---------------- 账号池 ---------------- */
+function manifestEditor(id, manifest){
+  const m = manifest || {};
+  return MODALITIES.map(mod=>`
+    <div>
+      <label>${mod} 模型（逗号分隔；<b>留空 = 明示不支持该模态</b>）</label>
+      <input id="${id}_${mod}" value="${esc((m[mod]||[]).join(", "))}" placeholder="例如 agnes-2.5-flash, agnes-2.0-flash">
+    </div>`).join("");
+}
+function viewAccounts(){
+  const data = state.accounts || {accounts:[]};
+  const rows = (data.accounts||[]).map(a=>{
+    const eff = a.rpm_effective||{}, base = a.rpm_base||{};
+    const rpm = POOLS.filter(p=>(base[p]||0)>0).map(p=>{
+      const b = base[p], e = eff[p];
+      return `<span class="pill ${e<b?"warn":""}" title="标称 ${b} → 校准后 ${e}">${p} ${e}</span>`;
+    }).join(" ");
+    return `<tr>
+      <td><b>${esc(a.name)}</b>
+        <div class="muted" style="font-size:11px">${esc(a.group||"—")} · ${esc(a.access_type)} · <span class="mono">${esc(a.api_key_masked)}</span></div>
+        <div class="muted" style="font-size:11px" title="${esc(a.base_url)}">${esc(a.base_url)}</div>
+        <div class="muted mono" style="font-size:11px">text: ${esc((a.model_manifest?.text||[]).join(", ")||"（不支持）")}</div>
+        <div class="muted mono" style="font-size:11px">image: ${esc((a.model_manifest?.image||[]).join(", ")||"（不支持）")}</div>
+        <div class="muted mono" style="font-size:11px">video: ${esc((a.model_manifest?.video||[]).join(", ")||"（不支持）")}</div>
+      </td>
+      <td>${a.enabled?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}
+        ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却</span>`:""}
+        ${a.stats?.rate_limited?`<span class="pill warn">限流 ${a.stats.rate_limited}</span>`:""}</td>
+      <td style="min-width:220px">${rpm}</td>
+      <td class="row" style="gap:4px">
+        <button class="sm" data-act="test" data-id="${esc(a.id)}">测试</button>
+        <button class="sm" data-act="toggle" data-id="${esc(a.id)}" data-on="${a.enabled?1:0}">${a.enabled?"停用":"启用"}</button>
+        <button class="sm" data-act="edit" data-id="${esc(a.id)}">编辑</button>
+        <button class="sm" data-act="factors" data-id="${esc(a.id)}">复位校准</button>
+        <button class="sm danger" data-act="del" data-id="${esc(a.id)}">删除</button>
+      </td>
+    </tr>`;
+  }).join("");
+  return `
+  <div class="grid g2">
+    <div class="card">
+      <h2>添加账号</h2>
+      <div class="grid">
+        <div><label>名称</label><input id="aName" placeholder="Agnes-中国站-1"></div>
+        <div><label>API Key</label><input id="aKey" placeholder="sk-..."></div>
+        <div><label>Base URL</label><input id="aBase" placeholder="https://api.agnes-ai.cn/v1"></div>
+        <div class="row">
+          <div style="flex:1"><label>账号类型</label>
+            <select id="aType">${["free","enterprise","tokenplan"].map(t=>`<option>${t}</option>`).join("")}</select></div>
+          <div style="flex:1"><label>分组（可选）</label><input id="aGroup" placeholder="cn-free"></div>
+          <div style="flex:1"><label>单账号并发</label><input id="aConc" type="number" value="8" min="1"></div>
+        </div>
+        ${manifestEditor("aMf", (data.default_manifest)||{})}
+        <div class="hint">留空的模态会被视为「该账号不支持」，调度时自动跳过 —— 这正是「多账号按模态分工」的开关。</div>
+        <div><button class="primary" id="btnAddAcc">添加账号</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>批量导入</h2>
+      <label>每行一个账号：<span class="mono">名称,key[,base_url[,access_type[,group]]]</span>，以 # 开头的行会被忽略</label>
+      <textarea id="bulkText" placeholder="Agnes-1,sk-xxxx,https://api.agnes-ai.cn/v1,free,cn
+Agnes-2,sk-yyyy,https://api.agnes-ai.cn/v1,free,cn"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="btnBulk">批量导入</button>
+        <span class="muted">逐行校验，失败的行会单独回报原因</span>
+      </div>
+      <div id="bulkResult" style="margin-top:10px"></div>
+      <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+      <h2>按分组批量改配置</h2>
+      <div class="row">
+        <div style="flex:1"><label>分组名（留空 = 全部账号）</label><input id="bulkGroup" placeholder="cn-free"></div>
+        <div style="flex:1"><label>操作</label><select id="bulkOp">
+          <option value="enable">全部启用</option><option value="disable">全部停用</option>
+        </select></div>
+        <div style="align-self:flex-end"><button id="btnBulkUpdate">执行</button></div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="spread"><h2>账号列表（${(data.accounts||[]).length}）</h2>
+      <div class="muted">标称 RPM 来自官方档位表；「校准后」是吃 429 反馈自适应后的实际节拍</div></div>
+    <div class="scroll"><table>
+      <thead><tr><th>账号 / 模型清单</th><th>状态</th><th>各池有效 RPM</th><th>操作</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="4" class="muted">暂无账号</td></tr>'}</tbody>
+    </table></div>
+  </div>`;
+}
+function bindAccountEvents(){
+  const view = document.getElementById("view");
+  const add = document.getElementById("btnAddAcc");
+  if(add) add.onclick = async ()=>{
+    const manifest = {}; MODALITIES.forEach(m=>manifest[m] = document.getElementById("aMf_"+m).value.split(",").map(s=>s.trim()).filter(Boolean));
+    try{
+      await api("/api/accounts",{method:"POST",body:JSON.stringify({
+        name:document.getElementById("aName").value, api_key:document.getElementById("aKey").value,
+        base_url:document.getElementById("aBase").value, access_type:document.getElementById("aType").value,
+        group:document.getElementById("aGroup").value, max_concurrency:Number(document.getElementById("aConc").value)||8,
+        model_manifest:manifest
+      })});
+      toast("账号已添加","good"); await refresh();
+    }catch(e){ toast(e.message,"bad"); }
+  };
+  const bulk = document.getElementById("btnBulk");
+  if(bulk) bulk.onclick = async ()=>{
+    try{
+      const r = await api("/api/accounts/bulk",{method:"POST",body:JSON.stringify({text:document.getElementById("bulkText").value})});
+      const f = (r.failed||[]).map(x=>`<div class="banner bad">第 ${x.line} 行：${esc(x.reason)}<br><span class="mono">${esc(x.text)}</span></div>`).join("");
+      document.getElementById("bulkResult").innerHTML =
+        `<div class="banner good">成功导入 ${r.added_count} 个账号</div>${f}`;
+      await refresh();
+    }catch(e){ toast(e.message,"bad"); }
+  };
+  const bu = document.getElementById("btnBulkUpdate");
+  if(bu) bu.onclick = async ()=>{
+    const op = document.getElementById("bulkOp").value;
+    try{
+      const r = await api("/api/accounts/bulk-update",{method:"POST",body:JSON.stringify({
+        group:document.getElementById("bulkGroup").value.trim(), enabled: op==="enable"
+      })});
+      toast(`已更新 ${r.updated} / ${r.matched} 个账号`,"good"); await refresh();
+    }catch(e){ toast(e.message,"bad"); }
+  };
+  view.querySelectorAll("button[data-act]").forEach(b=>b.onclick=()=>accountAction(b.dataset.act,b.dataset.id,b.dataset.on));
+}
+async function accountAction(act,id,on){
+  try{
+    if(act==="test"){
+      toast("正在测试…（会向上游发一个最小请求）","warn");
+      const r = await api("/api/accounts/"+id+"/test",{method:"POST"});
+      const drift = (r.drift||[]).map(d=>`<div class="banner warn">${esc(d.modality)} 的 <span class="mono">${esc(d.model)}</span>：${esc(d.issue)}</div>`).join("");
+      document.getElementById("view").insertAdjacentHTML("afterbegin",
+        `<div class="card"><div class="spread"><h2>测试结果</h2><button class="sm" onclick="this.closest('.card').remove()">关闭</button></div>
+          <div class="banner ${r.ok?"good":"bad"}">HTTP ${r.status} · ${r.latency_ms}ms · ${esc(r.hint)}</div>
+          ${drift}
+          ${r.models&&r.models.length?`<details open><summary>上游真实可用模型（${r.models.length}）</summary>
+            <div class="mono" style="margin-top:8px;font-size:12px">${esc(r.models.join(", "))}</div></details>`:""}
+          ${r.body?`<details><summary>响应体</summary><pre class="mono">${esc(r.body)}</pre></details>`:""}
+        </div>`);
+      return;
+    }
+    if(act==="toggle"){ await api("/api/accounts/"+id,{method:"PATCH",body:JSON.stringify({enabled:on!=="1"})}); }
+    if(act==="factors"){ await api("/api/accounts/"+id+"/reset-factors",{method:"POST"}); toast("校准系数已复位","good"); }
+    if(act==="del"){ if(!confirm("确认删除该账号？")) return; await api("/api/accounts/"+id,{method:"DELETE"}); }
+    if(act==="edit"){
+      const acc = (state.accounts.accounts||[]).find(x=>x.id===id); if(!acc) return;
+      const name = prompt("名称", acc.name); if(name===null) return;
+      const group = prompt("分组", acc.group||""); if(group===null) return;
+      const conc = prompt("单账号并发", acc.max_concurrency); if(conc===null) return;
+      const mf = {};
+      for(const m of MODALITIES){
+        const cur = (acc.model_manifest?.[m]||[]).join(", ");
+        const v = prompt(`${m} 模型（逗号分隔，留空 = 不支持）`, cur);
+        if(v===null) return;
+        mf[m] = v.split(",").map(s=>s.trim()).filter(Boolean);
+      }
+      await api("/api/accounts/"+id,{method:"PATCH",body:JSON.stringify({
+        name, group, max_concurrency:Number(conc)||8, model_manifest:mf})});
+    }
+    await refresh();
+  }catch(e){ toast(e.message,"bad"); }
+}
+
+/* ---------------- 密钥 ---------------- */
+function viewKeys(){
+  const rows = (state.keys||[]).map(k=>`
+    <tr>
+      <td><b>${esc(k.name)}</b><div class="muted" style="font-size:11px">${esc(k.UsedDate||k.used_date||"")}</div></td>
+      <td><span class="mono" style="font-size:11px">${esc(k.Key||k.key)}</span></td>
+      <td>${esc((k.Classes||k.classes||[]).join(", "))}</td>
+      <td class="mono">${num(k.UsedToday??k.used_today)} / ${num(k.DailyQuota??k.daily_quota)||"∞"}</td>
+      <td class="mono">${num(k.UsedTotal??k.used_total)} / ${num(k.TotalQuota??k.total_quota)||"∞"}</td>
+      <td>${(k.Enabled??k.enabled)?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}</td>
+      <td><button class="sm danger" data-del="${esc(k.Key||k.key)}">删除</button></td>
+    </tr>`).join("");
+  return `
+  <div class="card">
+    <h2>新建下游密钥</h2>
+    <div class="row">
+      <div style="flex:2"><label>名称</label><input id="kName" placeholder="WorkBuddy / Claude Code"></div>
+      <div style="flex:1"><label>允许的池（逗号分隔，* 表示全部）</label><input id="kClasses" value="*"></div>
+      <div style="flex:1"><label>每日额度（0=不限）</label><input id="kDaily" type="number" value="0"></div>
+      <div style="flex:1"><label>总额度（0=不限）</label><input id="kTotal" type="number" value="0"></div>
+      <div style="align-self:flex-end"><button class="primary" id="btnAddKey">签发</button></div>
+    </div>
+    <div class="hint">客户端把 Base URL 指向 <span class="mono">http://127.0.0.1:4142/v1</span>，模型填 <span class="mono">agnes-auto</span>，Key 填这里签发的值。</div>
+  </div>
+  <div class="card">
+    <h2>密钥列表</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>名称</th><th>密钥</th><th>允许池</th><th>今日</th><th>累计</th><th>状态</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="7" class="muted">暂无密钥</td></tr>'}</tbody>
+    </table></div>
+  </div>`;
+}
+function bindKeyEvents(){
+  const b = document.getElementById("btnAddKey");
+  if(b) b.onclick = async ()=>{
+    try{
+      await api("/api/keys",{method:"POST",body:JSON.stringify({
+        name:document.getElementById("kName").value,
+        classes:document.getElementById("kClasses").value.split(",").map(s=>s.trim()).filter(Boolean),
+        daily_quota:Number(document.getElementById("kDaily").value)||0,
+        total_quota:Number(document.getElementById("kTotal").value)||0
+      })});
+      toast("密钥已签发","good"); await refresh();
+    }catch(e){ toast(e.message,"bad"); }
+  };
+  document.getElementById("view").querySelectorAll("button[data-del]").forEach(x=>x.onclick=async ()=>{
+    if(!confirm("确认删除该密钥？")) return;
+    try{ await api("/api/keys?key="+encodeURIComponent(x.dataset.del),{method:"DELETE"}); await refresh(); }
+    catch(e){ toast(e.message,"bad"); }
+  });
+}
+
+/* ---------------- 队列 / 任务 / 日志 / 设置 ---------------- */
+function viewQueue(){
+  const q = state.stats?.queue || [];
+  const b = state.bindings||[];
+  return `
+  <div class="card"><h2>当前排队</h2>
+    ${q.length? `<table><thead><tr><th>账号</th><th>池</th><th>排队人数</th><th>节拍 RPM</th><th>队尾预计等待</th></tr></thead>
+      <tbody>${q.map(r=>`<tr><td>${esc(r.account)}</td><td><span class="pill">${esc(r.pool_class)}</span></td>
+        <td class="mono">${r.waiting}</td><td class="mono">${r.rpm}</td><td class="mono">${Math.round(r.projected_wait_ms/100)/10}s</td></tr>`).join("")}</tbody></table>`
+      : `<div class="banner good">当前没有排队请求 —— 节拍跟得上负载。</div>`}
+  </div>
+  <div class="card">
+    <div class="spread"><h2>粘性绑定（${b.length}）</h2><button class="sm danger" id="btnClearBind">全部清空</button></div>
+    <div class="muted" style="margin-bottom:8px">绑定只是「优先候选」：绑定账号拥堵或冷却时会自动改派并更新绑定。</div>
+    <div class="scroll"><table><thead><tr><th>会话</th><th>账号</th><th>更新时间</th></tr></thead>
+      <tbody>${b.slice(0,200).map(r=>`<tr><td class="mono" style="font-size:11px">${esc(r.session)}</td><td>${esc(r.account)}</td>
+        <td class="mono">${r.updated?new Date(r.updated*1000).toLocaleString():""}</td></tr>`).join("")||'<tr><td colspan="3" class="muted">暂无绑定</td></tr>'}</tbody></table></div>
+  </div>`;
+}
+function viewJobs(){
+  const rows = (state.jobs||[]).map(j=>`<tr>
+    <td class="mono" style="font-size:11px">${esc(j.job_id)}</td>
+    <td class="mono" style="font-size:11px">${esc(j.video_id)}</td>
+    <td>${esc(j.model)}</td>
+    <td class="mono" style="font-size:11px">${esc(j.account_id)}</td>
+    <td><span class="pill info">${esc(j.status)}</span></td>
+    <td class="mono">${j.created_at?new Date(j.created_at*1000).toLocaleString():""}</td></tr>`).join("");
+  return `<div class="card"><h2>视频任务（下游 job_id → 上游 video_id）</h2>
+    <div class="muted" style="margin-bottom:8px">客户端只认 job_id，上游语义（video_id / model_name）由网关维护，从根上避免「轮询用错字段」导致的卡住。</div>
+    <div class="scroll"><table><thead><tr><th>job_id</th><th>video_id</th><th>模型</th><th>承载账号</th><th>状态</th><th>创建时间</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="muted">暂无任务</td></tr>'}</tbody></table></div></div>`;
+}
+function viewLogs(){
+  const rows = (state.logs||[]).map(l=>`<tr>
+    <td class="mono" style="font-size:11px">${esc(l.ts)}</td>
+    <td>${l.intent?`<span class="pill ${l.intent==="image"?"info":l.intent==="video"?"warn":""}">${esc(l.intent)}</span> <span class="muted" style="font-size:11px">${esc(l.intent_by||"")}</span>`:""}</td>
+    <td>${esc(l.model_used||l.model||"")}</td>
+    <td>${esc(l.pool_class||"")}</td>
+    <td>${esc(l.account||"")}</td>
+    <td class="mono">${l.wait_ms!=null?Math.round(l.wait_ms)+"ms":""}</td>
+    <td>${esc(l.phase||"")}</td></tr>`).join("");
+  return `<div class="card"><div class="spread"><h2>用量日志</h2>
+      <div class="muted">含每次请求的意图判定依据（intent_by / intent_score / reason）</div></div>
+    <div class="scroll"><table><thead><tr><th>时间</th><th>意图</th><th>模型</th><th>池</th><th>账号</th><th>等待</th><th>阶段</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="7" class="muted">暂无日志</td></tr>'}</tbody></table></div></div>`;
+}
+function viewIntent(){
+  return `
+  <div class="card">
+    <h2>意图判定测试（零配额消耗）</h2>
+    <div class="muted" style="margin-bottom:10px">不发上游请求，只看网关会把这句话判成什么模态、用哪个模型。</div>
+    <label>判定端点</label>
+    <select id="ipPath">
+      <option value="/v1/chat/completions">/v1/chat/completions（走内容判定）</option>
+      <option value="/v1/images/generations">/v1/images/generations（端点即生图）</option>
+      <option value="/v1/videos">/v1/videos（端点即生视频）</option>
+    </select>
+    <div style="margin-top:10px"><label>批量样本（每行一句）</label>
+      <textarea id="ipSamples" style="min-height:150px">帮我画一张赛博朋克风格的城市夜景
+生成一段海边日落的海浪视频
+解释一下 Transformer 的注意力机制
+how do I draw a cat in matplotlib?
+生成一张产品海报，极简风格
+What is the difference between RPM and QPS?</textarea></div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="btnIntent">判定</button>
+      <span class="muted">阈值可在「设置」里调；判定依据会写进日志，便于事后追查误判</span>
+    </div>
+    <div id="intentResult" style="margin-top:12px"></div>
+  </div>`;
+}
+function bindIntentEvents(){
+  const b = document.getElementById("btnIntent");
+  if(!b) return;
+  b.onclick = async ()=>{
+    const samples = document.getElementById("ipSamples").value.split("\n").map(s=>s.trim()).filter(Boolean);
+    try{
+      const r = await api("/api/intent/preview",{method:"POST",body:JSON.stringify({
+        _path:document.getElementById("ipPath").value, _samples:samples})});
+      document.getElementById("intentResult").innerHTML = `<table>
+        <thead><tr><th>输入</th><th>判定</th><th>依据</th><th>置信度</th><th>说明</th></tr></thead>
+        <tbody>${(r.cases||[]).map(c=>`<tr>
+          <td style="max-width:280px">${esc(c.input)}</td>
+          <td><span class="pill ${c.intent==="text"?"":c.intent==="image"?"info":"warn"}">${esc(c.intent)}</span></td>
+          <td>${esc(c.label)}<span class="muted" style="font-size:11px"> (${esc(c.by)})</span></td>
+          <td class="mono">${c.score}</td>
+          <td class="muted" style="font-size:12px">${esc(c.reason)}</td></tr>`).join("")}</tbody></table>`;
+    }catch(e){ toast(e.message,"bad"); }
+  };
+}
+function viewSettings(){
+  const s = state.settings || {};
+  const ai = s.auto_intent || {};
+  const pref = ai.preferred_models || {};
+  const fld = (id,label,val,type="number",hint="")=>`
+    <div><label>${label}</label><input id="${id}" type="${type}" value="${esc(val)}">
+    ${hint?`<div class="hint">${hint}</div>`:""}</div>`;
+  return `
+  <div class="card">
+    <h2>统一模型入口（agnes-auto）</h2>
+    <div class="grid g2">
+      ${fld("s_auto_name","对外统一模型名", s.auto_model_name||"agnes-auto","text","客户端只填这个名字，网关自动判定模态")}
+      <div><label>内容判定（关闭则只看端点/参数）</label>
+        <select id="s_scan"><option value="1" ${ai.content_scan?"selected":""}>开启</option><option value="0" ${!ai.content_scan?"selected":""}>关闭（最保守）</option></select>
+        <div class="hint">开启后才会读「画一张…」这类措辞；agent 请求（带 tools）永远不走内容判定</div></div>
+      ${fld("s_conf","内容判定阈值", ai.min_confidence??0.6,"number","越高越保守；0.6 表示需命中较强措辞")}
+      ${fld("s_isize","生图默认尺寸", ai.default_image_size||"1K","text","上游只接受 1K/2K/3K/4K 或 WIDTHxHEIGHT")}
+      ${fld("s_ifield","图生图输入图字段名", ai.image_input_field||"image","text","留空则不自动带图；上游规范变更时改这里")}
+      ${fld("s_vfield","图生视频输入图字段名", ai.video_input_field||"image","text","")}
+      ${fld("s_vwait","视频阻塞等待秒数", ai.video_wait_sec??0,"number","0 = 立即返回 job_id 让客户端轮询")}
+    </div>
+    <h3 style="margin-top:14px">模型偏好顺序（只在账号已声明的清单内生效，绝不越界）</h3>
+    <div class="grid g2">
+      ${MODALITIES.map(m=>`<div><label>${m}</label>
+        <input id="s_pref_${m}" value="${esc((pref[m]||[]).join(", "))}"></div>`).join("")}
+    </div>
+  </div>
+  <div class="card">
+    <h2>节流与排队</h2>
+    <div class="grid g2">
+      ${fld("s_safety","安全阀系数", s.safety_factor??0.9,"number","有效 RPM = 标称 × 安全阀 × 校准；默认 0.9 留 10% 余量")}
+      ${fld("s_window","节拍窗口（秒）", s.pacing_window_sec??60,"number","生产保持 60；仅本地压测压缩时间轴用")}
+      <div><label>自适应校准</label><select id="s_cal">
+        <option value="1" ${s.calibration_enabled?"selected":""}>开启</option><option value="0" ${!s.calibration_enabled?"selected":""}>关闭</option></select>
+        <div class="hint">吃 429 反馈自动下调（账号 × 池）节拍；其它池不受影响</div></div>
+      ${fld("s_penalty","429 冷阱时长（秒）", s.penalty_cooldown_sec??65)}
+      ${fld("s_pfactor","每次 429 的降幅系数", s.penalty_factor??0.8)}
+      ${fld("s_floor","校准下限", s.min_learned_factor??0.5)}
+      ${fld("s_recover","回升所需连续成功次数", s.recover_successes??20,"number","按成功次数回升，而不是按墙钟 —— 低流量账号也能恢复")}
+      ${fld("s_qwait","单请求最长排队（毫秒）", s.queue_max_wait_ms??120000)}
+      ${fld("s_qsize","每池最大排队人数", s.queue_max_size??200)}
+      ${fld("s_keep","流式心跳间隔（毫秒）", s.keepalive_interval_ms??5000)}
+      ${fld("s_imconc","图片并发上限", s.image_concurrency??4)}
+      ${fld("s_vconc","视频在任务上限", s.video_max_inflight??2,"number","独立于 RPM 的任务级限制：只做 RPM 不做任务数会出现「RPM 没超但视频一直失败」")}
+      ${fld("s_brev","熔断自动复活（秒）", s.breaker_revive_sec??1800,"number","401/403/402 熔断后到这个时间自动复活低速试探")}
+    </div>
+  </div>
+  <div class="card">
+    <h2>路由与重试</h2>
+    <div class="grid g2">
+      <div><label>任务粘性口径</label><select id="s_affinity">
+        <option value="session_then_key" ${s.affinity_mode==="session_then_key"?"selected":""}>先看会话头，无则用下游 Key（推荐）</option>
+        <option value="key" ${s.affinity_mode==="key"?"selected":""}>仅按下游 Key</option>
+        <option value="session" ${s.affinity_mode==="session"?"selected":""}>仅按会话头</option>
+        <option value="none" ${s.affinity_mode==="none"?"selected":""}>不粘性（纯负载均衡）</option>
+      </select><div class="hint">绑定账号拥堵（预计等待 &gt; 3s）或冷却时自动改派并更新绑定</div></div>
+      ${fld("s_tier","生图默认档位", s.default_image_tier||"1k","text")}
+      ${fld("s_retry","最大重试次数", s.retry_max??3,"number","生图/视频提交不参与 5xx 重试，避免重复扣费")}
+      ${fld("s_rbase","退避基数（毫秒）", s.retry_base_backoff_ms??500)}
+      ${fld("s_rmax","退避上限（毫秒）", s.retry_max_backoff_ms??8000)}
+      ${fld("s_probe","探测模型", s.probe_model||"agnes-2.5-flash","text","账号测试按钮用的最小文本模型")}
+      ${fld("s_ttl","粘性绑定 TTL（小时）", s.session_ttl_hours??72)}
+    </div>
+    <div style="margin-top:12px"><button class="primary" id="btnSaveSettings">保存设置</button></div>
+  </div>
+  <div class="card">
+    <h2>迁移</h2>
+    <div class="row">
+      <button id="btnExport">导出配置（不含密钥明文）</button>
+      <button id="btnExportFull">导出含密钥</button>
+      <button id="btnImport" class="primary">导入配置</button>
+    </div>
+  </div>`;
+}
+function bindSettingsEvents(){
+  const save = document.getElementById("btnSaveSettings");
+  if(!save) return;
+  save.onclick = async ()=>{
+    const g = id=>document.getElementById(id).value;
+    const payload = {
+      auto_model_name:g("s_auto_name"),
+      auto_intent:{content_scan:g("s_scan")==="1", min_confidence:Number(g("s_conf")),
+        default_image_size:g("s_isize"), image_input_field:g("s_ifield"),
+        video_input_field:g("s_vfield"), video_wait_sec:Number(g("s_vwait")),
+        preferred_models:{}},
+      safety_factor:Number(g("s_safety")), pacing_window_sec:Number(g("s_window")),
+      calibration_enabled:g("s_cal")==="1", penalty_cooldown_sec:Number(g("s_penalty")),
+      penalty_factor:Number(g("s_pfactor")), min_learned_factor:Number(g("s_floor")),
+      recover_successes:Number(g("s_recover")), queue_max_wait_ms:Number(g("s_qwait")),
+      queue_max_size:Number(g("s_qsize")), keepalive_interval_ms:Number(g("s_keep")),
+      image_concurrency:Number(g("s_imconc")), video_max_inflight:Number(g("s_vconc")),
+      breaker_revive_sec:Number(g("s_brev")), affinity_mode:g("s_affinity"),
+      default_image_tier:g("s_tier"), retry_max:Number(g("s_retry")),
+      retry_base_backoff_ms:Number(g("s_rbase")), retry_max_backoff_ms:Number(g("s_rmax")),
+      probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl"))
+    };
+    MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
+      g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
+    try{ await api("/api/settings",{method:"POST",body:JSON.stringify(payload)});
+      toast("设置已保存并立即生效","good"); await refresh(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
+  const exp = (masked)=>async ()=>{
+    window.open("/api/export","_blank");
+    if(!masked) toast("含密钥的导出请用 /api/export 的结果自行保存","warn");
+  };
+  document.getElementById("btnExport").onclick = exp(true);
+  document.getElementById("btnExportFull").onclick = exp(true);
+  document.getElementById("btnImport").onclick = async ()=>{
+    const text = prompt("粘贴导出的 JSON（会追加账号，不覆盖现有）"); if(!text) return;
+    try{
+      const data = JSON.parse(text);
+      data.mode = "append";
+      const r = await api("/api/import",{method:"POST",body:JSON.stringify(data)});
+      toast(`已导入 ${r.accounts_imported} 个账号`,"good"); await refresh();
+    }catch(e){ toast("导入失败："+e.message,"bad"); }
+  };
+}
+
+/* ---------------- 数据拉取 ---------------- */
+async function refresh(){
+  try{
+    const [stats, accounts, keys, logs, settings, jobs, bindings] = await Promise.all([
+      api("/api/stats"), api("/api/accounts"), api("/api/keys"), api("/api/logs?limit=300"),
+      api("/api/settings"), api("/api/video-jobs"), api("/api/bindings")
+    ]);
+    state.stats = stats; state.accounts = accounts; state.keys = keys.keys||[];
+    state.logs = logs.logs||[]; state.settings = settings;
+    state.jobs = jobs.jobs||[]; state.bindings = bindings.bindings||[];
+    state.stats.queue = (await api("/api/queue")).queue||[];
+    const m = stats.metrics||{};
+    document.getElementById("subline").textContent =
+      `账号 ${(stats.accounts||[]).length} · 请求 ${num(m.requests_total)} · 上游 429 ${num(m.upstream_429)} · 排队 ${num(m.queued_total)} · 运行 ${m.uptime_sec||0}s`;
+    render();
+  }catch(e){
+    if(e.status===401){ renderLogin(false); return; }
+    toast(e.message,"bad");
+  }
+}
+function render(){
+  const v = document.getElementById("view");
+  if(state.tab==="overview"){ v.innerHTML = viewOverview(); }
+  else if(state.tab==="accounts"){ v.innerHTML = viewAccounts(); bindAccountEvents(); }
+  else if(state.tab==="keys"){ v.innerHTML = viewKeys(); bindKeyEvents(); }
+  else if(state.tab==="queue"){
+    v.innerHTML = viewQueue();
+    const b = document.getElementById("btnClearBind");
+    if(b) b.onclick = async ()=>{ if(!confirm("清空全部粘性绑定？")) return;
+      await api("/api/bindings/clear",{method:"POST"}); await refresh(); };
+  }
+  else if(state.tab==="jobs"){ v.innerHTML = viewJobs(); }
+  else if(state.tab==="intent"){ v.innerHTML = viewIntent(); bindIntentEvents(); }
+  else if(state.tab==="logs"){ v.innerHTML = viewLogs(); }
+  else if(state.tab==="settings"){ v.innerHTML = viewSettings(); bindSettingsEvents(); }
+}
+
+async function boot(){
+  if(!state.session || !state.session.logged_in){ renderLogin(false); return; }
+  renderShell();
+  await refresh();
+}
+window.addEventListener("DOMContentLoaded", async ()=>{
+  try{
+    const s = await api("/api/session");
+    state.session = s;
+    if(s.logged_in) await boot(); else renderLogin(s.must_change_password);
+  }catch(e){ renderLogin(false); }
+});
+</script>
+</body>
+</html>
