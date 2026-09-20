@@ -24,15 +24,17 @@ import (
 	"agneshub/internal/intent"
 	"agneshub/internal/pool"
 	"agneshub/internal/relay"
+	"agneshub/internal/updater"
 )
 
 // Server 组装全部路由。
 type Server struct {
-	Store  *config.Store
-	Hub    *hub.Hub
-	Client *http.Client
-	mux    *http.ServeMux
-	rules  intent.Rules
+	Store   *config.Store
+	Hub     *hub.Hub
+	Client  *http.Client
+	mux     *http.ServeMux
+	rules   intent.Rules
+	Updater *updater.Updater
 }
 
 // New 构造服务。
@@ -44,6 +46,12 @@ func New(store *config.Store, h *hub.Hub, client *http.Client) *Server {
 
 // SetClient 替换上游客户端（测试指向本地模拟上游用）。
 func (s *Server) SetClient(c *http.Client) { s.Client = c }
+
+// SetUpdater 注入自更新器（启动后调用）。
+func (s *Server) SetUpdater(u *updater.Updater) { s.Updater = u }
+
+// Updater 返回当前 updater 实例（测试用）。
+func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
 
 // ServeHTTP 实现 http.Handler。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }

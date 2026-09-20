@@ -24,6 +24,7 @@ import (
 	"agneshub/internal/config"
 	"agneshub/internal/hub"
 	"agneshub/internal/relay"
+	"agneshub/internal/updater"
 	"agneshub/internal/web"
 )
 
@@ -71,6 +72,27 @@ func main() {
 	h.StartMaintenance(ctx)
 
 	srv := web.New(store, h, relay.BuildClient())
+
+	// 初始化自更新器
+	exe, _ := os.Executable()
+	updCfg := updater.Config{
+		Repo:       "my788525/agnes-hub-go",
+		BinaryName: "agnes-hub-go",
+		DataDir:    *dataDir,
+	}
+	upd := updater.New(updCfg, version, exe, nil)
+	srv.SetUpdater(upd)
+
+	// 启动后台版本检查（每天检查一次）
+	upd.StartBackground(ctx, 24*time.Hour)
+
+	// 监听需要重启的信号
+	go func() {
+		<-ctx.Done()
+		if upd.NeedRestart() {
+			upd.RequestRestart()
+		}
+	}()
 
 	addr := net.JoinHostPort(*host, *port)
 	httpSrv := &http.Server{

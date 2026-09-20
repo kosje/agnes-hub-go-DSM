@@ -64,6 +64,9 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/intent/preview", s.apiIntentPreview)
 	m.HandleFunc("POST /api/probe", s.apiProbe)
 	m.HandleFunc("GET /api/rpm-table", s.apiRPMTable)
+
+	m.HandleFunc("GET /api/update/check", s.apiUpdateCheck)
+	m.HandleFunc("POST /api/update/apply", s.apiUpdateApply)
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,4 +1259,47 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// ---------------------------------------------------------------------------
+// 自更新
+// ---------------------------------------------------------------------------
+
+func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if s.Updater == nil {
+		writeJSON(w, 200, map[string]any{"error": map[string]any{"message": "self-update not initialized"}}, nil)
+		return
+	}
+	result, err := s.Updater.Check(r.Context())
+	if err != nil {
+		writeJSON(w, 200, map[string]any{
+			"current_version": "1.0.0-go",
+			"error":           err.Error(),
+		}, nil)
+		return
+	}
+	writeJSON(w, 200, result, nil)
+}
+
+func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	if s.Updater == nil {
+		writeJSON(w, 200, map[string]any{"error": map[string]any{"message": "self-update not initialized"}}, nil)
+		return
+	}
+	result, err := s.Updater.Apply(r.Context())
+	if err != nil {
+		writeJSON(w, 200, map[string]any{
+			"success": false,
+			"error":   err.Error(),
+		}, nil)
+		return
+	}
+	if result.Success {
+		s.Updater.RequestRestart()
+	}
+	writeJSON(w, 200, result, nil)
 }
