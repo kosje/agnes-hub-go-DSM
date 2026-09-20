@@ -162,14 +162,51 @@ var (
 )
 
 // IsAutoModel 判断是否「让网关决定」的模型名。
+//
+// 重要规则：自定义 auto 名称（如 "my-auto"）如果与上游已知模型名重合，
+// 必须视为非 auto —— 否则网关会错误地路由到 auto 模态判定逻辑，
+// 而不是把请求当作显式模型调用直接透传。
+// 例如：用户把 agnes-auto 改名为 "agnes-image-2.5-flash"，这应该走显式 image 路由。
 func IsAutoModel(name string) bool {
 	low := strings.ToLower(strings.TrimSpace(name))
-	for _, n := range AutoModelNames {
-		if low == n {
-			return true
-		}
+	if low == "" {
+		return false
 	}
-	return strings.HasPrefix(low, "agnes-auto")
+	// 内置 auto 名称集合
+	autoNames := map[string]bool{
+		"agnes-auto": true, "agnes-auto-all": true, "agnes_auto": true, "auto": true,
+	}
+	if autoNames[low] {
+		return true
+	}
+	// agnes-auto 前缀匹配
+	if strings.HasPrefix(low, "agnes-auto") {
+		return true
+	}
+	// 已知上游模型名集合（与 pool.TextModels/ImageModels/VideoModels 同步）
+	knownModels := map[string]bool{
+		// text models
+		"agnes-2.5-flash": true, "agnes-2.0-flash": true, "agnes-1.5-flash": true,
+		"agnes-3.0-flash": true, "agnes-2.5-pro": true,
+		"agnes-2.5-pro-alpha": true, "agnes-2.5-pro-beta": true,
+		// image models
+		"agnes-image-2.0-flash": true, "agnes-image-2.1-flash": true, "agnes-image-2.5-flash": true,
+		// video models
+		"agnes-video-v2.0": true, "agnes-video-2.5": true, "agnes-video-2.5-flash": true,
+		// built-in aliases
+		"gpt-4o": true, "gpt-4o-mini": true, "gpt-4-turbo": true, "gpt-3.5-turbo": true,
+		"claude-3-5-sonnet": true, "claude-sonnet-4": true, "dall-e-3": true, "gpt-image-1": true,
+	}
+	if knownModels[low] {
+		return false
+	}
+	// 模糊匹配：含 image/video 关键字的可能是未知模型，不阻断 auto
+	lowNoDash := strings.ReplaceAll(low, "-", "")
+	if strings.Contains(lowNoDash, "image") || strings.Contains(lowNoDash, "video") {
+		// 可能是自定义别名，不强制阻断，但也不视为标准 auto
+		return false
+	}
+	return false
 }
 
 // ModalityFromPath 端点信号。

@@ -161,6 +161,24 @@ type VideoJob struct {
 	Error     string  `json:"error,omitempty"`
 }
 
+// ImageJob 是图片任务映射（下游 request_id → 上游 image_id + 产出 URL + 承载账号）。
+type ImageJob struct {
+	JobID     string  `json:"job_id"`
+	ImageID   string  `json:"image_id"`
+	Model     string  `json:"model"`
+	AccountID string  `json:"account_id"`
+	URL       string  `json:"url,omitempty"`
+	RevisedURL string `json:"revised_url,omitempty"`
+	Size      string  `json:"size,omitempty"`
+	Quality   string  `json:"quality,omitempty"`
+	Style     string  `json:"style,omitempty"`
+	Prompt    string  `json:"prompt"`
+	Status    string  `json:"status"`
+	Error     string  `json:"error,omitempty"`
+	CreatedAt float64 `json:"created_at"`
+	RequestID string  `json:"request_id"`
+}
+
 // AutoIntentSettings 是 agnes-auto 的判定与适配配置。
 type AutoIntentSettings struct {
 	ContentScan      bool                `json:"content_scan"`
@@ -206,6 +224,8 @@ type Settings struct {
 	LogRetentionDays     int                `json:"log_retention_days"`
 	SessionTTLHours      float64            `json:"session_ttl_hours"`
 	ProbeModel           string             `json:"probe_model"`
+	OptimizationMode     string             `json:"optimization_mode"`
+	ImageRecordRetention int                `json:"image_record_retention_days"`
 }
 
 // DefaultSettings 返回出厂设置。
@@ -266,13 +286,14 @@ func DefaultSettings() Settings {
 
 // Store 是全部持久化状态的唯一真源。
 type Store struct {
-	mu       sync.RWMutex
-	Dir      string
-	Settings Settings
-	Accounts []*Account
-	Keys     []*DownstreamKey
-	Bindings map[string]Binding
-	Jobs     map[string]*VideoJob
+	mu        sync.RWMutex
+	Dir       string
+	Settings  Settings
+	Accounts  []*Account
+	Keys      []*DownstreamKey
+	Bindings  map[string]Binding
+	Jobs      map[string]*VideoJob
+	ImageJobs map[string]*ImageJob
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -326,6 +347,10 @@ func (s *Store) load() error {
 	}
 	s.Jobs = map[string]*VideoJob{}
 	if err := readJSON(s.path("video_jobs.json"), &s.Jobs); err != nil {
+		return err
+	}
+	s.ImageJobs = map[string]*ImageJob{}
+	if err := readJSON(s.path("image_jobs.json"), &s.ImageJobs); err != nil {
 		return err
 	}
 	for _, a := range s.Accounts {
@@ -960,6 +985,46 @@ func (s *Store) JobsSnapshot() []*VideoJob {
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
 	return out
 }
+
+// ---- 图片任务 ----
+
+// PutImageJob 记录图片任务。
+func (s *Store) PutImageJob(job *ImageJob) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ImageJobs == nil {
+		s.ImageJobs = map[string]*ImageJob{}
+	}
+	s.ImageJobs[job.JobID] = job
+	_ = s.saveImageJobsLocked()
+}
+
+// ImageJobByID 取图片任务。
+func (s *Store) ImageJobByID(id string) (*ImageJob, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	j, ok := s.ImageJobs[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *j
+	return &cp, true
+}
+
+// ImageJobsSnapshot 返回全部图片任务（倒序，按创建时间）。
+func (s *Store) ImageJobsSnapshot() []*ImageJob {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*ImageJob, 0, len(s.ImageJobs))
+	for _, j := range s.ImageJobs {
+		cp := *j
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+func (s *Store) saveImageJobsLocked() error { return writeJSON(s.path("image_jobs.json"), s.ImageJobs) }
 
 // ---- 用量日志 ----
 

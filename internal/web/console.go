@@ -19,6 +19,9 @@ import (
 //go:embed static/console.html
 var consoleHTML []byte
 
+//go:embed static/chat.html
+var chatHTML []byte
+
 const cookieName = "agnes_hub_session"
 
 func (s *Server) consoleRoutes() {
@@ -55,6 +58,7 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("GET /api/bindings", s.apiBindings)
 	m.HandleFunc("POST /api/bindings/clear", s.apiClearBindings)
 	m.HandleFunc("GET /api/video-jobs", s.apiVideoJobs)
+	m.HandleFunc("GET /api/image-jobs", s.apiImageJobs)
 
 	m.HandleFunc("GET /api/settings", s.apiGetSettings)
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
@@ -68,6 +72,14 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("GET /api/update/status", s.apiUpdateStatus)
 	m.HandleFunc("GET /api/update/check", s.apiUpdateCheck)
 	m.HandleFunc("POST /api/update/apply", s.apiUpdateApply)
+
+	// 网页端：聊天 / 生图 / 生视频（免第三方 AI Coding 积分）
+	m.HandleFunc("GET /chat", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Length", fmt.Sprint(len(chatHTML)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(chatHTML)
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +755,14 @@ func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"jobs": s.Store.JobsSnapshot()}, nil)
 }
 
+func (s *Server) apiImageJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"jobs": s.Store.ImageJobsSnapshot()}, nil)
+}
+
 // ---------------------------------------------------------------------------
 // 设置
 // ---------------------------------------------------------------------------
@@ -812,6 +832,8 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("keepalive_interval_ms", &st.KeepaliveMS)
 	s2("affinity_mode", &st.AffinityMode)
 	s2("default_image_tier", &st.DefaultImageTier)
+	s2("optimization_mode", &st.OptimizationMode)
+	i("image_record_retention_days", &st.ImageRecordRetention)
 	i("retry_max", &st.RetryMax)
 	i("retry_base_backoff_ms", &st.RetryBaseBackoffMS)
 	i("retry_max_backoff_ms", &st.RetryMaxBackoffMS)

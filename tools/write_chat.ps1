@@ -1,0 +1,63 @@
+﻿$path = "D:\work\GitHub\agnes-hub-go\internal\web\static\chat.html"
+$html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agnes Chat</title>
+<style>
+  :root{--bg:#f6f7f9;--panel:#ffffff;--line:#e4e7ec;--ink:#1c2430;--muted:#65717f;--brand:#2f6fed;--brand-soft:#eaf1ff;--good:#12805c;--good-soft:#e7f6ef;--warn:#a86400;--warn-soft:#fdf3e2;--bad:#c0293b;--bad-soft:#fdecee;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  button{font:inherit;padding:7px 13px;border-radius:9px;border:1px solid var(--line);background:#fff;color:var(--ink);cursor:pointer}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+  .login{max-width:380px;margin:8vh auto}
+  .hide{display:none!important}
+  .banner{padding:10px 12px;border-radius:10px;font-size:13px;margin-bottom:12px}
+  .banner.warn{background:var(--warn-soft);color:var(--warn)}
+  .banner.good{background:var(--good-soft);color:var(--good)}
+  .banner.bad{background:var(--bad-soft);color:var(--bad)}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  .muted{color:var(--muted)}
+  input,textarea{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:9px;width:100%}
+  textarea{min-height:80px;resize:vertical}
+  .chat-container{display:flex;height:80vh;gap:12px}
+  .chat-main{flex:1;display:flex;flex-direction:column;min-width:0}
+  .chat-history{flex:1;overflow-y:auto;padding:12px}
+  .chat-input-area{padding:12px;border-top:1px solid var(--line);background:var(--panel)}
+  .message{margin-bottom:12px;max-width:80%}
+  .message.user{margin-left:auto;text-align:right}
+  .message.assistant{margin-right:auto}
+  .message-content{padding:10px 14px;border-radius:12px;display:inline-block;text-align:left;word-break:break-word}
+  .message.user .message-content{background:var(--brand);color:#fff}
+  .message.assistant .message-content{background:var(--panel);border:1px solid var(--line)}
+  .message img{max-width:100%;border-radius:8px;margin-top:8px}
+  .tab-bar{display:flex;gap:6px;margin-bottom:12px}
+  .tab-bar button.on{background:var(--ink);color:#fff}
+  .history-panel{width:260px;border-left:1px solid var(--line);padding:12px;overflow-y:auto}
+  .history-item{padding:8px;border-radius:8px;margin-bottom:8px;cursor:pointer;border:1px solid var(--line);font-size:12px}
+  .history-item:hover{background:var(--bg)}
+  .history-item.active{border-color:var(--brand)}
+  .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--brand);border-radius:50%;animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const state={tab:"chat",session:null,history:[],currentJob:null};
+const MODALITIES=["text","image","video"];
+async function api(p,o={}){const r=await fetch(p,{credentials:"same-origin",headers:{"Content-Type":"application/json"},...o});const t=await r.text();let d=null;try{d=t?JSON.parse(t):null;}catch(e){d={raw:t};}if(!r.ok){const m=(d&&d.error&&d.error.message)||("HTTP "+r.status);throw new Error(m);}return d;}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function toast(m,k){const e=document.getElementById("toast");if(!e)return;e.className="banner "+(k||"good");e.textContent=m;e.classList.remove("hide");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.add("hide"),4000);}
+async function checkSession(){try{const s=await api("/api/session");if(s&&s.logged_in){state.session=s;renderChat();return;}}catch(e){}renderLogin();}
+function renderLogin(){document.getElementById("app").innerHTML=`<div class="login"><div class="card"><h1>Agnes Chat</h1><p class="muted">AI Image & Video Generation</p><div id="toast" class="hide"></div><label>Password</label><input id="pw" type="password" placeholder="admin password"><div class="row" style="margin-top:12px"><button class="primary" id="btnLogin">Login</button></div><div class="hint">Default: admin123</div></div></div>`;document.getElementById("btnLogin").onclick=async()=>{try{const r=await api("/api/login",{method:"POST",body:JSON.stringify({password:document.getElementById("pw").value})});state.session=r;renderChat();}catch(e){toast(e.message,"bad");}};document.getElementById("pw").onkeydown=e=>{if(e.key==="Enter")document.getElementById("btnLogin").click();};document.getElementById("pw").focus();}
+window.onload=checkSession;
+</script>
+</body>
+</html>
+"@
+[System.IO.File]::WriteAllText($path, $html, [System.Text.UTF8Encoding]::new($false))
+Write-Host "chat.html created"

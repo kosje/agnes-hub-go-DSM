@@ -564,6 +564,47 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	s.Store.ChargeKey(item.Key)
 	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts)
 
+	// 记录图片生成结果（便于控制台查看历史）
+	requestID := config.NewID("img")
+	prompt := decision.Prompt.Text
+	if prompt == "" {
+		if rawMsg, ok := body["prompt"].(string); ok {
+			prompt = rawMsg
+		}
+	}
+	size := asStr(body["size"])
+	if size == "" {
+		if w, ok := body["width"]; ok {
+			if h, ok2 := body["height"]; ok2 {
+				size = fmt.Sprintf("%dx%d", int(intToFloat64(w)), int(intToFloat64(h)))
+			}
+		}
+	}
+	imgJob := &config.ImageJob{
+		JobID:     requestID,
+		Model:     model,
+		AccountID: result.Account.ID,
+		Prompt:    prompt,
+		Size:      size,
+		Status:    "completed",
+		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
+		RequestID: requestID,
+	}
+	// 解析响应中的 URL
+	data := decodeMap(raw)
+	items := mapList(data["data"])
+	for _, item := range items {
+		if url, ok := item["url"].(string); ok && url != "" {
+			imgJob.URL = url
+			break
+		}
+		if b64, ok := item["b64_json"].(string); ok && b64 != "" {
+			imgJob.URL = "data:image/png;base64," + b64
+			break
+		}
+	}
+	s.Store.PutImageJob(imgJob)
+
 	extra := decision.Headers()
 	extra["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
 	extra["X-Agnes-Hub-Account-Id"] = result.Account.ID
@@ -581,8 +622,6 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 		return
 	}
 
-	data := decodeMap(raw)
-	items := mapList(data["data"])
 	content, images := intent.ImageContent(items, decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") + " 未被生图端点接受，已忽略。"
@@ -1184,7 +1223,20 @@ func asStr(v any) string {
 	case nil:
 		return ""
 	}
-	return ""
+	return fmt.Sprint(v)
+}
+
+func intToFloat64(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	}
+	return 0
 }
 
 func truthy(v any) bool {
