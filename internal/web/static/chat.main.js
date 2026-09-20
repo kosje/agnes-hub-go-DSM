@@ -1,6 +1,30 @@
 // chat.main.js - Agnes Chat UI logic
 
-const state={tab:"chat",session:null,keys:[],accounts:[],activeKey:null,history:[],curHistoryId:null,messages:[],model:"",sending:false,imJobId:null};
+// 工具函数（与 chat.html 内联脚本等价，避免重复声明）
+const API_URL = "";
+async function api(p, o = {}) {
+  const opts = { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...o };
+  const r = await fetch(API_URL + p, opts);
+  const t = await r.text();
+  let d = null; try { d = t ? JSON.parse(t) : null; } catch (e) { d = { raw: t }; }
+  if (!r.ok) { const m = (d && d.error && d.error.message) || ("HTTP " + r.status); throw new Error(m); }
+  return d;
+}
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function toast(m, k) { const e = document.getElementById("toast"); if (!e) return; e.className = "banner " + (k || "good"); e.textContent = m; e.classList.remove("hide"); clearTimeout(e._t); e._t = setTimeout(() => e.classList.add("hide"), 4000); }
+function fmtDate(ts) { if (!ts) return ""; const d = new Date(ts * 1000); return d.toLocaleDateString("zh-CN") + " " + d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }
+function timeAgo(ts) { const s = Math.floor(Date.now() / 1000) - ts; if (s < 60) return s + "秒前"; if (s < 3600) return Math.floor(s / 60) + "分钟前"; if (s < 86400) return Math.floor(s / 3600) + "小时前"; return Math.floor(s / 86400) + "天前"; }
+
+const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, history: [], curHistoryId: null, messages: [], model: "", sending: false, imJobId: null };
+
+/* ==================== INIT ==================== */
+// 延迟到 DOM 就绪，避免 getElementById 返回 null
+window.addEventListener("DOMContentLoaded", () => {
+  checkChatAuth();
+  switchTab("chat");
+  renderImageView();
+  renderVideoView();
+});
 
 /* ==================== LOGIN ==================== */
 async function checkSession(){
@@ -475,7 +499,10 @@ function renderMarkdown(text){
 }
 
 /* ==================== INIT ==================== */
-window.onload=checkChatAuth;
-switchTab("chat");
-renderImageView();
-renderVideoView();
+// 延迟到 DOM 就绪，避免 getElementById 返回 null
+window.addEventListener("DOMContentLoaded", () => {
+  checkChatAuth();
+  switchTab("chat");
+  renderImageView();
+  renderVideoView();
+});
