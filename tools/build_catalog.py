@@ -20,7 +20,7 @@ x86_64 用 catalog.json（最常见，也是本项目的默认），其余用 ca
 
 用法：
     python tools/build_catalog.py                     # 用 dist/ 下的 spk
-    python tools/build_catalog.py --tag v1.0.2-0001   # 指定 Release tag
+    python tools/build_catalog.py --tag v1.0.2-0002   # 指定 Release tag
     python tools/build_catalog.py --link-from-release # link 指回 Release（不推荐）
 """
 
@@ -40,6 +40,7 @@ from build_spk import (  # noqa: E402
     MAINTAINER_URL,
     SERVICE_PORT,
     make_icon_set,
+    validate_spk,
 )
 
 REPO = "kosje/agnes-hub-go-DSM"
@@ -51,10 +52,10 @@ PRIMARY_ARCH = "x86_64"
 
 # 套件中心里显示的变更说明（HTML）。发新版时改这里。
 CHANGELOG = (
-    "首个群晖 DSM 套件版本，基于 agnes-hub-go 1.0.2 构建。<br>"
-    "· 新增 -no-selfupdate 开关：套件由套件中心负责升级，禁用进程内替换二进制<br>"
-    "· 以套件专用账户运行（非 root），支持开机自启与套件中心启停<br>"
-    "· 数据目录位于 /var/packages/agnes-hub/var/data，升级保留、卸载删除"
+    "修复群晖套件中心无法安装的问题。<br>"
+    "· SPK 外层改为 DSM 要求的未压缩 tar 格式<br>"
+    "· INFO arch 改为 DSM 实际平台代号，支持 apollolake、geminilake、v1000 等 x86_64 机型<br>"
+    "· 增加发布前格式、校验和与可执行权限检查"
 )
 
 CATALOG_FIELDS_NOTE = "SynoCommunity/spkrepo 的 build_entry_data 与 sspks 的字段清单"
@@ -66,7 +67,8 @@ def read_spk_info(path):
     版本号以 SPK 内 INFO 为准 —— 套件中心就是拿安装后的版本与 catalog 的
     version 比对来判断有无更新，两边必须完全一致。
     """
-    with tarfile.open(path, "r:gz") as t:
+    # DSM SPK 外层必须是未压缩 tar。明确使用 r:，避免构建错误时被自动探测掩盖。
+    with tarfile.open(path, "r:") as t:
         raw = t.extractfile("INFO").read().decode("utf-8")
     fields = {}
     for line in raw.splitlines():
@@ -78,6 +80,7 @@ def read_spk_info(path):
 
 
 def make_entry(spk_path, link, thumb_urls):
+    validate_spk(spk_path)
     info = read_spk_info(spk_path)
     data = open(spk_path, "rb").read()
     version = info["version"]
@@ -122,6 +125,14 @@ def make_entry(spk_path, link, thumb_urls):
 
 def catalog_name_for(arch):
     return "catalog.json" if arch == PRIMARY_ARCH else "catalog-%s.json" % arch
+
+
+def distribution_arch(name):
+    """从产物文件名读取分发架构标签；INFO arch 是一组 DSM 平台代号。"""
+    for arch in ("x86_64", "armv8"):
+        if "-%s-" % arch in name:
+            return arch
+    raise ValueError("无法从 SPK 文件名判断分发架构：%s" % name)
 
 
 LANDING = """<!DOCTYPE html>
@@ -233,7 +244,7 @@ def main():
     ap.add_argument("--out", default="docs", help="输出目录（默认 docs/）")
     ap.add_argument("--icon", default="assets/ICON.PNG", help="图标源文件")
     ap.add_argument("--tag", default=None,
-                    help="Release tag（默认 v<SPK 版本>，如 v1.0.2-0001）；"
+                    help="Release tag（默认 v<SPK 版本>，如 v1.0.2-0002）；"
                          "仅 --link-from-release 时会用到")
     ap.add_argument("--link-from-release", action="store_true",
                     help="把 link 指向 GitHub Release 而不是 Pages（默认走 Pages）")
@@ -275,7 +286,7 @@ def main():
     for name in spks:
         path = os.path.join(args.dist, name)
         info = read_spk_info(path)
-        arch = info["arch"]
+        arch = distribution_arch(name)
         version = info["version"]
         tag = args.tag or ("v%s" % version)
 
