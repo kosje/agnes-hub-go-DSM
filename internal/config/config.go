@@ -179,6 +179,16 @@ type ImageJob struct {
 	RequestID string  `json:"request_id"`
 }
 
+// ChatLog 是聊天对话记录（用户问题 + 助手回复），持久化于 chat_logs.json。
+type ChatLog struct {
+	ID        string  `json:"id"`
+	Model     string  `json:"model"`
+	Prompt    string  `json:"prompt"`
+	Reply     string  `json:"reply"`
+	Status    string  `json:"status"`
+	CreatedAt float64 `json:"created_at"`
+}
+
 // AutoIntentSettings 是 agnes-auto 的判定与适配配置。
 type AutoIntentSettings struct {
 	ContentScan      bool                `json:"content_scan"`
@@ -259,13 +269,13 @@ func DefaultSettings() Settings {
 			VideoInputField:  "image",
 			VideoWaitSec:     0,
 			PreferredModels: map[string][]string{
-				"text":  {"agnes-2.5-flash", "agnes-2.0-flash"},
+				"text":  {"agnes-3.0-flash", "agnes-2.5-flash", "agnes-2.0-flash"},
 				"image": {"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
 				"video": {"agnes-video-2.5-flash", "agnes-video-v2.0"},
 			},
 		},
 		ModelManifestDefault: ModelManifest{
-			Text:  []string{"agnes-2.5-flash", "agnes-2.0-flash", "agnes-3.0-flash"},
+			Text:  []string{"agnes-3.0-flash", "agnes-2.5-flash", "agnes-2.0-flash"},
 			Image: []string{"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
 			Video: []string{"agnes-video-2.5-flash", "agnes-video-2.5", "agnes-video-v2.0"},
 		},
@@ -302,6 +312,7 @@ type Store struct {
 	Bindings  map[string]Binding
 	Jobs      map[string]*VideoJob
 	ImageJobs map[string]*ImageJob
+	ChatLogs  map[string]*ChatLog
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -311,6 +322,7 @@ func NewStore(dir string) (*Store, error) {
 		Settings: DefaultSettings(),
 		Bindings: map[string]Binding{},
 		Jobs:     map[string]*VideoJob{},
+		ChatLogs: map[string]*ChatLog{},
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -359,6 +371,10 @@ func (s *Store) load() error {
 	}
 	s.ImageJobs = map[string]*ImageJob{}
 	if err := readJSON(s.path("image_jobs.json"), &s.ImageJobs); err != nil {
+		return err
+	}
+	s.ChatLogs = map[string]*ChatLog{}
+	if err := readJSON(s.path("chat_logs.json"), &s.ChatLogs); err != nil {
 		return err
 	}
 	for _, a := range s.Accounts {
@@ -1120,6 +1136,66 @@ func (s *Store) ImageJobsSnapshot() []*ImageJob {
 }
 
 func (s *Store) saveImageJobsLocked() error { return writeJSON(s.path("image_jobs.json"), s.ImageJobs) }
+
+// ---- 聊天记录 ----
+
+// AddChatLog 追加一条聊天对话记录并落盘。
+func (s *Store) AddChatLog(log *ChatLog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ChatLogs == nil {
+		s.ChatLogs = map[string]*ChatLog{}
+	}
+	s.ChatLogs[log.ID] = log
+	_ = s.saveChatLogsLocked()
+}
+
+// DeleteChatLog 删除单条聊天记录。
+func (s *Store) DeleteChatLog(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.ChatLogs[id]; !ok {
+		return false
+	}
+	delete(s.ChatLogs, id)
+	_ = s.saveChatLogsLocked()
+	return true
+}
+
+// ClearChatLogs 清空全部聊天记录。
+func (s *Store) ClearChatLogs() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ChatLogs = map[string]*ChatLog{}
+	_ = s.saveChatLogsLocked()
+}
+
+// ChatLogByID 取单条聊天记录。
+func (s *Store) ChatLogByID(id string) (*ChatLog, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	j, ok := s.ChatLogs[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *j
+	return &cp, true
+}
+
+// ChatLogsSnapshot 返回全部聊天记录（按创建时间倒序）。
+func (s *Store) ChatLogsSnapshot() []*ChatLog {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*ChatLog, 0, len(s.ChatLogs))
+	for _, j := range s.ChatLogs {
+		cp := *j
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+func (s *Store) saveChatLogsLocked() error { return writeJSON(s.path("chat_logs.json"), s.ChatLogs) }
 
 // ---- 用量日志 ----
 

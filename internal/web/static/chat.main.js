@@ -15,7 +15,7 @@ function toast(m, k) { const e = document.getElementById("toast"); if (!e) retur
 function fmtDate(ts) { if (!ts) return ""; const d = new Date(ts * 1000); return d.toLocaleDateString("zh-CN") + " " + d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }
 function timeAgo(ts) { const s = Math.floor(Date.now() / 1000) - ts; if (s < 60) return s + "秒前"; if (s < 3600) return Math.floor(s / 60) + "分钟前"; if (s < 86400) return Math.floor(s / 3600) + "小时前"; return Math.floor(s / 86400) + "天前"; }
 
-const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, history: [], curHistoryId: null, messages: [], model: "agnes-2.5-flash", sending: false, imJobId: null };
+const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, chatLogs: [], curHistoryId: null, messages: [], model: "agnes-3.0-flash", sending: false, imJobId: null };
 
 /* ==================== LOGIN ==================== */
 async function checkSession(){
@@ -311,9 +311,11 @@ async function sendChat(){
       bubble.innerHTML=renderMarkdown(full);
     }
     if(!full)bubble.textContent="（无内容返回）";
-    // Save to history
-    state.history.push({id:Date.now(),type:"chat",text:text.substring(0,60),ts:Date.now()/1000,model:state.model||"agnes-auto"});
-    renderHistory();
+    // 持久化到服务端聊天记录
+    try{
+      await api("/api/chat-logs",{method:"POST",body:JSON.stringify({model:state.model||"agnes-auto",prompt:text,reply:full,status:"completed"})});
+      await loadHistory();
+    }catch(e){ console.error("save chat log failed", e); }
   }catch(e){
     bubble.textContent="错误: "+e.message;
     bubble.style.color="var(--bad)";
@@ -413,8 +415,6 @@ async function generateImage(){
       }
       result.appendChild(div);
     });
-    state.history.push({id:Date.now(),type:"image",text:prompt.substring(0,60),ts:Date.now()/1000,model});
-    renderHistory();
   }catch(e){
     result.innerHTML=`<div class="banner bad">${esc(e.message)}</div>`;
   }
@@ -457,8 +457,6 @@ async function generateVideo(){
     if(jobId){
       result.innerHTML=`<div class="banner good">✅ 视频已提交生成！任务 ID: ${esc(jobId)}</div>`;
       pollVideo(jobId,result);
-      state.history.push({id:Date.now(),type:"video",text:prompt.substring(0,60),ts:Date.now()/1000,model,jobs:[jobId]});
-      renderHistory();
     }
   }catch(e){
     result.innerHTML=`<div class="banner bad">❌ ${esc(e.message)}</div>`;
@@ -487,17 +485,34 @@ async function pollVideo(jobId,resultEl){
 /* ==================== HISTORY ==================== */
 async function loadHistory(){
   try{
-    const [imgJobs,vidJobs]=await Promise.all([
+    const [imgJobs,vidJobs,chatLogs]=await Promise.all([
       api("/api/image-jobs"),
-      api("/api/video-jobs")
+      api("/api/video-jobs"),
+      api("/api/chat-logs")
     ]);
     state.imgJobs=imgJobs.jobs||[];
     state.vidJobs=vidJobs.jobs||[];
+    state.chatLogs=chatLogs.logs||[];
     renderHistory();
   }catch(e){console.error(e);}
 }
 
 function renderHistory(){
+  // 聊天对话记录
+  const chatList=document.getElementById("historyList");
+  if(chatList&&state.chatLogs){
+    if(state.chatLogs.length===0){
+      chatList.innerHTML='<div class="muted" style="font-size:12px;padding:4px 2px">暂无对话记录</div>';
+    }else{
+      const items=state.chatLogs.slice(0,50).map(j=>`
+        <div class="history-item" onclick="showChatLog('${esc(j.id)}')">
+          <button class="del" title="删除" onclick="event.stopPropagation();deleteChatLog('${esc(j.id)}')">×</button>
+          <div class="muted">${timeAgo(j.created_at)} · ${esc((j.model||"").substring(0,18))}</div>
+          <div>${esc((j.prompt||"").substring(0,40))}</div>
+        </div>`).join("");
+      chatList.innerHTML=`<div class="hist-head"><span>对话记录 (${state.chatLogs.length})</span><button class="sm" onclick="clearChatLogs()">清空</button></div>`+items;
+    }
+  }
   const imgList=document.getElementById("imgHistory");
   const vidList=document.getElementById("vidHistory");
   if(imgList&&state.imgJobs){
@@ -520,6 +535,26 @@ function renderHistory(){
       </div>`).join("");
     vidList.innerHTML=`<div class="hist-head"><span>视频记录 (${state.vidJobs.length})</span><button class="sm" onclick="clearVidJobs()">清空</button></div>`+items;
   }
+}
+
+async function deleteChatLog(id){
+  try{ await api("/api/chat-logs/"+encodeURIComponent(id),{method:"DELETE"}); state.chatLogs=state.chatLogs.filter(j=>j.id!==id); renderHistory(); toast("已删除对话记录","good"); }
+  catch(e){ toast(e.message,"bad"); }
+}
+async function clearChatLogs(){
+  if(!confirm("确认清空全部对话记录？此操作不可恢复。"))return;
+  try{ await api("/api/chat-logs/clear",{method:"POST"}); state.chatLogs=[]; renderHistory(); toast("已清空对话记录","good"); }
+  catch(e){ toast(e.message,"bad"); }
+}
+function showChatLog(id){
+  const j=state.chatLogs.find(x=>x.id===id);
+  if(!j)return;
+  switchTab("chat");
+  const view=document.getElementById("chatView");
+  view.innerHTML="";
+  addMsg("user",j.prompt,null,j.created_at||Date.now()/1000);
+  addMsg("ass",j.reply||"",j.model,j.created_at||Date.now()/1000);
+  view.scrollTop=view.scrollHeight;
 }
 
 async function deleteImgJob(id){
@@ -564,7 +599,7 @@ async function loadModels(){
 
 function populateModelSelects(){
   if(!state.models)return;
-  const defaults={chat:"agnes-2.5-flash", image:"agnes-image-2.5-flash", video:"agnes-video-2.5-flash"};
+  const defaults={chat:"agnes-3.0-flash", image:"agnes-image-2.5-flash", video:"agnes-video-2.5-flash"};
   const cfg=[
     {id:"chatModel", mod:"text", def:defaults.chat},
     {id:"imgModel", mod:"image", def:defaults.image},
@@ -575,7 +610,10 @@ function populateModelSelects(){
     if(!sel)return;
     const list=state.models[mod]||[];
     if(list.length===0)return;
-    const current=sel.value||def;
+    // 文字模型优先采用用户/默认偏好（agnes-3.0-flash），图/视频沿用各自静态默认值
+    const current = (mod==="text")
+      ? ((state.model && list.indexOf(state.model)>=0) ? state.model : def)
+      : (sel.value||def);
     let opts=`<option value="agnes-auto">agnes-auto（自动选择）</option>`;
     list.forEach(m=>{
       const selected=m===current?" selected":"";
@@ -607,7 +645,7 @@ function renderMarkdown(src){
   s=s.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,lang,code)=>{
     const idx=codeBlocks.length;
     codeBlocks.push('<pre class="md-pre"><code>'+code.replace(/\n$/,"")+'</code></pre>');
-    return " CODE"+idx+" ";
+    return "\uE000CODE"+idx+"\uE000";
   });
 
   // 2) 抽取行内代码
@@ -615,7 +653,7 @@ function renderMarkdown(src){
   s=s.replace(/`([^`\n]+?)`/g,(m,code)=>{
     const idx=inlineCodes.length;
     inlineCodes.push('<code class="md-code">'+code+'</code>');
-    return " IC"+idx+" ";
+    return "\uE000IC"+idx+"\uE000";
   });
 
   // 3) 块级解析
@@ -623,11 +661,11 @@ function renderMarkdown(src){
   let html="";
   let inList=null;
   const closeList=()=>{ if(inList){ html+=(inList==="ul"?"</ul>":"</ol>"); inList=null; } };
-  const isSpecial=(ln)=>/^(#{1,6})\s/.test(ln)||/^\s*[-*+]\s+/.test(ln)||/^\s*\d+\.\s+/.test(ln)||/^&gt;/.test(ln)||/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)||/^ CODE\d+ $/.test(ln);
+  const isSpecial=(ln)=>/^(#{1,6})\s/.test(ln)||/^\s*[-*+]\s+/.test(ln)||/^\s*\d+\.\s+/.test(ln)||/^&gt;/.test(ln)||/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)||/^\uE000CODE\d+\uE000$/.test(ln);
   let i=0;
   while(i<lines.length){
     const line=lines[i];
-    let cm=line.match(/^ CODE(\d+) $/);
+    let cm=line.match(/^\uE000CODE(\d+)\uE000$/);
     if(cm){ closeList(); html+=codeBlocks[+cm[1]]; i++; continue; }
     let hm=line.match(/^(#{1,6})\s+(.*)$/);
     if(hm){ closeList(); const lvl=hm[1].length; html+="<h"+lvl+' class="md-h md-h'+lvl+'">'+inline(hm[2])+"</h"+lvl+">"; i++; continue; }
@@ -660,7 +698,7 @@ function renderMarkdown(src){
   closeList();
 
   // 4) 还原行内代码
-  html=html.replace(/ IC(\d+) /g,(m,idx)=>inlineCodes[+idx]);
+  html=html.replace(/\uE000IC(\d+)\uE000/g,(m,idx)=>inlineCodes[+idx]);
   return html;
 
   function inline(t){

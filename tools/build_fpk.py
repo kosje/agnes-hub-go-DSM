@@ -40,11 +40,11 @@ OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
 
 APP_ID = "agnes-hub"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 SERVICE_PORT = 4142
 # 嵌在二进制里的版本串，upgrade_init 用它判断「这个残留文件是不是本版本的」。
 # 必须与 main.go 的 var version 完全一致，否则升级前置清理会把自己刚装的删掉。
-VERSION_TAG = "1.0.2"
+VERSION_TAG = "1.0.3"
 # 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
 FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
@@ -186,6 +186,8 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.3：新增聊天对话记录持久化（服务端存储、侧栏可查看/删除/清空、点击回溯历史对话）；"
+    "文字模型默认改为 agnes-3.0-flash 优先；飞牛端安装后生成桌面快捷方式（点击打开控制台）。"
     "1.0.1 自更新：内置 GitHub Releases 版本检查与一键更新（SHA256 + 可执行文件魔数双校验）；"
     "Windows 由助手进程在旧进程退出后完成替换并自动重启；修复替换脚本在进程存活时执行导致更新静默失效的问题。"
     "1.0.0 首发：多账号聚合中转、agnes-auto 三模态自动路由、FIFO 严格节拍限流、"
@@ -263,15 +265,15 @@ def prepare():
         ("version", VERSION),
         ("display_name", "Agnes Hub"),
         ("desc", "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生/生图/生视频；"
-                  "FIFO 严格节拍、软粘性溢出、二维自适应校准、熔断自动复活。"),
+                  "FIFO 严格节拍、软粘性溢出、二维自适应校准、熔断自动复活。内置 /chat 网页对话 UI（对话记录持久化、agnes-3.0-flash 默认模型）；飞牛端安装后生成桌面快捷方式，点击打开控制台。"),
         ("source", "thirdparty"),
         ("platform", "x86"),
         ("arch", "x86_64"),
         ("maintainer", "my788525"),
         ("maintainer_url", "https://github.com/my788525/agnes-hub-go"),
         ("os_min_version", "0.9.0"),
-        ("desktop_uidir", ""),  # 服务无UI，留空
-        ("desktop_applaunchname", ""),  # 服务无桌面快捷方式，留空
+        ("desktop_uidir", "ui"),
+        ("desktop_applaunchname", "agnes-hub.main"),
         ("service_port", str(SERVICE_PORT)),
         ("checkport", "false"),
         ("ctl_stop", "true"),
@@ -292,6 +294,33 @@ def prepare():
         else:
             _placeholder_png(os.path.join(FPK_DIR, name), 64 if name == "ICON.PNG" else 256)
 
+    # 6.5 桌面快捷方式（ui 目录）：fnOS 安装后于桌面生成图标，点击打开 /console
+    # 结构必须对齐 M365 官方可装 fpk：ui/ 平铺在 app.tgz 顶层（fnOS 套 <app_id>/ 后为
+    # <app_id>/ui/config）；ui/config 为 JSON，icon 用 images/icon-{0}.png 占位。
+    ui_dir = os.path.join(APP_DIR, "ui")
+    ui_img_dir = os.path.join(ui_dir, "images")
+    os.makedirs(ui_img_dir, exist_ok=True)
+    ui_config = {
+        ".url": {
+            "agnes-hub.main": {
+                "title": "Agnes Hub",
+                "icon": "images/icon-{0}.png",
+                "type": "url",
+                "protocol": "http",
+                "port": str(SERVICE_PORT),
+                "url": "/console",
+                "allUsers": True,
+            }
+        }
+    }
+    with open(os.path.join(ui_dir, "config"), "w", encoding="utf-8") as f:
+        json.dump(ui_config, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+    _make_square_icon(os.path.join(ROOT, "assets", "ICON_256.PNG"),
+                      os.path.join(ui_img_dir, "icon-256.png"), 256)
+    _make_square_icon(os.path.join(ROOT, "assets", "ICON_256.PNG"),
+                      os.path.join(ui_img_dir, "icon-64.png"), 64)
+
 
 def _placeholder_png(path, size):
     import zlib
@@ -307,21 +336,34 @@ def _placeholder_png(path, size):
         f.write(sig + ihdr + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
-def build_inner():
-    """内层 app.tgz：包含完整的 app 目录树（对齐 M365 结构）。
+def _make_square_icon(src, dst, size):
+    """从源图正方形裁剪到 size×size；缺 Pillow 时退回原图拷贝。"""
+    try:
+        from PIL import Image
+        im = Image.open(src).convert("RGBA")
+        w, h = im.size
+        side = min(w, h)
+        box = ((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2)
+        im.crop(box).resize((size, size), Image.LANCZOS).save(dst)
+    except Exception:
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
 
-    对齐 fnOS 官方 fpk（如 M365-Copilot2API-FNOS）：
-    - app.tgz 根目录是一个以 APP_ID 命名的子目录
-    - 该子目录下放：二进制、config/、cmd/ 等完整目录树
-    - 应用中心会将 app.tgz 内容解压到 /var/apps/<app_id>/
+
+def build_inner():
+    """内层 app.tgz：对齐已验证可装的 1.0.0 fpk 内层结构。
+
+    实测 fnOS 会把 app.tgz 内容解压到 /var/apps/<app_id>/ 并再套一层 <app_id>/，
+    因此内部路径要这样排布（参考 1.0.0 实际产物）：
+    - 二进制放在 app/ 下        → 最终 <app_id>/app/<bin>，cmd/main 的 $APP_DIR/app/$BIN_NAME 命中
+    - cmd/、wizard/、config/、ui/ 平铺在 app.tgz 顶层
+      （ui/ 由 fnOS 套 <app_id>/ 后变成 <app_id>/ui，桌面快捷方式据此读取）
     """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9,
                       format=tarfile.GNU_FORMAT) as tar:
-        root_arc = APP_ID
-
-        # 添加根目录条目（必须用正斜杠，避免 Windows 产生反斜杠路径）
-        ti = tarfile.TarInfo(name=root_arc + "/")
+        # app/ 目录条目（二进制所在）
+        ti = tarfile.TarInfo(name="app/")
         ti.type = tarfile.DIRTYPE
         ti.mode = 0o755
         ti.uid = ti.gid = 0
@@ -329,26 +371,24 @@ def build_inner():
         ti.mtime = 0
         tar.addfile(ti)
 
-        # 复制二进制到根目录
+        # 二进制放在 app/ 下
         for src_name, dst_name in (("agnes-hub-go-linux-amd64", "agnes-hub-go"),
                                     ("agnes-hub-go-linux-arm64", "agnes-hub-go-arm64")):
             src = os.path.join(ROOT, src_name)
             if not os.path.exists(src):
                 sys.exit("[ERROR] 缺少交叉编译产物 %s，请先执行 build_linux.sh 或 go build" % src_name)
-            arc = root_arc + "/" + dst_name
-            _add_file(tar, src, arc, mode=0o755)
+            _add_file(tar, src, "app/" + dst_name, mode=0o755)
 
-        # 复制 config/ 目录
-        if os.path.isdir(CONFIG_DIR):
-            _add_dir_recursive(tar, CONFIG_DIR, root_arc + "/config")
+        # cmd/、wizard/、config/ 平铺在顶层
+        for d in ("config", "cmd", "wizard"):
+            full = os.path.join(FPK_DIR, d)
+            if os.path.isdir(full):
+                _add_dir_recursive(tar, full, d)
 
-        # 复制 cmd/ 目录
-        if os.path.isdir(CMD_DIR):
-            _add_dir_recursive(tar, CMD_DIR, root_arc + "/cmd")
-
-        # 复制 wizard/ 目录
-        if os.path.isdir(WIZARD_DIR):
-            _add_dir_recursive(tar, WIZARD_DIR, root_arc + "/wizard")
+        # 桌面快捷方式 ui/ 平铺在顶层（fnOS 套 <app_id>/ 后为 <app_id>/ui）
+        ui_full = os.path.join(APP_DIR, "ui")
+        if os.path.isdir(ui_full):
+            _add_dir_recursive(tar, ui_full, "ui")
 
     data = buf.getvalue()
     md5 = hashlib.md5(data).hexdigest()
@@ -400,6 +440,11 @@ def build_outer(app_data, md5):
             for name in ("ICON.PNG", "ICON_256.PNG"):
                 _add_file(outer, os.path.join(FPK_DIR, name), name)
 
+            # 独立的 manifest.checksum 文件（与已验证可装的 1.0.0 fpk 保持一致）
+            cs = os.path.join(FPK_DIR, "manifest.checksum")
+            if os.path.exists(cs):
+                _add_file(outer, cs, "manifest.checksum")
+
             ti = tarfile.TarInfo(name="app.tgz")
             ti.size = len(app_data)
             ti.uid = ti.gid = 0
@@ -411,7 +456,8 @@ def build_outer(app_data, md5):
 
 
 def _stamp_manifest_checksum(md5):
-    """往 manifest 末尾补 checksum= 字段（对齐 fnOS 官方参考 fpk）。"""
+    """往 manifest 末尾补 checksum= 字段（对齐 fnOS 官方参考 fpk），
+    并额外写一份 manifest.checksum 文件（对齐已验证可装的 1.0.0 fpk）。"""
     mp = os.path.join(FPK_DIR, "manifest")
     with open(mp, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
@@ -419,6 +465,8 @@ def _stamp_manifest_checksum(md5):
         lines.append("%s = %s" % ("checksum".ljust(22), md5))
     with open(mp, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("\n".join(lines) + "\n")
+    with open(os.path.join(FPK_DIR, "manifest.checksum"), "w", encoding="utf-8", newline="") as f:
+        f.write(md5 + "\n")
 
 
 def main():

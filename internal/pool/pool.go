@@ -63,7 +63,7 @@ var ModalityByPool = map[string]string{
 
 // FallbackModel 每个模态的兜底模型（仅在账号清单与偏好都为空时使用）。
 var FallbackModel = map[string]string{
-	"text":  "agnes-2.5-flash",
+	"text":  "agnes-3.0-flash",
 	"image": "agnes-image-2.5-flash",
 	"video": "agnes-video-2.5-flash",
 }

@@ -3,6 +3,8 @@ package web
 import (
 	"context"
 	_ "embed"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,6 +70,10 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("DELETE /api/image-jobs/{id}", s.apiDeleteImageJob)
 	m.HandleFunc("POST /api/video-jobs/clear", s.apiClearVideoJobs)
 	m.HandleFunc("POST /api/image-jobs/clear", s.apiClearImageJobs)
+	m.HandleFunc("GET /api/chat-logs", s.apiChatLogs)
+	m.HandleFunc("POST /api/chat-logs", s.apiCreateChatLog)
+	m.HandleFunc("DELETE /api/chat-logs/{id}", s.apiDeleteChatLog)
+	m.HandleFunc("POST /api/chat-logs/clear", s.apiClearChatLogs)
 
 	m.HandleFunc("GET /api/settings", s.apiGetSettings)
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
@@ -905,6 +911,86 @@ func (s *Server) apiClearVideoJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Store.ClearVideoJobs()
 	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// ---- 聊天记录 ----
+
+func (s *Server) apiChatLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"logs": s.Store.ChatLogsSnapshot()}, nil)
+}
+
+func (s *Server) apiCreateChatLog(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	var body struct {
+		Model  string `json:"model"`
+		Prompt string `json:"prompt"`
+		Reply  string `json:"reply"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "invalid body"})
+		return
+	}
+	if body.Prompt == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "prompt required"})
+		return
+	}
+	if body.Status == "" {
+		body.Status = "completed"
+	}
+	id := "cl_" + randHex(12)
+	log := &config.ChatLog{
+		ID:        id,
+		Model:     body.Model,
+		Prompt:    body.Prompt,
+		Reply:     body.Reply,
+		Status:    body.Status,
+		CreatedAt: float64(time.Now().Unix()),
+	}
+	s.Store.AddChatLog(log)
+	writeJSON(w, 200, map[string]any{"id": id, "ok": true}, nil)
+}
+
+func (s *Server) apiDeleteChatLog(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "missing id"})
+		return
+	}
+	if !s.Store.DeleteChatLog(id) {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "chat log not found"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+func (s *Server) apiClearChatLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	s.Store.ClearChatLogs()
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// randHex 生成 n 字节的十六进制随机串，用于聊天记录等实体的唯一 ID。
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // ---------------------------------------------------------------------------
