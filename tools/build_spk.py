@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 """构建 agnes-hub-go 的群晖 DSM SPK 安装包。
 
-与飞牛 fpk 的关键差异（决定了本脚本为什么不能复用 build_fpk.py）：
+四个必须守住的群晖约束：
 
   1. 一个 SPK 只能装一种架构的二进制。群晖官方 INFO 文档对 arch 字段的原话是
      "Please not pack all binary files with different platforms to one package spk file."
-     所以这里按架构循环产出多个 SPK，而不是像 fpk 那样把 amd64+arm64 塞进一个包
-     再在脚本里用 uname -m 选。
+     所以这里按架构产出独立的 SPK（默认只出 x86_64）。
   2. INFO 的每个值都必须带双引号（package="x" 而不是 package=x），
      且 version 必须是「功能号-构建号」（1.0.2-0001），构建号每次发布要递增，
      否则套件中心认为版本没变、不提示升级。
-  3. 生命周期脚本是固定文件名的 scripts/ 目录，不是 cmd/main 的子命令分发；
-     其中 preinst/postinst/preuninst/postuninst/preupgrade/postupgrade
-     六个文件必须全部存在，缺一个会被判定为「套件损坏」。
-  4. 数据目录用 SYNOPKG_PKGVAR（/var/packages/<包名>/var），不是 TRIM_PKGVAR。
+  3. thirdparty="yes" 不能漏。DSM 靠它判定这是第三方套件、走「信任层级」那套流程；
+     缺了它 DSM 会把包当成群晖官方包、要求有效的官方签名，安装直接被拒。
+  4. 生命周期脚本是固定文件名的 scripts/ 目录，其中 start-stop-status 加
+     preinst/postinst/preuninst/postuninst/preupgrade/postupgrade 七个文件
+     必须全部存在，缺一个会被判定为「套件损坏」。数据目录用 SYNOPKG_PKGVAR。
 
 产出结构（对齐群晖官方 Package Developer Guide）：
     agnes-hub-<arch>-<version>.spk   (外层 tar.gz)

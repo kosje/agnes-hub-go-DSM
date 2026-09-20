@@ -10,7 +10,7 @@ import (
 	"syscall"
 )
 
-// buildListeners 在 Linux（飞牛 fnOS 部署目标）上处理双栈监听。
+// buildListeners 在 Linux（群晖套件的部署目标）上处理双栈监听。
 //
 // host 为 0.0.0.0 / 空 / :: 时，同时监听 IPv4(0.0.0.0) 与 IPv6(::)：
 // 既能局域网 IPv4 访问，也能被外网 IPv6 域名直达。

@@ -197,7 +197,7 @@ func main() {
 }
 
 // buildListeners 按平台拆分到 listener_linux.go / listener_other.go：
-//   - Linux（飞牛 fnOS 部署目标）：host 为 0.0.0.0/空/:: 时同时监听
+//   - Linux（群晖套件的部署目标）：host 为 0.0.0.0/空/:: 时同时监听
 //     IPv4(0.0.0.0) 与 IPv6(::)，IPv6 套接字强制 V6ONLY=1，互不抢占端口，
 //     满足外网 IPv6 域名直达 + 局域网 IPv4 访问。
 //   - 其余平台（Windows / macOS 单机运行）：单套接字，行为与原版一致。

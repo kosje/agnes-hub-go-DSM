@@ -5,8 +5,8 @@
 //   - Check endpoint is unauthenticated (read-only version probe).
 //   - Apply endpoint requires admin auth (modifies executable on disk).
 //   - The update path is: check → download → verify SHA256 → swap → signal restart.
-//   - The parent process (bat / Windows Service / fnOS appcenter) is expected
-//     to handle the actual restart. On fnOS, upgrade_init runs automatically.
+//   - The parent process (bat / Windows Service) is expected to handle the
+//     actual restart.
 //   - On Windows we replace the .exe only after all in-flight requests finish
 //     (graceful shutdown signal first, then swap).
 package updater
@@ -193,7 +193,7 @@ func (u *Updater) LastCheck() *CheckResult {
 }
 
 // Apply downloads the new binary, verifies it, and replaces the running one.
-// The process is expected to be restarted by the caller (or by fnOS upgrade_init).
+// The process is expected to be restarted by the caller.
 func (u *Updater) Apply(ctx context.Context) (*ApplyResult, error) {
 	last := u.LastCheck()
 	if last == nil || !last.IsUpdateAvailable {
@@ -392,9 +392,6 @@ func pickAsset(assets []ReleaseAsset, binaryName, goos, goarch string) *ReleaseA
 		case goos == "linux" && goarch == "amd64" && strings.Contains(a.Name, "amd64"):
 			return a
 		case goos == "linux" && goarch == "arm64" && strings.Contains(a.Name, "arm64"):
-			return a
-		case goos == "linux" && strings.HasSuffix(a.Name, ".fpk"):
-			// fpk is arch-neutral for our purposes (contains both)
 			return a
 		}
 	}

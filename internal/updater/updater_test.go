@@ -51,7 +51,11 @@ func TestPickAsset(t *testing.T) {
 		{Name: "agnes-hub-go.exe", BrowserURL: "https://example.com/win.exe"},
 		{Name: "agnes-hub-go-linux-amd64", BrowserURL: "https://example.com/linux-amd64"},
 		{Name: "agnes-hub-go-linux-arm64", BrowserURL: "https://example.com/linux-arm64"},
-		{Name: "agnes-hub-go-1.0.0.fpk", BrowserURL: "https://example.com/fpk"},
+		// 群晖套件也在 Release 里，但它不是自更新该拿的东西：
+		// 套件由套件中心管理，进程内替换二进制会让套件内容与已安装版本不一致。
+		// 这里的名字不含 "agnes-hub-go"，pickAsset 不会选中它 —— 下面的用例
+		// 顺带把这一点钉住。
+		{Name: "agnes-hub-x86_64-1.0.2-0001.spk", BrowserURL: "https://example.com/spk"},
 	}
 
 	cases := []struct {
@@ -67,6 +71,12 @@ func TestPickAsset(t *testing.T) {
 		if a == nil || a.Name != tc.wantName {
 			t.Errorf("pickAsset(%s/%s) = %v, want %s", tc.goos, tc.goarch, a, tc.wantName)
 		}
+	}
+
+	// 只提供 SPK 时必须选不出来，否则会把套件当二进制下载。
+	onlySpk := []ReleaseAsset{assets[3]}
+	if a := pickAsset(onlySpk, "agnes-hub-go", "linux", "amd64"); a != nil {
+		t.Errorf("pickAsset 不该选中 SPK，却返回了 %q", a.Name)
 	}
 }
 
