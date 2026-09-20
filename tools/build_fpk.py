@@ -223,12 +223,15 @@ def _placeholder_png(path, size):
 
 
 def build_inner():
-    """内层 app.tgz。uid/gid 归零 + mtime 归零，保证可复现。"""
+    """内层 app.tgz：只放 app/ 下的二进制（对齐 fnOS 官方 fnpack 产物结构）。
+
+    fnOS 应用中心从 fpk **外层**读取 cmd/、config/、wizard/，把这些目录
+    塞进 app.tgz 会导致安装时找不到生命周期脚本（cmd/main 等）而失败。
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9,
                       format=tarfile.GNU_FORMAT) as tar:
-        exec_names = {"agnes-hub-go", "agnes-hub-go-arm64", "main",
-                      "upgrade_init", "install_init"}
+        exec_names = {"agnes-hub-go", "agnes-hub-go-arm64"}
 
         def add(full, arc):
             ti = tar.gettarinfo(full, arcname=arc)
@@ -247,10 +250,6 @@ def build_inner():
 
         for entry in sorted(os.listdir(APP_DIR)):
             add(os.path.join(APP_DIR, entry), "app/" + entry)
-        for entry in sorted(os.listdir(CMD_DIR)):
-            add(os.path.join(CMD_DIR, entry), "cmd/" + entry)
-        add(WIZARD_DIR, "wizard")
-        add(CONFIG_DIR, "config")
 
     data = buf.getvalue()
     md5 = hashlib.md5(data).hexdigest()
@@ -259,21 +258,49 @@ def build_inner():
     return data, md5
 
 
-def build_outer(app_data):
+def _add_file(outer, full, arc, mode=0o644):
+    ti = outer.gettarinfo(full, arcname=arc)
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = "root"
+    ti.mtime = 0
+    ti.mode = mode
+    with open(full, "rb") as fh:
+        outer.addfile(ti, fh)
+
+
+def _add_dir_recursive(outer, full, arc):
+    """把目录递归加进外层 tar，脚本统一 0755、其余 0644。"""
+    ti = tarfile.TarInfo(name=arc)
+    ti.type = tarfile.DIRTYPE
+    ti.mode = 0o755
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = "root"
+    ti.mtime = 0
+    outer.addfile(ti)
+    for child in sorted(os.listdir(full)):
+        cfull = os.path.join(full, child)
+        carc = arc + "/" + child
+        if os.path.isdir(cfull):
+            _add_dir_recursive(outer, cfull, carc)
+        else:
+            mode = 0o755 if (carc.startswith("cmd/") or os.access(cfull, os.X_OK)) else 0o644
+            _add_file(outer, cfull, carc, mode)
+
+
+def build_outer(app_data, md5):
     os.makedirs(OUT_DIR, exist_ok=True)
     out = os.path.join(OUT_DIR, FPK_NAME)
     with open(out, "wb") as fout:
         with tarfile.open(fileobj=fout, mode="w:gz", compresslevel=9,
                           format=tarfile.GNU_FORMAT) as outer:
-            for name in ("manifest", "manifest.checksum", "ICON.PNG", "ICON_256.PNG"):
-                full = os.path.join(FPK_DIR, name)
-                ti = outer.gettarinfo(full, arcname=name)
-                ti.uid = ti.gid = 0
-                ti.uname = ti.gname = "root"
-                ti.mtime = 0
-                ti.mode = 0o644
-                with open(full, "rb") as fh:
-                    outer.addfile(ti, fh)
+            # 顺序对齐已知可装的 fnOS fpk：
+            # manifest → manifest.checksum → cmd → config → wizard → icons → app.tgz
+            _add_file(outer, os.path.join(FPK_DIR, "manifest"), "manifest")
+            _add_file(outer, os.path.join(FPK_DIR, "manifest.checksum"), "manifest.checksum")
+            for d in ("cmd", "config", "wizard"):
+                _add_dir_recursive(outer, os.path.join(FPK_DIR, d), d)
+            for name in ("ICON.PNG", "ICON_256.PNG"):
+                _add_file(outer, os.path.join(FPK_DIR, name), name)
 
             ti = tarfile.TarInfo(name="app.tgz")
             ti.size = len(app_data)
@@ -285,10 +312,22 @@ def build_outer(app_data):
     return out
 
 
+def _stamp_manifest_checksum(md5):
+    """往 manifest 末尾补 checksum= 字段（对齐 fnOS 官方参考 fpk）。"""
+    mp = os.path.join(FPK_DIR, "manifest")
+    with open(mp, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    if not any(l.startswith("checksum=") for l in lines):
+        lines.append("checksum=%s" % md5)
+    with open(mp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def main():
     prepare()
     app_data, md5 = build_inner()
-    out = build_outer(app_data)
+    _stamp_manifest_checksum(md5)
+    out = build_outer(app_data, md5)
     size = os.path.getsize(out)
     print("内层 app.tgz : %d bytes  md5=%s" % (len(app_data), md5))
     print("fpk 产物     : %s" % out)

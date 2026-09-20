@@ -19,7 +19,8 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 
 | 资产 | 用途 |
 | --- | --- |
-| `agnes-hub-go.exe` | Windows x64，配合 `agnes-hub-go.bat` 双击运行 |
+| `agnes-hub-go-windows-<版本>.zip` | **Windows 绿色版**：解压即用，含 `agnes-hub-go.exe` + `agnes-hub-go.bat` + 说明，无需安装 Go 或任何运行时，支持 Win10+ |
+| `agnes-hub-go.exe` | Windows x64 裸二进制（自更新会下载它；手动运行请用上面的 zip） |
 | `agnes-hub-go-linux-amd64` | 飞牛 fnOS / 通用 Linux x64 |
 | `agnes-hub-go-linux-arm64` | Linux ARM64 |
 | `agnes-hub-go-<版本>.fpk` | 飞牛 fnOS 应用中心安装包 |
