@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -143,9 +144,17 @@ func main() {
 	if settings.MustChangePassword {
 		fmt.Println("  初始密码  admin123   ← 请到控制台立即修改")
 	}
+	if *host == "0.0.0.0" || *host == "" || *host == "::" {
+		fmt.Println("  网络监听  IPv4(0.0.0.0) + IPv6(::) 双栈")
+	}
 	fmt.Println("--------------------------------------------------------------")
 	fmt.Println("  关闭本窗口即停止服务。")
 	fmt.Println("==============================================================")
+
+	listeners, err := buildListeners(*host, *port)
+	if err != nil {
+		log.Fatalf("监听失败：%v", err)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -154,11 +163,35 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("监听失败：%v", err)
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(listeners))
+	for _, ln := range listeners {
+		wg.Add(1)
+		go func(l net.Listener) {
+			defer wg.Done()
+			if e := httpSrv.Serve(l); e != nil && !errors.Is(e, http.ErrServerClosed) {
+				errCh <- e
+			}
+		}(ln)
+	}
+
+	// 等到优雅关闭完成，或首个监听错误。
+	select {
+	case <-ctx.Done():
+		wg.Wait()
+	case e := <-errCh:
+		log.Printf("监听错误：%v", e)
+		cancel()
+		wg.Wait()
 	}
 	fmt.Println("agnes-hub-go 已停止。")
 }
+
+// buildListeners 按平台拆分到 listener_linux.go / listener_other.go：
+//   - Linux（飞牛 fnOS 部署目标）：host 为 0.0.0.0/空/:: 时同时监听
+//     IPv4(0.0.0.0) 与 IPv6(::)，IPv6 套接字强制 V6ONLY=1，互不抢占端口，
+//     满足外网 IPv6 域名直达 + 局域网 IPv4 访问。
+//   - 其余平台（Windows / macOS 单机运行）：单套接字，行为与原版一致。
 
 func displayAddr(host, port string) string {
 	switch host {

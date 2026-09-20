@@ -7,16 +7,20 @@
     （`Copy pack ... to tmp dir ... error : CreateFile ... The system cannot find the file specified`，
      路径转换所致）。双 tar.gz 结构本身很简单，手搓反而可控。
 
-产出结构：
+产出结构（对齐 fnOS 官方可装 fpk，如 M365-Copilot2API-FNOS）：
     .fpk (外层 tar.gz)
       ├── manifest              key=value 文本，不是 JSON（写成 JSON 会让 appcenter 报 code 10111）
-      ├── manifest.checksum     内层 app.tgz 的 MD5
+      │                         —— 内含 checksum=<app.tgz 的 MD5>，应用中心据此校验完整性
       ├── ICON.PNG / ICON_256.PNG
-      └── app.tgz               内层 tar.gz
-          ├── app/              双架构二进制
-          ├── cmd/              生命周期脚本
-          ├── config/           privilege + resource（缺失会被应用中心拒绝）
-          └── wizard/install
+      ├── cmd/                  生命周期脚本（main/install_init/upgrade_init/... 必须置于外层）
+      ├── config/               privilege + resource（缺失会被应用中心拒绝）
+      ├── wizard/install        无交互安装向导（空数组即可）
+      └── app.tgz               内层 tar.gz，只放 app/ 双架构二进制
+          ├── app/agnes-hub-go
+          └── app/agnes-hub-go-arm64
+
+关键坑：cmd/config/wizard 必须放在**外层** tar；塞进 app.tgz 会导致
+应用中心找不到 cmd/main 而安装失败。fnOS 不要求独立的 manifest.checksum 文件。
 
 用法：
     python tools/build_fpk.py                 # 输出到 dist/
@@ -48,10 +52,16 @@ CMD_DIR = os.path.join(FPK_DIR, "cmd")
 WIZARD_DIR = os.path.join(FPK_DIR, "wizard")
 CONFIG_DIR = os.path.join(FPK_DIR, "config")
 
+# 对齐 fnOS 官方可装 fpk（M365-Copilot2API-FNOS）的 cmd/main 形态：
+# fnOS 应用中心会以 `cmd/main start` 拉起、`cmd/main stop` 停止、
+# `cmd/main status` 探活（期望运行中返回 0、未运行返回 3）。
+# 无参数调用默认按 start 处理，兼容 appcenter 直接 `cmd/main` 的场景。
 MAIN_SCRIPT = '''#!/bin/bash
 set -u
 
 APP_DIR="$TRIM_APPDEST"
+
+# 数据目录解析：优先用 fnOS 生命周期变量，否则读取 start 时持久化的路径
 DATA_DIR=""
 if [ -n "${TRIM_PKGVAR:-}" ]; then
   DATA_DIR="$TRIM_PKGVAR/data"
@@ -63,6 +73,7 @@ fi
 PORT="${AGNES_HUB_PORT:-%PORT%}"
 LISTEN="0.0.0.0:$PORT"
 
+# 定位二进制（解压后可能位于 $APP_DIR 或 $APP_DIR/app 下）
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) BIN_NAME="agnes-hub-go" ;;
@@ -72,22 +83,57 @@ esac
 
 BIN=""
 for cand in "$APP_DIR/app/$BIN_NAME" "$APP_DIR/$BIN_NAME"; do
-  [ -x "$cand" ] && BIN="$cand" && break
+  if [ -x "$cand" ]; then
+    BIN="$cand"
+    break
+  fi
 done
-[ -z "$BIN" ] && { echo "binary not found" > "$TRIM_TEMP_LOGFILE"; exit 1; }
+if [ -z "$BIN" ]; then
+  echo "binary not found under $APP_DIR" > "$TRIM_TEMP_LOGFILE"
+  exit 1
+fi
 
 mkdir -p "$DATA_DIR" "$APP_DIR/state"
 echo "$DATA_DIR" > "$APP_DIR/state/datadir"
 echo "$LISTEN" > "$APP_DIR/state/listen"
 
-cd "$(dirname "$BIN")"
-nohup "$BIN" -host 0.0.0.0 -port "$PORT" -data "$DATA_DIR" >> "$DATA_DIR/app.log" 2>&1 &
-for i in $(seq 1 30); do
-  pgrep -f "$BIN" >/dev/null 2>&1 && { sleep 1; exit 0; }
-  sleep 1
-done
-echo "failed to start $BIN" > "$TRIM_TEMP_LOGFILE"
-exit 1
+# -host 0.0.0.0 由 main.go 内部展开为 IPv4(0.0.0.0)+IPv6(::) 双栈，
+# 满足飞牛外网 IPv6 域名直达 + 局域网 IPv4 访问。
+start_service() {
+  cd "$(dirname "$BIN")"
+  nohup "$BIN" -host 0.0.0.0 -port "$PORT" -data "$DATA_DIR" >> "$DATA_DIR/app.log" 2>&1 &
+  for i in $(seq 1 30); do
+    if pgrep -f "$BIN" >/dev/null 2>&1; then
+      sleep 1
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "failed to start $BIN" > "$TRIM_TEMP_LOGFILE"
+  exit 1
+}
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  start)
+    start_service
+    ;;
+  stop)
+    pkill -f "$BIN" 2>/dev/null || true
+    exit 0
+    ;;
+  status)
+    if pgrep -f "$BIN" >/dev/null 2>&1; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    # 无参数默认 start
+    start_service
+    ;;
+esac
 '''
 
 UPGRADE_INIT = '''#!/bin/bash
@@ -253,8 +299,9 @@ def build_inner():
 
     data = buf.getvalue()
     md5 = hashlib.md5(data).hexdigest()
-    with open(os.path.join(FPK_DIR, "manifest.checksum"), "w", encoding="utf-8") as f:
-        f.write(md5 + "\n")
+    # 注：fnOS 官方可装 fpk（M365-Copilot2API-FNOS）**不**带独立 manifest.checksum 文件，
+    # 只在 manifest 内用 checksum= 字段登记 app.tgz 的 MD5（应用中心据此校验完整性）。
+    # 故此处只返回 md5，由 _stamp_manifest_checksum 写进 manifest，不再落单独文件。
     return data, md5
 
 
@@ -293,10 +340,10 @@ def build_outer(app_data, md5):
     with open(out, "wb") as fout:
         with tarfile.open(fileobj=fout, mode="w:gz", compresslevel=9,
                           format=tarfile.GNU_FORMAT) as outer:
-            # 顺序对齐已知可装的 fnOS fpk：
-            # manifest → manifest.checksum → cmd → config → wizard → icons → app.tgz
+            # 顺序对齐已知可装的 fnOS fpk（M365-Copilot2API-FNOS）：
+            # manifest → cmd → config → wizard → icons → app.tgz
+            # （不单独带 manifest.checksum 文件；完整性由 manifest 内的 checksum= 字段保证）
             _add_file(outer, os.path.join(FPK_DIR, "manifest"), "manifest")
-            _add_file(outer, os.path.join(FPK_DIR, "manifest.checksum"), "manifest.checksum")
             for d in ("cmd", "config", "wizard"):
                 _add_dir_recursive(outer, os.path.join(FPK_DIR, d), d)
             for name in ("ICON.PNG", "ICON_256.PNG"):
