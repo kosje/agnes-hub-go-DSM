@@ -464,6 +464,11 @@ def build_info(arch, spk_ver, checksum, extractsize_kb):
         'description="%s"' % DESCRIPTION,
         'arch="%s"' % arch,
         'os_min_ver="%s"' % OS_MIN_VER,
+        # thirdparty 必须声明。DSM 靠它判定这是第三方套件，从而走「信任层级」
+        # 那套流程；缺了它 DSM 会把包当成群晖官方包，要求有效的官方签名，
+        # 安装直接被拒。对照真实在用的 DSM 7 第三方 SPK（homebridge 4.1.2、
+        # Duplicati、r8152）确认过，它们的 INFO 里都有这一行。
+        'thirdparty="yes"',
         'maintainer="%s"' % MAINTAINER,
         'maintainer_url="%s"' % MAINTAINER_URL,
         'distributor="%s"' % MAINTAINER,
