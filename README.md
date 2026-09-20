@@ -399,7 +399,7 @@ sudo appcenter-cli install-fpk /tmp/agnes-hub-go-1.0.0.fpk
 
 ```bash
 export NAS_PASS='<你的口令>'      # 或写进 .nas_pass 文件（已 gitignore）
-python tools/deploy_nas.py
+python tools/deploy_nas.py --host <nas-host> --user <user>
 ```
 
 > **沙箱注意事项**：飞牛的 SSH 会话会拦截 `nohup` / `setsid` / `&` 等后台派生，

@@ -11,7 +11,7 @@
 凭据来源（按优先级，脚本内不存任何明文口令）：
     1. 环境变量 NAS_PASS
     2. 环境变量 NAS_PASS_FILE 指向的文件
-    3. 默认文件 .nas_pass
+    3. 仓库根目录下的 .nas_pass 文件（已 gitignore）
 
 用法：
     python tools/deploy_nas.py --host <nas-host> --user admin
@@ -28,7 +28,7 @@ except ImportError:
     sys.exit("[ERROR] 需要 paramiko：pip install paramiko")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_PASS_FILE = r".nas_pass"
+DEFAULT_PASS_FILE = os.path.join(ROOT, ".nas_pass")
 
 APP_ID = "agnes-hub"
 APP_DIR = "/vol1/@appcenter/" + APP_ID
@@ -87,12 +87,16 @@ class Nas:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="<nas-host>")
+    ap.add_argument("--host", default="", help="fnOS 主机名或 IP（必填）")
     ap.add_argument("--user", default="admin")
     ap.add_argument("--port", default="4142")
     ap.add_argument("--keep-data", action="store_true",
                     help="保留已有数据目录（默认也保留，此开关仅作显式声明）")
     args = ap.parse_args()
+
+    if not args.host:
+        sys.exit("[ERROR] 请用 --host 指定 fnOS 主机名或 IP，"
+                 "例如：--host 192.168.1.10 --user admin")
 
     password = load_password()
     binaries = {
