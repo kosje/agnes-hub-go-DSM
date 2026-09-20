@@ -64,7 +64,7 @@ pause
 exit /b 1
 
 :RUN
-echo 控制台    http://%HOST%:%PORT%/console      初始密码 admin123
+echo 控制台    http://%HOST%:%PORT%/console      首次登录请设置管理员密码
 echo 接口基址  http://%HOST%:%PORT%/v1
 echo 统一模型  agnes-auto   文本 / 生图 / 生视频 自动判定
 echo 数据目录  %DATADIR%

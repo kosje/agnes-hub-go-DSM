@@ -126,7 +126,7 @@ function renderLogin(mustChange){
       <p class="muted">Agnes AI 多账号聚合中转 · RPM 排队限流网关</p>
       <div id="toast" class="hide"></div>
       <label>管理员密码</label>
-      <input id="pw" type="password" placeholder="初始密码 admin123" autocomplete="current-password">
+      <input id="pw" type="password" placeholder="请输入管理员密码" autocomplete="current-password">
       <div class="row" style="margin-top:12px">
         <button class="primary" id="btnLogin">登录</button>
         ${mustChange?`<span class="pill warn">首次登录请改密</span>`:""}
@@ -181,7 +181,7 @@ function renderShell(){
   if(state.session?.must_change_password){
     const el = document.getElementById("mustChange");
     el.className = "banner warn";
-    el.innerHTML = `当前仍在使用初始密码 <b>admin123</b>，请立即修改。<button class="sm primary" style="margin-left:8px" onclick="changePassword()">去修改</button>`;
+    el.innerHTML = `为保障安全，请立即设置一个新管理员密码。<button class="sm primary" style="margin-left:8px" onclick="changePassword()">去修改</button>`;
   }
 }
 async function changePassword(){

@@ -40,11 +40,11 @@ OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
 
 APP_ID = "agnes-hub"
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 SERVICE_PORT = 4142
 # 嵌在二进制里的版本串，upgrade_init 用它判断「这个残留文件是不是本版本的」。
 # 必须与 main.go 的 var version 完全一致，否则升级前置清理会把自己刚装的删掉。
-VERSION_TAG = "1.0.3"
+VERSION_TAG = "1.0.4"
 # 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
 FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
@@ -59,27 +59,31 @@ CONFIG_DIR = os.path.join(FPK_DIR, "config")
 MAIN_SCRIPT = '''#!/bin/bash
 
 # fnOS 会把 app.tgz 的内容解压到 /var/apps/<app_id>/target（= /vol1/@appcenter/<app_id>/），
-# 并且**额外套一层 <app_id>/ 子目录** —— 即真实二进制在 $APP_DIR/$APP_ID/。
-# 参考 jdbeanbot：/vol1/@appcenter/jdbeanbot/node/bin/node ... （扁平，无额外子目录）
-# 我们的包内没有顶层 jdbeanbot 那样的扁平布局，所以需要显式找 $APP_ID 子目录。
+# 并且**额外套一层 <app_id>/ 子目录** —— 即真实二进制在 $APP_DIR/$APP_ID/app/。
+# 注意：hook 阶段（install_init/upgrade_init/uninstall_init/config_init）的环境变量
+# 不一定齐全，因此这里所有变量都要用 ${var:-} 兜底，并且 set -u 已经被禁用。
 APP_ID="agnes-hub"
-APP_DIR="$TRIM_APPDEST"
+APP_DIR="${TRIM_APPDEST:-}"
+[ -z "$APP_DIR" ] && APP_DIR="/var/apps/$APP_ID/target"
+[ -d "$APP_DIR" ] || APP_DIR="/vol1/@appcenter/$APP_ID"
 
-# 安全兜底：fnOS 在 hook 阶段未必传 TRIM_TEMP_LOGFILE，未定义时会因 set -u 崩溃
 TRIM_TEMP_LOGFILE="${TRIM_TEMP_LOGFILE:-/tmp/agnes-hub-main-fallback.log}"
 
-# 数据目录解析：优先用 fnOS 生命周期变量，否则读取 start 时持久化的路径
+# 数据目录解析：优先 fnOS 生命周期变量，其次 start 时持久化的 datadir，
+# 最后 fallback 到 /vol1/@appdata/<app_id>/data（这也是 fnOS 标准的应用数据目录）。
 DATA_DIR=""
 if [ -n "${TRIM_PKGVAR:-}" ]; then
   DATA_DIR="$TRIM_PKGVAR/data"
-elif [ -n "$APP_DIR" ] && [ -f "$APP_DIR/$APP_ID/state/datadir" ]; then
+elif [ -f "$APP_DIR/$APP_ID/state/datadir" ]; then
   DATA_DIR="$(cat "$APP_DIR/$APP_ID/state/datadir" 2>/dev/null)"
+elif [ -f "$APP_DIR/state/datadir" ]; then
+  DATA_DIR="$(cat "$APP_DIR/state/datadir" 2>/dev/null)"
 fi
-[ -z "$DATA_DIR" ] && DATA_DIR="$APP_DIR/$APP_ID/data"
+[ -z "$DATA_DIR" ] && DATA_DIR="/vol1/@appdata/$APP_ID/data"
 
 PORT="${AGNES_HUB_PORT:-%PORT%}"
 
-# 定位二进制：fnOS 实际路径为 $APP_DIR/$APP_ID/<bin>
+# 定位二进制：兼容 $APP_DIR/$APP_ID/app/、$APP_DIR/app/ 以及历史残留路径
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) BIN_NAME="agnes-hub-go" ;;
@@ -88,19 +92,46 @@ case "$ARCH" in
 esac
 
 BIN=""
-for cand in "$APP_DIR/$APP_ID/app/$BIN_NAME" "$APP_DIR/app/$BIN_NAME" "$APP_DIR/$BIN_NAME"; do
+for cand in "$APP_DIR/$APP_ID/app/$BIN_NAME" "$APP_DIR/app/$BIN_NAME" "$APP_DIR/$APP_ID/$BIN_NAME" "$APP_DIR/$BIN_NAME"; do
   if [ -x "$cand" ]; then
     BIN="$cand"
     break
   fi
 done
 if [ -z "$BIN" ]; then
-  echo "binary not found (checked: $APP_DIR/$APP_ID/app/$BIN_NAME, $APP_DIR/app/$BIN_NAME, $APP_DIR/$BIN_NAME)" > "$TRIM_TEMP_LOGFILE"
+  echo "binary not found (checked: $APP_DIR/$APP_ID/app/$BIN_NAME, $APP_DIR/app/$BIN_NAME, $APP_DIR/$APP_ID/$BIN_NAME, $APP_DIR/$BIN_NAME)" > "$TRIM_TEMP_LOGFILE"
   exit 1
 fi
 
+# 卸载留存恢复：数据目录缺少关键用户文件时，从留存目录回填（不覆盖现有）。
+# 留存目录由 uninstall_init 在卸载前写入。
+restore_keep() {
+  local keep=""
+  for cand in "/vol1/@appdata/$APP_ID-keep" "$DATA_DIR/../$APP_ID-keep" "/vol1/$APP_ID-keep"; do
+    if [ -d "$cand" ] && [ -f "$cand/settings.json" ]; then
+      keep="$cand"
+      break
+    fi
+  done
+  [ -z "$keep" ] && return 0
+  if [ ! -f "$DATA_DIR/settings.json" ] || [ ! -f "$DATA_DIR/accounts.json" ]; then
+    mkdir -p "$DATA_DIR"
+    cp -an "$keep/." "$DATA_DIR/" 2>/dev/null || true
+    echo "restored user data from $keep" >> "$DATA_DIR/app.log" 2>/dev/null || true
+  fi
+}
+
 mkdir -p "$DATA_DIR" "$APP_DIR/$APP_ID/state"
 echo "$DATA_DIR" > "$APP_DIR/$APP_ID/state/datadir"
+if [ -d "$APP_DIR/state" ] || mkdir -p "$APP_DIR/state" 2>/dev/null; then
+  echo "$DATA_DIR" > "$APP_DIR/state/datadir"
+fi
+
+# 安装向导设置的管理员密码：非空时传给 Go 二进制作为初始/覆盖密码；
+# 留空时 Go 端不会覆盖现有密码（重装时保留）。
+if [ -n "${wizard_admin_password:-}" ]; then
+  export AGNES_ADMIN_PASSWORD="$wizard_admin_password"
+fi
 
 # -host 0.0.0.0 由 main.go 内部展开为 IPv4(0.0.0.0)+IPv6(::) 双栈，
 # 满足飞牛外网 IPv6 域名直达 + 局域网 IPv4 访问。
@@ -122,6 +153,7 @@ cmd="${1:-}"; shift || true
 
 case "$cmd" in
   start)
+    restore_keep
     start_service
     ;;
   stop)
@@ -136,16 +168,19 @@ case "$cmd" in
     ;;
   *)
     # 无参数默认 start
+    restore_keep
     start_service
     ;;
 esac
 '''
 
 UPGRADE_INIT = '''#!/bin/bash
-# 升级前清掉旧版二进制（保留数据目录）。
-# 注意：fnOS 会把 app.tgz 内容解压到 $TRIM_APPDEST/$APP_ID/，因此扫描路径要带 $APP_ID。
-# 不用 pkill -f "agnes-hub-go" —— 会匹配到本脚本自己的命令行。
+# ============================================================
+# upgrade_init — 升级前：安全停服、备份数据、清理旧版二进制
+# ============================================================
 APP_ID="agnes-hub"
+
+# 1. 安全停服：按 exe 路径精确匹配，避免杀掉钩子脚本自身
 for pid in $(pgrep -f "agnes-hub-go" 2>/dev/null); do
   [ "$pid" = "$$" ] && continue
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
@@ -154,28 +189,29 @@ for pid in $(pgrep -f "agnes-hub-go" 2>/dev/null); do
   esac
 done
 sleep 1
-BASES=""
-[ -n "${TRIM_APPDEST:-}" ] && BASES="$BASES $TRIM_APPDEST"
-[ -n "${TRIM_PKGROOT:-}" ] && BASES="$BASES $TRIM_PKGROOT"
-for base in $BASES; do
-  [ -d "$base" ] || continue
-  for cand in "$base/$APP_ID/app/agnes-hub-go" "$base/$APP_ID/agnes-hub-go" "$base/app/agnes-hub-go" "$base/agnes-hub-go"; do
-    [ -f "$cand" ] || continue
-    grep -aq "%VERSION_TAG%" "$cand" 2>/dev/null || rm -f "$cand"
-  done
-done
-exit 0
-'''
 
-INSTALL_INIT = '''#!/bin/bash
-# 安装前清掉残留旧版二进制（避免版本混乱）。
-APP_ID="agnes-hub"
+# 2. 数据目录解析与备份（升级绝不覆盖原数据）
+DATA_DIR=""
+if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "${TRIM_PKGVAR}/data" ]; then
+  DATA_DIR="${TRIM_PKGVAR}/data"
+elif [ -n "${TRIM_APPDEST:-}" ] && [ -f "${TRIM_APPDEST}/state/datadir" ]; then
+  DATA_DIR="$(cat "${TRIM_APPDEST}/state/datadir" 2>/dev/null)"
+elif [ -n "${TRIM_APPDEST:-}" ] && [ -f "${TRIM_APPDEST}/${APP_ID}/state/datadir" ]; then
+  DATA_DIR="$(cat "${TRIM_APPDEST}/${APP_ID}/state/datadir" 2>/dev/null)"
+fi
+[ -z "$DATA_DIR" ] && DATA_DIR="/vol1/@appdata/${APP_ID}/data"
+if [ -d "$DATA_DIR" ] && [ -f "$DATA_DIR/settings.json" ]; then
+  BACKUP_DIR="${DATA_DIR}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+fi
+
+# 3. 清理旧版二进制（保留数据目录）
 BASES=""
 [ -n "${TRIM_APPDEST:-}" ] && BASES="$BASES $TRIM_APPDEST"
 [ -n "${TRIM_PKGROOT:-}" ] && BASES="$BASES $TRIM_PKGROOT"
 for base in $BASES; do
   [ -d "$base" ] || continue
-  for cand in "$base/$APP_ID/app/agnes-hub-go" "$base/$APP_ID/agnes-hub-go" "$base/app/agnes-hub-go" "$base/agnes-hub-go"; do
+  for cand in "$base/$APP_ID/app/agnes-hub-go" "$base/$APP_ID/app/agnes-hub-go-arm64" "$base/$APP_ID/agnes-hub-go" "$base/$APP_ID/agnes-hub-go-arm64" "$base/app/agnes-hub-go" "$base/app/agnes-hub-go-arm64" "$base/agnes-hub-go" "$base/agnes-hub-go-arm64"; do
     [ -f "$cand" ] || continue
     grep -aq "%VERSION_TAG%" "$cand" 2>/dev/null || rm -f "$cand" 2>/dev/null || true
   done
@@ -183,9 +219,89 @@ done
 exit 0
 '''
 
+INSTALL_INIT = '''#!/bin/bash
+# ============================================================
+# install_init — 安装/重装前：备份已有数据、清理残留旧版二进制
+# ============================================================
+APP_ID="agnes-hub"
+
+# 1. 若已有数据目录，先带时间戳备份（绝不删除/覆盖原数据）
+DATA_DIR=""
+if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "${TRIM_PKGVAR}/data" ]; then
+  DATA_DIR="${TRIM_PKGVAR}/data"
+elif [ -n "${TRIM_APPDEST:-}" ] && [ -f "${TRIM_APPDEST}/state/datadir" ]; then
+  DATA_DIR="$(cat "${TRIM_APPDEST}/state/datadir" 2>/dev/null)"
+elif [ -n "${TRIM_APPDEST:-}" ] && [ -f "${TRIM_APPDEST}/${APP_ID}/state/datadir" ]; then
+  DATA_DIR="$(cat "${TRIM_APPDEST}/${APP_ID}/state/datadir" 2>/dev/null)"
+fi
+[ -z "$DATA_DIR" ] && DATA_DIR="/vol1/@appdata/${APP_ID}/data"
+if [ -d "$DATA_DIR" ] && [ -f "$DATA_DIR/settings.json" ]; then
+  BACKUP_DIR="${DATA_DIR}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$DATA_DIR" "$BACKUP_DIR" 2>/dev/null || true
+fi
+
+# 2. 清理残留旧版二进制（避免版本混乱）
+BASES=""
+[ -n "${TRIM_APPDEST:-}" ] && BASES="$BASES $TRIM_APPDEST"
+[ -n "${TRIM_PKGROOT:-}" ] && BASES="$BASES $TRIM_PKGROOT"
+for base in $BASES; do
+  [ -d "$base" ] || continue
+  for cand in "$base/$APP_ID/app/agnes-hub-go" "$base/$APP_ID/app/agnes-hub-go-arm64" "$base/$APP_ID/agnes-hub-go" "$base/$APP_ID/agnes-hub-go-arm64" "$base/app/agnes-hub-go" "$base/app/agnes-hub-go-arm64" "$base/agnes-hub-go" "$base/agnes-hub-go-arm64"; do
+    [ -f "$cand" ] || continue
+    grep -aq "%VERSION_TAG%" "$cand" 2>/dev/null || rm -f "$cand" 2>/dev/null || true
+  done
+done
+exit 0
+'''
+
+UNINSTALL_INIT = '''#!/bin/bash
+# ============================================================
+# uninstall_init — 卸载前保留用户数据（账号 / 设置 / 聊天记录等）
+# ============================================================
+APP_ID="agnes-hub"
+
+# 1. 停服
+for pid in $(pgrep -f "agnes-hub-go" 2>/dev/null); do
+  [ "$pid" = "$$" ] && continue
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+  case "$exe" in
+    */agnes-hub-go) kill "$pid" 2>/dev/null || true ;;
+  esac
+done
+sleep 1
+
+# 2. 解析数据目录
+DATA_DIR=""
+if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "${TRIM_PKGVAR}/data" ]; then
+  DATA_DIR="${TRIM_PKGVAR}/data"
+elif [ -n "${TRIM_APPDEST:-}" ] && [ -f "${TRIM_APPDEST}/state/datadir" ]; then
+  DATA_DIR="$(cat "${TRIM_APPDEST}/state/datadir" 2>/dev/null)"
+elif [ -n "${TRIM_APPDEST:-}" ] && [ -f "${TRIM_APPDEST}/${APP_ID}/state/datadir" ]; then
+  DATA_DIR="$(cat "${TRIM_APPDEST}/${APP_ID}/state/datadir" 2>/dev/null)"
+fi
+[ -z "$DATA_DIR" ] && DATA_DIR="/vol1/@appdata/${APP_ID}/data"
+[ -d "$DATA_DIR" ] || exit 0   # 没有数据可保，直接放行
+
+# 3. 复制到留存目录（排除日志与临时文件）
+RETAIN="/vol1/@appdata/${APP_ID}-keep"
+if [ ! -d "$RETAIN" ]; then
+  if ! mkdir -p "$RETAIN" 2>/dev/null; then
+    RETAIN="$DATA_DIR/../${APP_ID}-keep"
+    mkdir -p "$RETAIN" 2>/dev/null || RETAIN="/vol1/${APP_ID}-keep"
+    mkdir -p "$RETAIN" 2>/dev/null || { echo "no writable retain dir" >&2; exit 0; }
+  fi
+fi
+tar -C "$DATA_DIR" --exclude='app.log' --exclude='*.tmp' -cf - . 2>/dev/null | tar -C "$RETAIN" -xf - 2>/dev/null
+
+exit 0
+'''
+
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.4：飞牛 fnOS 重装/升级/卸载时完整保留账号、设置、聊天记录；"
+    "安装向导的管理员密码填写后覆盖原密码、留空则保留原密码；更换品牌 logo；"
+    "修复 cmd/main 在部分 fnOS 版本下找不到二进制的问题。"
     "1.0.3：新增聊天对话记录持久化（服务端存储、侧栏可查看/删除/清空、点击回溯历史对话）；"
     "文字模型默认改为 agnes-3.0-flash 优先；飞牛端安装后生成桌面快捷方式（点击打开控制台）。"
     "1.0.1 自更新：内置 GitHub Releases 版本检查与一键更新（SHA256 + 可执行文件魔数双校验）；"
@@ -217,8 +333,9 @@ def prepare():
     _write(os.path.join(CMD_DIR, "main"), MAIN_SCRIPT.replace("%PORT%", str(SERVICE_PORT)))
     _write(os.path.join(CMD_DIR, "upgrade_init"), UPGRADE_INIT.replace("%VERSION_TAG%", VERSION_TAG))
     _write(os.path.join(CMD_DIR, "install_init"), INSTALL_INIT.replace("%VERSION_TAG%", VERSION_TAG))
+    _write(os.path.join(CMD_DIR, "uninstall_init"), UNINSTALL_INIT)
     for name in ("upgrade_callback", "install_callback", "config_callback",
-                 "uninstall_init", "uninstall_callback"):
+                 "uninstall_callback"):
         _write(os.path.join(CMD_DIR, name), TRIVIAL)
     _write(os.path.join(CMD_DIR, "config_init"),
            "#!/bin/bash\npkill -f 'agnes-hub-go' 2>/dev/null || true\nexit 0\n")
@@ -233,11 +350,11 @@ def prepare():
                 "type": "password",
                 "field": "wizard_admin_password",
                 "label": "管理员密码",
-                "helpText": "设置网页管理后台的管理员密码（建议 ≥8 位，含字母和数字）。安装或重新安装时，只要本字段与上次安装时不同，就会直接把管理员密码重置为本值（忘记密码时重装一次即可）。日常重启不会覆盖在网页端修改过的密码。"
+                "helpText": "设置网页管理后台的管理员密码。安装时若填写，则会将管理员密码设为此值；重新安装时若留空，则保留原有管理员密码。忘记密码时可重新安装并填写新密码覆盖。"
             },
             {
                 "type": "tips",
-                "helpText": "服务端口固定为 4142（无需填写）：安装完成后通过飞牛桌面图标或浏览器访问 http://NAS的IP:4142 进入管理页，添加 AI 账号并生成 API Key。账号与配置保存在应用数据目录，卸载时自动保留。"
+                "helpText": "服务端口固定为 4142（无需填写）：安装完成后通过飞牛桌面图标或浏览器访问 http://NAS的IP:4142 进入管理页，添加 AI 账号并生成 API Key。账号与配置保存在应用数据目录，重装/卸载时自动保留。"
             }
         ]
     }], ensure_ascii=False, indent=2)

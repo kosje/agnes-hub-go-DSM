@@ -330,7 +330,18 @@ func NewStore(dir string) (*Store, error) {
 	if err := s.load(); err != nil {
 		return nil, err
 	}
-	if s.Settings.AdminPasswordHash == "" {
+	// 处理安装向导传入的初始/覆盖密码（AGNES_ADMIN_PASSWORD 由 cmd/main 在填写了
+	// wizard_admin_password 时注入）。只要该变量非空，就覆盖当前管理员密码。
+	if adminPW := os.Getenv("AGNES_ADMIN_PASSWORD"); adminPW != "" {
+		salt := randHex(8)
+		s.Settings.AdminPasswordSalt = salt
+		s.Settings.AdminPasswordHash = HashPassword(adminPW, salt)
+		s.Settings.MustChangePassword = true
+		if err := s.saveSettingsLocked(); err != nil {
+			return nil, err
+		}
+	} else if s.Settings.AdminPasswordHash == "" {
+		// 无向导密码且无现有密码：回退到内部默认（不在任何界面展示）
 		salt := randHex(8)
 		s.Settings.AdminPasswordSalt = salt
 		s.Settings.AdminPasswordHash = HashPassword("admin123", salt)

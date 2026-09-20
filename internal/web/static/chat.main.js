@@ -92,7 +92,7 @@ function renderAdminLogin(){
       <label>管理员密码</label>
       <input id="adminPw" type="password" placeholder="请输入管理员密码">
       <div style="margin-top:12px"><button class="primary" id="btnAdminLogin">登录</button></div>
-      <div class="hint">默认密码: admin123</div>
+      <div class="hint">请输入安装时设置的管理员密码</div>
     </div>
   </div>`;
   document.getElementById("btnAdminLogin").onclick=async()=>{
@@ -117,7 +117,7 @@ function renderLogin(){
       <label>访问密码</label>
       <input id="pw" type="password" placeholder="请输入访问密码">
       <div style="margin-top:12px"><button class="primary" id="btnLogin">登录</button></div>
-      <div class="hint">默认密码: admin123</div>
+      <div class="hint">访问密码由控制台设置；未设置则直接进入</div>
     </div>
   </div>`;
   document.getElementById("btnLogin").onclick=async()=>{
@@ -135,7 +135,7 @@ function renderLogin(){
 function renderApp(){
   document.getElementById("app").innerHTML=`
   <div class="topbar">
-    <h1><span class="logo">🤖</span>Agnes AI 助手</h1>
+    <h1><img class="logo" src="/logo.png" alt="Agnes">Agnes AI 助手</h1>
     <span id="topbarInfo" class="topbar-info">加载中...</span>
     <button class="sm" id="btnRefresh">刷新</button>
     <button class="sm danger" id="btnLogout">退出</button>

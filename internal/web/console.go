@@ -28,6 +28,9 @@ var chatHTML []byte
 //go:embed static/chat.main.js
 var chatMainJS []byte
 
+//go:embed static/logo.png
+var logoPNG []byte
+
 const cookieName = "agnes_hub_session"
 const chatPasswordCookie = "agnes_chat_password"
 
@@ -38,6 +41,13 @@ func (s *Server) consoleRoutes() {
 		w.Header().Set("Content-Length", fmt.Sprint(len(consoleHTML)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(consoleHTML)
+	})
+	m.HandleFunc("GET /logo.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Length", fmt.Sprint(len(logoPNG)))
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(logoPNG)
 	})
 
 	m.HandleFunc("POST /api/login", s.apiLogin)
