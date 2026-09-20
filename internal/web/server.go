@@ -35,6 +35,8 @@ type Server struct {
 	mux     *http.ServeMux
 	rules   intent.Rules
 	Updater *updater.Updater
+	// Version 由 main 注入，供 /healthz 与自更新接口显示，避免写死在多处。
+	Version string
 }
 
 // New 构造服务。
@@ -289,10 +291,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			enabled++
 		}
 	}
+	ver := s.Version
+	if ver == "" {
+		ver = "dev"
+	}
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "accounts": enabled,
 		"uptime_sec": int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
-		"version":    "1.0.0-go",
+		"version":    ver,
 	}, nil)
 }
 

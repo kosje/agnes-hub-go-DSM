@@ -34,12 +34,15 @@ import tarfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
-FPK_NAME = "agnes-hub-go-1.0.0.fpk"
 
 APP_ID = "agnes-hub"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SERVICE_PORT = 4142
-VERSION_TAG = "1.0.0-go"      # 嵌在二进制里的版本串，用于升级前置清理的识别
+# 嵌在二进制里的版本串，upgrade_init 用它判断「这个残留文件是不是本版本的」。
+# 必须与 main.go 的 var version 完全一致，否则升级前置清理会把自己刚装的删掉。
+VERSION_TAG = "1.0.1"
+# 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
+FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
 CMD_DIR = os.path.join(FPK_DIR, "cmd")
 WIZARD_DIR = os.path.join(FPK_DIR, "wizard")
@@ -129,6 +132,8 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.1 自更新：内置 GitHub Releases 版本检查与一键更新（SHA256 + 可执行文件魔数双校验）；"
+    "Windows 由助手进程在旧进程退出后完成替换并自动重启；修复替换脚本在进程存活时执行导致更新静默失效的问题。"
     "1.0.0 首发：多账号聚合中转、agnes-auto 三模态自动路由、FIFO 严格节拍限流、"
     "软粘性溢出、(账号*池)二维自适应校准、401/403/402 熔断自动复活、生图/视频非幂等不重试。"
 )

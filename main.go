@@ -28,7 +28,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.0"
+var version = "1.0.1"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -38,6 +38,13 @@ func env(key, fallback string) string {
 }
 
 func main() {
+	// 自更新助手模式：此时本进程唯一任务是等上一个进程退出、
+	// 换掉被锁定的 exe、再把新版本拉起来，然后立刻结束。
+	// 必须在任何初始化之前判断，否则助手会去抢端口。
+	if updater.SwapHelperRequested() {
+		os.Exit(updater.RunSwapHelper())
+	}
+
 	host := flag.String("host", env("AGNES_HUB_HOST", "127.0.0.1"), "监听地址（0.0.0.0 表示允许局域网访问）")
 	port := flag.String("port", env("AGNES_HUB_PORT", "4142"), "监听端口")
 	dataDir := flag.String("data", env("AGNES_HUB_DATA", ""), "数据目录（默认 ./data）")
@@ -72,6 +79,7 @@ func main() {
 	h.StartMaintenance(ctx)
 
 	srv := web.New(store, h, relay.BuildClient())
+	srv.Version = version
 
 	// 初始化自更新器
 	exe, _ := os.Executable()
@@ -79,18 +87,30 @@ func main() {
 		Repo:       "my788525/agnes-hub-go",
 		BinaryName: "agnes-hub-go",
 		DataDir:    *dataDir,
+		// 检查频率：12 小时。自更新是「有就换」，没必要更勤；
+		// 控制台上也可以随时手动点「检查更新」。
+		CheckInterval: 12 * time.Hour,
 	}
 	upd := updater.New(updCfg, version, exe, nil)
 	srv.SetUpdater(upd)
+	upd.StartBackground(ctx, updCfg.CheckInterval)
 
-	// 启动后台版本检查（每天检查一次）
-	upd.StartBackground(ctx, 24*time.Hour)
-
-	// 监听需要重启的信号
+	// 应用完更新后要真的退出：光置一个标志位没人看，
+	// 必须有人把它翻译成取消信号，进程才会走到优雅关闭。
 	go func() {
-		<-ctx.Done()
-		if upd.NeedRestart() {
-			upd.RequestRestart()
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if upd.NeedRestart() {
+					fmt.Println("自更新已就位，正在退出以便替换二进制…")
+					cancel()
+					return
+				}
+			}
 		}
 	}()
 

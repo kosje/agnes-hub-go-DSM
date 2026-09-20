@@ -187,7 +187,7 @@ def main():
     print("\n" + "=" * 62)
     print(" 前台联调结束。要常驻请用应用中心安装 .fpk：")
     print("   python tools/build_fpk.py")
-    print("   sudo appcenter-cli install-fpk dist/agnes-hub-go-1.0.0.fpk")
+    print("   sudo appcenter-cli install-fpk dist/agnes-hub-go-1.0.1.fpk")
     print("=" * 62)
 
 

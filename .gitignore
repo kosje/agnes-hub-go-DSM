@@ -1,4 +1,5 @@
 # 编译产物
+*.exe~        # Go 链接器覆盖运行中的 exe 时留下的备份
 *.exe
 agnes-hub-go
 agnes-hub-go-linux-amd64

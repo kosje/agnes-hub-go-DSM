@@ -22,7 +22,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -46,30 +45,30 @@ type ReleaseAsset struct {
 
 // GitHubRelease is the shape we care about from a GitHub release JSON.
 type GitHubRelease struct {
-	TagName    string            `json:"tag_name"`
-	PublishedAt time.Time         `json:"published_at"`
-	Body       string            `json:"body"`
-	Assets     []ReleaseAsset    `json:"assets"`
+	TagName     string         `json:"tag_name"`
+	PublishedAt time.Time      `json:"published_at"`
+	Body        string         `json:"body"`
+	Assets      []ReleaseAsset `json:"assets"`
 }
 
 // CheckResult holds the outcome of a version check.
 type CheckResult struct {
-	CurrentVersion string       `json:"current_version"`
-	LatestVersion  string       `json:"latest_version"`
-	IsUpdateAvailable bool     `json:"is_update_available"`
-	ReleaseDate    string       `json:"release_date,omitempty"`
-	Changelog    string        `json:"changelog,omitempty"`
-	Assets       []ReleaseAsset `json:"assets,omitempty"`
-	Error        string        `json:"error,omitempty"`
+	CurrentVersion    string         `json:"current_version"`
+	LatestVersion     string         `json:"latest_version"`
+	IsUpdateAvailable bool           `json:"is_update_available"`
+	ReleaseDate       string         `json:"release_date,omitempty"`
+	Changelog         string         `json:"changelog,omitempty"`
+	Assets            []ReleaseAsset `json:"assets,omitempty"`
+	Error             string         `json:"error,omitempty"`
 }
 
 // ApplyResult holds the outcome of an update apply.
 type ApplyResult struct {
-	Success      bool   `json:"success"`
-	NewVersion   string `json:"new_version,omitempty"`
-	OldVersion   string `json:"old_version,omitempty"`
-	Message      string `json:"message,omitempty"`
-	Error        string `json:"error,omitempty"`
+	Success    bool   `json:"success"`
+	NewVersion string `json:"new_version,omitempty"`
+	OldVersion string `json:"old_version,omitempty"`
+	Message    string `json:"message,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +89,9 @@ type Config struct {
 	AllowPreRelease bool
 	// SHA256Expected is an optional known-good hash to verify against.
 	SHA256Expected string
+	// NoRelaunch 只影响 Windows：置 true 时替换完成后不自动把新版本拉起来，
+	// 交给调用方（服务管理器 / 用户）决定何时重启。默认 false = 自动重启。
+	NoRelaunch bool
 }
 
 // ---------------------------------------------------------------------------
@@ -98,14 +100,14 @@ type Config struct {
 
 // Updater is the self-update engine.
 type Updater struct {
-	cfg      Config
-	client   *http.Client
-	mu       sync.Mutex
+	cfg       Config
+	client    *http.Client
+	mu        sync.Mutex
 	lastCheck *CheckResult
-	pending  atomic.Bool // true when a restart is requested after successful apply
-	version  string
-	binPath  string
-	logger   *log.Logger
+	pending   atomic.Bool // true when a restart is requested after successful apply
+	version   string
+	binPath   string
+	logger    *log.Logger
 }
 
 // New constructs an Updater.
@@ -123,42 +125,58 @@ func New(cfg Config, version, binPath string, logger *log.Logger) *Updater {
 	return u
 }
 
+// Version 返回当前版本。加锁是因为应用更新后会在运行期改写它。
+func (u *Updater) Version() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.version
+}
+
+func (u *Updater) setVersion(v string) {
+	u.mu.Lock()
+	u.version = v
+	u.mu.Unlock()
+}
+
 // Check performs a one-shot GitHub release lookup and returns the result.
 // Returns nil (with empty result) when the repo is not configured.
 func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
+	cur := u.Version()
 	if u.cfg.Repo == "" {
 		return &CheckResult{
-			CurrentVersion: u.version,
+			CurrentVersion:    cur,
 			IsUpdateAvailable: false,
-			Error: "self-update disabled (no repo configured)",
+			Error:             "self-update disabled (no repo configured)",
 		}, nil
 	}
 
 	release, err := u.fetchLatestRelease(ctx)
 	if err != nil {
 		return &CheckResult{
-			CurrentVersion: u.version,
+			CurrentVersion: cur,
 			Error:          err.Error(),
 		}, nil
 	}
 
 	tag := release.TagName
-	isNewer := versionGt(tag, u.version)
+	isNewer := versionGt(tag, cur)
 
-	// Filter to matching-arch asset.
+	// 只挑本平台能用的那个资产；挑不到就不算「有更新」，
+	// 否则点了更新只会在 Apply 阶段失败。
 	asset := pickAsset(release.Assets, u.cfg.BinaryName, runtime.GOOS, runtime.GOARCH)
 
 	result := &CheckResult{
-		CurrentVersion:  u.version,
-		LatestVersion:   tag,
+		CurrentVersion:    cur,
+		LatestVersion:     tag,
 		IsUpdateAvailable: isNewer && asset != nil,
-		ReleaseDate:     release.PublishedAt.Format("2006-01-02"),
-		Changelog:      truncate(release.Body, 500),
-		Assets:         release.Assets,
+		ReleaseDate:       release.PublishedAt.Format("2006-01-02"),
+		Changelog:         truncate(release.Body, 500),
+		Assets:            release.Assets,
 	}
-	if asset == nil {
-		result.IsUpdateAvailable = false
-		result.Error = fmt.Sprintf("no %s/%s asset found in %s", runtime.GOOS, runtime.GOARCH, tag)
+	// 只有「确实有新版本、但没提供本平台的包」才值得报错；
+	// 已经是最新版时资产列表里没有本平台的包是正常的，不该弹错误。
+	if isNewer && asset == nil {
+		result.Error = fmt.Sprintf("release %s 没有 %s/%s 的资产", tag, runtime.GOOS, runtime.GOARCH)
 	}
 
 	u.mu.Lock()
@@ -225,10 +243,19 @@ func (u *Updater) Apply(ctx context.Context) (*ApplyResult, error) {
 		return &ApplyResult{Success: false, Error: "write: " + err.Error()}, nil
 	}
 
-	// Size sanity.
-	if written > 50*1024*1024 {
+	// 尺寸合理性：下载被截断、或拿到的是错误页/重定向页面时都会明显偏小。
+	// 上界防「下成别的大文件」，下界防「下成一段 HTML 就当二进制换上」。
+	if written < 32*1024 || written > 50*1024*1024 {
 		_ = os.Remove(tmpPath)
-		return &ApplyResult{Success: false, Error: "download too large (>50MB)"}, nil
+		return &ApplyResult{Success: false,
+			Error: fmt.Sprintf("downloaded %d bytes, out of sane range (32KB-50MB)", written)}, nil
+	}
+
+	// 魔数校验：SHA256 只有在调用方显式给了期望值时才比得了，
+	// 那时才挡不住「GitHub 返回一页 HTML 却被当成新版本」。
+	if err := checkExecutable(tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return &ApplyResult{Success: false, Error: err.Error()}, nil
 	}
 
 	digest := hex.EncodeToString(h.Sum(nil))
@@ -240,32 +267,35 @@ func (u *Updater) Apply(ctx context.Context) (*ApplyResult, error) {
 		}, nil
 	}
 
-	// Replace running binary. On Windows we can't overwrite in-place while running,
-	// so we copy to a .new path and signal restart.
+	// 先把新二进制放到正式文件旁边的 .new：
+	// 这一步只是改名，不碰正在运行的旧文件，任何平台都能成功。
 	newPath := u.binPath + ".new"
 	if err := os.Rename(tmpPath, newPath); err != nil {
-		// Windows can't rename over a locked file.
 		_ = os.Remove(tmpPath)
-		// Fallback: write alongside and signal.
-		if rerr := os.WriteFile(newPath, []byte(digest), 0o755); rerr != nil {
-			return &ApplyResult{Success: false, Error: "swap: " + rerr.Error()}, nil
-		}
+		return &ApplyResult{Success: false,
+			Error: "stage new binary to " + filepath.Base(newPath) + ": " + err.Error()}, nil
 	}
 
-	// Also place it at the canonical name for next launch.
-	// On Linux we can replace directly; on Windows we'll use .new on next start.
-	if err := replaceBinary(u.binPath, newPath); err != nil {
-		u.logger.Printf("replace binary warning: %v", err)
+	// 再让平台各自决定怎么把它变成「正在运行的那个名字」。
+	// 类 Unix 就地 rename 即可；Windows 必须等本进程退出，见 swap_windows.go。
+	if err := replaceBinary(u.binPath, newPath, u.cfg.NoRelaunch); err != nil {
+		u.logger.Printf("replace binary failed: %v", err)
+		return &ApplyResult{Success: false,
+			Error: "downloaded and verified, but swap failed: " + err.Error()}, nil
 	}
 
-	u.logger.Printf("updated to %s", last.LatestVersion)
-	u.version = last.LatestVersion
+	u.setVersion(last.LatestVersion)
+	u.logger.Printf("updated %s -> %s (sha256 %s)", last.CurrentVersion, last.LatestVersion, digest[:12])
 
+	msg := "update applied; restart to activate"
+	if runtime.GOOS == "windows" {
+		msg = "update staged; 旧进程退出后自动替换并重启"
+	}
 	return &ApplyResult{
 		Success:    true,
 		NewVersion: last.LatestVersion,
 		OldVersion: last.CurrentVersion,
-		Message:    "update applied; restart to activate",
+		Message:    msg,
 	}, nil
 }
 
@@ -325,7 +355,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context) (*GitHubRelease, error
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "agnes-hub-go/"+u.version)
+	req.Header.Set("User-Agent", "agnes-hub-go/"+u.Version())
 
 	resp, err := u.client.Do(req)
 	if err != nil {
@@ -424,46 +454,53 @@ func compareParts(a, b versionParts) int {
 }
 
 // ---------------------------------------------------------------------------
-// Binary replacement
+// 二进制校验
 // ---------------------------------------------------------------------------
 
-func replaceBinary(current, newBin string) error {
-	// On Unix we can rename directly.
-	if runtime.GOOS != "windows" {
-		if err := os.Rename(newBin, current); err != nil {
-			return fmt.Errorf("rename: %w", err)
-		}
-		return nil
+// checkExecutable 校验文件开头的魔数，确认它确实是本平台的二进制。
+//
+// 为什么不能只靠 SHA256：SHA256 只在调用方事先知道期望值时才起作用，
+// 而自动更新场景下「期望值」恰恰只能从 release 页面拿，等于形同虚设。
+// 魔数校验很便宜，却能挡住最常见的失败模式 —— 把一页 HTML 错误信息
+// 或一段重定向内容当成新版本换上，让服务再也起不来。
+func checkExecutable(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open downloaded file: %w", err)
+	}
+	defer f.Close()
+
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return fmt.Errorf("read magic of downloaded file: %w", err)
 	}
 
-	// On Windows the running exe is locked. We try rename first; if it fails
-	// we schedule a replacement on next launch via a sidecar script.
-	if err := os.Rename(newBin, current); err == nil {
-		return nil
+	var want string
+	var ok bool
+	switch runtime.GOOS {
+	case "windows":
+		want = "MZ"
+		ok = head[0] == 0x4D && head[1] == 0x5A
+	case "linux":
+		want = "ELF"
+		ok = head[0] == 0x7F && head[1] == 'E' && head[2] == 'L' && head[3] == 'F'
+	case "darwin":
+		want = "Mach-O"
+		ok = (head[0] == 0xFE && head[1] == 0xED) || // 32/64 位 fat 之外的常见形态
+			(head[0] == 0xCF && head[1] == 0xFA) || // 64 位 Mach-O
+			(head[0] == 0xCA && head[1] == 0xFE) // fat / universal
+	default:
+		return nil // 未知平台不拦，交给调用方
 	}
-
-	// Write a .bat that will run on next launch to replace the binary.
- batPath := current + ".update.bat"
- batContent := fmt.Sprintf(`@echo off
-setlocal
-set "SRC=%s"
-set "DST=%s"
-if exist "%%DST%%" del /F /Q "%%DST%%"
-if exist "%%SRC%%" move /Y "%%SRC%%" "%%DST%%"
-endlocal
-`, newBin, current)
-	if err := os.WriteFile(batPath, []byte( batContent), 0o644); err != nil {
-		return fmt.Errorf("write bat: %w", err)
+	if !ok {
+		return fmt.Errorf("downloaded file is not a %s executable (magic % X, want %s)",
+			runtime.GOOS, head, want)
 	}
-
-	// Schedule the bat to run after we exit.
-	cmd := exec.Command("cmd", "/C", "start", "/B", batPath)
-	cmd.Start()
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// 助手
 // ---------------------------------------------------------------------------
 
 func truncate(s string, n int) string {

@@ -11,6 +11,18 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 - 纯 Go 标准库实现，**零第三方依赖**（规避代理被墙与供应链风险）
 - 单文件可执行程序，无运行时依赖，可直接交叉编译到飞牛 NAS
 - 跨平台运行期数据：全 JSON 文件，免 SSH 即可备份 / 迁移
+- **内置自更新**：定时向 GitHub Releases 查新版本，控制台一键更新（见第 7.5 节）
+
+### 直接下载
+
+[Releases](https://github.com/my788525/agnes-hub-go/releases) 里按平台提供：
+
+| 资产 | 用途 |
+| --- | --- |
+| `agnes-hub-go.exe` | Windows x64，配合 `agnes-hub-go.bat` 双击运行 |
+| `agnes-hub-go-linux-amd64` | 飞牛 fnOS / 通用 Linux x64 |
+| `agnes-hub-go-linux-arm64` | Linux ARM64 |
+| `agnes-hub-go-<版本>.fpk` | 飞牛 fnOS 应用中心安装包 |
 
 ---
 
@@ -274,6 +286,58 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agn
 
 ---
 
+## 7.5 自更新
+
+程序内置自更新，会定时向本仓库的 GitHub Releases 查询新版本，
+控制台「系统」Tab 也能手动检查并一键更新。
+
+```text
+GET  /api/update/status   # 当前版本 + 最近一次检查结果（不联网）
+GET  /api/update/check    # 立刻查一次 GitHub Releases
+POST /api/update/apply    # 下载并替换二进制（需管理员会话）
+```
+
+更新流程：**查版本 → 下载匹配本平台/架构的资产 → 尺寸与魔数校验 → 替换 → 重启**。
+
+### 为什么必须是公开仓库
+
+自更新是**匿名**调用 `api.github.com/repos/<repo>/releases/latest` 的，不带任何 token
+（分发出去的二进制里塞 token 等于把仓库读取权限一起发出去）。仓库为 private 时该端点
+返回 404，自更新会静默失效 —— 所以本仓库保持 public。
+
+### 替换正在运行的二进制
+
+这是整个功能里唯一有平台差异的地方：
+
+| 平台 | 做法 | 生效时机 |
+| --- | --- | --- |
+| Linux / macOS | 就地 `rename`。内核持有旧 inode，运行中的进程不受影响 | 下次启动 |
+| Windows | 运行中的 exe 被内核锁定，**无法就地替换**。派生一个「助手」进程：等旧进程退出 → 换文件 → 用新控制台窗口把新版本拉起来 | 自动，无需人工干预 |
+
+Windows 的助手不是批处理，而是**用同一个 exe 加内部参数重新拉起自己**
+（`--agnes-hub-swap-helper`）。这么做有两个原因：
+
+1. 批处理在当前进程还活着的时候就执行，`del` / `move` 必然失败 —— 更新会**看起来成功但什么也没做**；
+2. 批处理是父进程的子进程，父进程一退就被一起带走，没人再执行替换；
+3. 顺带绕开中文路径下 `.bat` 必须存成 GBK、否则被 cmd 按字节切错位的经典坑 ——
+   助手参数走 argv，不存在代码页解析问题。
+
+原始启动参数（`-host` / `-port` / `-data`）会一并透传给重启后的新进程，
+否则更新完新版本会以默认端口起来，看起来就像「更新之后服务不见了」。
+
+> 以 Windows 服务方式运行时，重启由服务管理器负责，应设 `NoRelaunch: true`
+> 避免多起一个进程和 SCM 抢端口。
+
+### 校验
+
+- **尺寸**：小于 32 KB 或大于 50 MB 一律拒绝（挡住被截断的下载和错误页）；
+- **魔数**：按目标平台校验文件头（Windows `MZ`、Linux `ELF`、macOS `Mach-O`）——
+  SHA256 只在调用方事先知道期望值时才起作用，魔数校验才是挡住
+  「把一页 HTML 当成新版本换上、服务再也起不来」的那道闸；
+- **SHA256**：调用方通过 `SHA256Expected` 提供期望值时启用。
+
+---
+
 ## 8. 运行期数据
 
 全部在 `-data` 指定的目录里，都是 JSON，可随时备份 / 拷贝 / 手工编辑：
@@ -305,6 +369,8 @@ go test ./... -count=1
   密钥配额、跨天滚动、绑定 TTL 清理
 - `internal/intent`：意图判定回归矩阵（正例 + 反例）、端点/模型/参数信号优先级、
   agent 守卫、请求体改写
+- `internal/updater`：版本比较、平台资产选择、魔数校验（Windows `MZ` / Linux `ELF` / macOS `Mach-O`）、
+  助手模式（`--agnes-hub-swap-helper`）、等锁释放后的替换与重启
 - `internal/web`：起 mock 上游做端到端（**验证 429 永不透传**、三模态路由、
   多账号分工、中文账号名）
 
@@ -384,10 +450,10 @@ python tools/deploy_nas.py            # 上传并安装到飞牛（需 NAS_PASS 
 ## 11. 部署到飞牛 fnOS
 
 ```bash
-python tools/build_fpk.py                            # 产出 dist/agnes-hub-go-1.0.0.fpk
-scp dist/agnes-hub-go-1.0.0.fpk <user>@<nas-host>:/tmp/
+python tools/build_fpk.py                            # 产出 dist/agnes-hub-go-1.0.1.fpk
+scp dist/agnes-hub-go-1.0.1.fpk <user>@<nas-host>:/tmp/
 ssh <user>@<nas-host>
-sudo appcenter-cli install-fpk /tmp/agnes-hub-go-1.0.0.fpk
+sudo appcenter-cli install-fpk /tmp/agnes-hub-go-1.0.1.fpk
 ```
 
 `.fpk` 是两层 tar.gz：外层放 `manifest`（**key=value 纯文本，不能写成 JSON**，

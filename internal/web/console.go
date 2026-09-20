@@ -65,6 +65,7 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/probe", s.apiProbe)
 	m.HandleFunc("GET /api/rpm-table", s.apiRPMTable)
 
+	m.HandleFunc("GET /api/update/status", s.apiUpdateStatus)
 	m.HandleFunc("GET /api/update/check", s.apiUpdateCheck)
 	m.HandleFunc("POST /api/update/apply", s.apiUpdateApply)
 }
@@ -1265,15 +1266,52 @@ func truncateStr(s string, n int) string {
 // 自更新
 // ---------------------------------------------------------------------------
 
-func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
+// updateStatus 汇总当前版本与最近一次检查结果，供控制台展示。
+func (s *Server) updateStatus() map[string]any {
+	cur := s.Version
+	if s.Updater != nil {
+		cur = s.Updater.Version()
+	}
+	out := map[string]any{
+		"current_version": cur,
+		"enabled":         s.Updater != nil,
+	}
 	if s.Updater == nil {
-		writeJSON(w, 200, map[string]any{"error": map[string]any{"message": "self-update not initialized"}}, nil)
+		return out
+	}
+	if last := s.Updater.LastCheck(); last != nil {
+		out["last_check"] = last
+	}
+	return out
+}
+
+// apiUpdateStatus 返回当前版本与最近一次检查结果（不主动联网）。
+func (s *Server) apiUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	writeJSON(w, 200, s.updateStatus(), nil)
+}
+
+// apiUpdateCheck 立即向 GitHub 查一次最新版本。
+func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	if s.Updater == nil {
+		writeJSON(w, 200, map[string]any{
+			"current_version": s.Version,
+			"enabled":         false,
+			"error":           "自更新未启用",
+		}, nil)
 		return
 	}
 	result, err := s.Updater.Check(r.Context())
 	if err != nil {
 		writeJSON(w, 200, map[string]any{
-			"current_version": "1.0.0-go",
+			"current_version": s.Updater.Version(),
 			"error":           err.Error(),
 		}, nil)
 		return
@@ -1281,21 +1319,26 @@ func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, result, nil)
 }
 
+// apiUpdateApply 下载并替换二进制。
+//
+// 必须有管理员会话：这是唯一会改动磁盘上可执行文件的接口。
+// 替换成功后置重启标志，主循环监听到就优雅退出 ——
+// Windows 上随后由助手进程完成替换并重启，类 Unix 上由调用方重启。
 func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
 		s.deny(w)
 		return
 	}
 	if s.Updater == nil {
-		writeJSON(w, 200, map[string]any{"error": map[string]any{"message": "self-update not initialized"}}, nil)
+		writeJSON(w, 200, map[string]any{
+			"success": false,
+			"error":   "自更新未启用",
+		}, nil)
 		return
 	}
 	result, err := s.Updater.Apply(r.Context())
 	if err != nil {
-		writeJSON(w, 200, map[string]any{
-			"success": false,
-			"error":   err.Error(),
-		}, nil)
+		writeJSON(w, 200, map[string]any{"success": false, "error": err.Error()}, nil)
 		return
 	}
 	if result.Success {
