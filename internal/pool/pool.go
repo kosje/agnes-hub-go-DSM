@@ -252,3 +252,51 @@ func KnownModelNames(aliases map[string]string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// KnownModelNamesByModality 按模态返回已知的模型名（含别名）。
+func KnownModelNamesByModality(aliases map[string]string) map[string][]string {
+	out := map[string][]string{"text": {}, "image": {}, "video": {}}
+	seen := map[string]bool{}
+	add := func(name, modality string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := modality + "|" + name
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out[modality] = append(out[modality], name)
+	}
+
+	// 标准模型
+	for m := range TextModels {
+		add(m, "text")
+	}
+	for m := range ImageModels {
+		add(m, "image")
+	}
+	for m := range VideoModels {
+		add(m, "video")
+	}
+
+	// 内置别名：按解析后的目标模型归类
+	for alias, target := range BuiltinAliases {
+		if mod := ModalityOfModel(target, nil); mod != "" {
+			add(alias, mod)
+		}
+	}
+
+	// 用户自定义别名
+	for alias, target := range aliases {
+		if mod := ModalityOfModel(target, aliases); mod != "" {
+			add(alias, mod)
+		}
+	}
+
+	for k := range out {
+		sort.Strings(out[k])
+	}
+	return out
+}

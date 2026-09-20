@@ -15,7 +15,7 @@ function toast(m, k) { const e = document.getElementById("toast"); if (!e) retur
 function fmtDate(ts) { if (!ts) return ""; const d = new Date(ts * 1000); return d.toLocaleDateString("zh-CN") + " " + d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }
 function timeAgo(ts) { const s = Math.floor(Date.now() / 1000) - ts; if (s < 60) return s + "秒前"; if (s < 3600) return Math.floor(s / 60) + "分钟前"; if (s < 86400) return Math.floor(s / 3600) + "小时前"; return Math.floor(s / 86400) + "天前"; }
 
-const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, history: [], curHistoryId: null, messages: [], model: "", sending: false, imJobId: null };
+const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, history: [], curHistoryId: null, messages: [], model: "agnes-2.5-flash", sending: false, imJobId: null };
 
 /* ==================== LOGIN ==================== */
 async function checkSession(){
@@ -151,6 +151,16 @@ function renderApp(){
       <div id="imageView" class="hide" style="padding:16px;overflow-y:auto;flex:1"></div>
       <div id="videoView" class="hide" style="padding:16px;overflow-y:auto;flex:1"></div>
       <div id="inputArea" class="input-area">
+        <div class="setting-row" style="margin-bottom:8px">
+          <div class="setting-group" style="max-width:260px">
+            <label>对话模型</label>
+            <select id="chatModel">
+              <option value="agnes-2.5-flash" selected>agnes-2.5-flash</option>
+              <option value="agnes-2.0-flash">agnes-2.0-flash</option>
+              <option value="agnes-auto">agnes-auto（自动）</option>
+            </select>
+          </div>
+        </div>
         <div class="input-row">
           <input id="textInput" class="msg-input" placeholder="输入消息... (Enter 发送，Shift+Enter 换行)" rows="3">
           <button class="primary send-btn" id="btnSend">发送</button>
@@ -193,12 +203,15 @@ function renderApp(){
 
   document.getElementById("btnSend").onclick=sendChat;
   document.getElementById("textInput").onkeydown=e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat();}};
+  const chatModelSel=document.getElementById("chatModel");
+  if(chatModelSel){ chatModelSel.value=state.model; chatModelSel.onchange=e=>{state.model=e.target.value;}; }
 
   // 渲染生图/生视频视图（必须在 renderApp 之后调用）
   renderImageView();
   renderVideoView();
 
   loadHistory();
+  loadModels();
 }
 
 function switchTab(tab){
@@ -351,8 +364,8 @@ function renderImageView(){
           <div class="setting-group">
             <label>生成模型</label>
             <select id="imgModel">
+              <option value="agnes-image-2.5-flash" selected>agnes-image-2.5-flash</option>
               <option value="agnes-auto">agnes-auto (自动选择)</option>
-              <option value="agnes-image-2.5-flash">agnes-image-2.5-flash</option>
               <option value="agnes-image-2.1-flash">agnes-image-2.1-flash</option>
               <option value="dall-e-3">dall-e-3</option>
             </select>
@@ -418,8 +431,8 @@ function renderVideoView(){
       
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
         <select id="vidModel" style="width:200px">
+          <option value="agnes-video-2.5-flash" selected>agnes-video-2.5-flash</option>
           <option value="agnes-auto">agnes-auto (自动选择)</option>
-          <option value="agnes-video-2.5-flash">agnes-video-2.5-flash</option>
           <option value="agnes-video-v2.0">agnes-video-v2.0</option>
         </select>
         <button class="primary" id="btnGenVid">🎥 提交生成</button>
@@ -538,6 +551,47 @@ async function showImgJob(jobId){
       <p class="muted">模型: ${esc(resp.model||"?")} · 状态: ${esc(resp.status||"?")}</p>
       <img src="${esc(resp.url||"")}" style="max-width:100%;border-radius:8px;margin-top:10px">`;
   }catch(e){toast(e.message,"bad");}
+}
+
+/* ==================== MODELS ==================== */
+async function loadModels(){
+  try{
+    const resp=await api("/api/models");
+    state.models=(resp&&resp.models)||null;
+    populateModelSelects();
+  }catch(e){ console.error("loadModels failed", e); }
+}
+
+function populateModelSelects(){
+  if(!state.models)return;
+  const defaults={chat:"agnes-2.5-flash", image:"agnes-image-2.5-flash", video:"agnes-video-2.5-flash"};
+  const cfg=[
+    {id:"chatModel", mod:"text", def:defaults.chat},
+    {id:"imgModel", mod:"image", def:defaults.image},
+    {id:"vidModel", mod:"video", def:defaults.video}
+  ];
+  cfg.forEach(({id,mod,def})=>{
+    const sel=document.getElementById(id);
+    if(!sel)return;
+    const list=state.models[mod]||[];
+    if(list.length===0)return;
+    const current=sel.value||def;
+    let opts=`<option value="agnes-auto">agnes-auto（自动选择）</option>`;
+    list.forEach(m=>{
+      const selected=m===current?" selected":"";
+      opts+=`<option value="${esc(m)}"${selected}>${esc(m)}</option>`;
+    });
+    sel.innerHTML=opts;
+    if(list.indexOf(current)>=0){
+      sel.value=current;
+    }else if(list.indexOf(def)>=0){
+      sel.value=def;
+    }else{
+      sel.value="agnes-auto";
+    }
+  });
+  const chatSel=document.getElementById("chatModel");
+  if(chatSel) state.model=chatSel.value;
 }
 
 /* ==================== UTILS ==================== */

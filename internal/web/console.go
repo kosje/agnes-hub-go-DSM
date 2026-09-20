@@ -91,6 +91,7 @@ func (s *Server) consoleRoutes() {
 	})
 	m.HandleFunc("POST /api/chat/login", s.apiChatLogin)
 	m.HandleFunc("GET /api/chat/session", s.apiChatSession)
+	m.HandleFunc("GET /api/models", s.apiChatModels)
 	// Chat 代理端点：免下游密钥，自动走账号池 + RPM 限制
 	m.HandleFunc("POST /api/chat/v1/chat/completions", s.handleChatProxy)
 	m.HandleFunc("POST /api/chat/v1/images/generations", s.handleChatMediaProxy)
@@ -224,6 +225,17 @@ func (s *Server) apiChatSession(w http.ResponseWriter, r *http.Request) {
 		"requires_password": hasPassword,
 		"authenticated":     isAuthed,
 	}, nil)
+}
+
+// apiChatModels 返回聊天页（对话/生图/生视频）可用的模型列表。
+func (s *Server) apiChatModels(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	models := pool.KnownModelNamesByModality(settings.ModelAliases)
+	writeJSON(w, 200, map[string]any{"models": models}, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -1735,7 +1747,13 @@ func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, e
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 		return
 	}
-	writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+	// stream=true 时，上游返回的 raw 本身就是 SSE 帧序列；直接原样写回并声明 event-stream。
+	headers["Content-Type"] = "text/event-stream"
+	for k, v := range headers {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(result.Status)
+	_, _ = w.Write(raw)
 }
 
 // handleChatMediaProxy 代理图片/视频请求到账号池，无需下游 API Key。
