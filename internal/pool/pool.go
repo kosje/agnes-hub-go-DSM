@@ -270,7 +270,7 @@ func KnownModelNamesByModality(aliases map[string]string) map[string][]string {
 		out[modality] = append(out[modality], name)
 	}
 
-	// 标准模型
+	// 标准模型（Agnes 原生模型）
 	for m := range TextModels {
 		add(m, "text")
 	}
@@ -281,19 +281,16 @@ func KnownModelNamesByModality(aliases map[string]string) map[string][]string {
 		add(m, "video")
 	}
 
-	// 内置别名：按解析后的目标模型归类
-	for alias, target := range BuiltinAliases {
-		if mod := ModalityOfModel(target, nil); mod != "" {
-			add(alias, mod)
-		}
-	}
-
-	// 用户自定义别名
+	// 用户自定义别名（控制台 model_aliases 里配置的）
 	for alias, target := range aliases {
 		if mod := ModalityOfModel(target, aliases); mod != "" {
 			add(alias, mod)
 		}
 	}
+
+	// 注意：不返回 BuiltinAliases（gpt-4o/claude/dall-e-3/gpt-image-1 等），
+	// 这些跨厂商兼容别名仅用于 /v1/models 和外部客户端兼容，
+	// 聊天 UI 只展示用户实际接入的 Agnes 模型与用户自定义别名。
 
 	for k := range out {
 		sort.Strings(out[k])
