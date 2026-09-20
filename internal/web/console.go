@@ -22,6 +22,9 @@ var consoleHTML []byte
 //go:embed static/chat.html
 var chatHTML []byte
 
+//go:embed static/chat.main.js
+var chatMainJS []byte
+
 const cookieName = "agnes_hub_session"
 
 func (s *Server) consoleRoutes() {
