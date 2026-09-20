@@ -226,6 +226,8 @@ type Settings struct {
 	ProbeModel           string             `json:"probe_model"`
 	OptimizationMode     string             `json:"optimization_mode"`
 	ImageRecordRetention int                `json:"image_record_retention_days"`
+	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
+	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
 }
 
 // DefaultSettings 返回出厂设置。
@@ -277,6 +279,8 @@ func DefaultSettings() Settings {
 		LogRetentionDays:    7,
 		SessionTTLHours:     72,
 		ProbeModel:          "agnes-2.5-flash",
+		OptimizationMode:    "concurrent_batch",
+		ImageRecordRetention: 30,
 	}
 }
 
@@ -441,6 +445,12 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.ProbeModel == "" {
 		v.ProbeModel = d.ProbeModel
+	}
+	if v.OptimizationMode == "" {
+		v.OptimizationMode = d.OptimizationMode
+	}
+	if v.ImageRecordRetention <= 0 {
+		v.ImageRecordRetention = d.ImageRecordRetention
 	}
 }
 
@@ -1093,6 +1103,32 @@ func (s *Store) SetPassword(password string) error {
 	s.Settings.AdminPasswordSalt = salt
 	s.Settings.AdminPasswordHash = HashPassword(password, salt)
 	s.Settings.MustChangePassword = false
+	return s.saveSettingsLocked()
+}
+
+// VerifyChatPassword 校验 chat 页面密码。
+func (s *Store) VerifyChatPassword(password string) bool {
+	s.mu.RLock()
+	hash, salt := s.Settings.ChatPasswordHash, s.Settings.ChatPasswordSalt
+	s.mu.RUnlock()
+	if hash == "" {
+		return true // 未设置密码，允许访问
+	}
+	return subtleEqual(hash, HashPassword(password, salt))
+}
+
+// SetChatPassword 设置/更新 chat 页面密码。空密码表示禁用。
+func (s *Store) SetChatPassword(password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(password) == "" {
+		s.Settings.ChatPasswordHash = ""
+		s.Settings.ChatPasswordSalt = ""
+	} else {
+		salt := randHex(8)
+		s.Settings.ChatPasswordSalt = salt
+		s.Settings.ChatPasswordHash = HashPassword(password, salt)
+	}
 	return s.saveSettingsLocked()
 }
 

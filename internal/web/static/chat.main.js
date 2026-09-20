@@ -13,6 +13,83 @@ async function checkSession(){
   renderLogin();
 }
 
+async function checkChatAuth(){
+  try{
+    const s=await api("/api/chat/session");
+    if(s.authenticated){
+      // 已验证或无需密码，检查管理员会话
+      try{
+        const admin=await api("/api/session");
+        if(admin.logged_in){
+          state.session=admin;
+          renderApp();
+          return;
+        }
+      }catch(e){}
+      // 无管理员会话，显示管理员登录
+      state.chatAuth=true;
+      renderAdminLogin();
+      return;
+    }
+    if(s.requires_password){
+      // 需要 chat 密码
+      state.requiresChatPassword=true;
+      renderChatPasswordLogin();
+      return;
+    }
+  }catch(e){}
+  renderLogin();
+}
+
+function renderChatPasswordLogin(){
+  document.getElementById("app").innerHTML=`
+  <div class="login">
+    <div class="card">
+      <h1>Agnes Chat</h1>
+      <p class="muted">AI Image & Video Generation</p>
+      <div id="toast" class="hide"></div>
+      <label>Chat Password</label>
+      <input id="chatPw" type="password" placeholder="enter chat password">
+      <div style="margin-top:12px"><button class="primary" id="btnChatLogin">Login</button></div>
+      <div class="hint">Enter the chat password set by administrator</div>
+    </div>
+  </div>`;
+  document.getElementById("btnChatLogin").onclick=async()=>{
+    try{
+      await api("/api/chat/login",{method:"POST",body:JSON.stringify({password:document.getElementById("chatPw").value})});
+      state.chatAuth=true;
+      renderApp();
+    }catch(e){toast(e.message,"bad");}
+  };
+  document.getElementById("chatPw").onkeydown=e=>{if(e.key==="Enter")document.getElementById("btnChatLogin").click();};
+  document.getElementById("chatPw").focus();
+}
+
+function renderAdminLogin(){
+  document.getElementById("app").innerHTML=`
+  <div class="login">
+    <div class="card">
+      <h1>Agnes Chat</h1>
+      <p class="muted">AI Image & Video Generation</p>
+      <div id="toast" class="hide"></div>
+      <label>Admin Password</label>
+      <input id="adminPw" type="password" placeholder="admin password">
+      <div style="margin-top:12px"><button class="primary" id="btnAdminLogin">Login</button></div>
+      <div class="hint">Default: admin123</div>
+    </div>
+  </div>`;
+  document.getElementById("btnAdminLogin").onclick=async()=>{
+    try{
+      await api("/api/login",{method:"POST",body:JSON.stringify({password:document.getElementById("adminPw").value})});
+      const admin=await api("/api/session");
+      state.session=admin;
+      renderApp();
+    }catch(e){toast(e.message,"bad");}
+  };
+  document.getElementById("adminPw").onkeydown=e=>{if(e.key==="Enter")document.getElementById("btnAdminLogin").click();};
+  document.getElementById("adminPw").focus();
+}
+
 function renderLogin(){
   document.getElementById("app").innerHTML=`
   <div class="login">
@@ -346,7 +423,7 @@ function renderMarkdown(text){
 }
 
 /* ==================== INIT ==================== */
-window.onload=checkSession;
+window.onload=checkChatAuth;
 switchTab("chat");
 renderImageView();
 renderVideoView();

@@ -26,6 +26,7 @@ var chatHTML []byte
 var chatMainJS []byte
 
 const cookieName = "agnes_hub_session"
+const chatPasswordCookie = "agnes_chat_password"
 
 func (s *Server) consoleRoutes() {
 	m := s.mux
@@ -77,12 +78,9 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/update/apply", s.apiUpdateApply)
 
 	// 网页端：聊天 / 生图 / 生视频（免第三方 AI Coding 积分）
-	m.HandleFunc("GET /chat", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Content-Length", fmt.Sprint(len(chatHTML)))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(chatHTML)
-	})
+	m.HandleFunc("GET /chat", s.handleChat)
+	m.HandleFunc("POST /api/chat/login", s.apiChatLogin)
+	m.HandleFunc("GET /api/chat/session", s.apiChatSession)
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +93,18 @@ func (s *Server) authed(r *http.Request) bool {
 		return false
 	}
 	return c.Value == s.Store.SessionToken()
+}
+
+// chatAuthed 检查 chat 页面密码是否验证通过（cookie 或无密码设置）。
+func (s *Server) chatAuthed(r *http.Request) bool {
+	// 先检查是否有 chat 密码 cookie
+	c, err := r.Cookie(chatPasswordCookie)
+	if err == nil && c.Value != "" {
+		return true
+	}
+	// 未设置密码则允许访问
+	settings := s.Store.SettingsSnapshot()
+	return settings.ChatPasswordHash == ""
 }
 
 func (s *Server) deny(w http.ResponseWriter) {
@@ -151,6 +161,49 @@ func (s *Server) apiPassword(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: s.Store.SessionToken(),
 		Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 86400})
 	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Chat 页面密码
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	// 检查 chat 密码验证
+	if !s.chatAuthed(r) {
+		// 需要密码，重定向到带错误参数的登录页
+		http.Redirect(w, r, "/chat?need_password=1", http.StatusSeeOther)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", fmt.Sprint(len(chatHTML)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(chatHTML)
+}
+
+func (s *Server) apiChatLogin(w http.ResponseWriter, r *http.Request) {
+	body, _, e := readBody(r)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	pw := asStr(body["password"])
+	if !s.Store.VerifyChatPassword(pw) {
+		writeErr(w, &apiError{Status: 401, Type: "authentication_error", Message: "密码错误"})
+		return
+	}
+	// 设置 chat 密码 cookie（7天过期）
+	http.SetCookie(w, &http.Cookie{Name: chatPasswordCookie, Value: "authenticated",
+		Path: "/chat", HttpOnly: false, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 86400})
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+func (s *Server) apiChatSession(w http.ResponseWriter, r *http.Request) {
+	hasPassword := s.Store.SettingsSnapshot().ChatPasswordHash != ""
+	isAuthed := s.chatAuthed(r)
+	writeJSON(w, 200, map[string]any{
+		"requires_password": hasPassword,
+		"authenticated":     isAuthed,
+	}, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +831,8 @@ func (s *Server) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	settings := s.Store.SettingsSnapshot()
 	settings.AdminPasswordHash = ""
 	settings.AdminPasswordSalt = ""
+	settings.ChatPasswordHash = ""
+	settings.ChatPasswordSalt = ""
 	writeJSON(w, 200, settings, nil)
 }
 
@@ -796,11 +851,30 @@ func (s *Server) apiSetSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
 		return
 	}
+
+	// 单独处理 chat_password（需要在锁外调用 Store 方法）
+	if pw, ok := body["chat_password"]; ok {
+		pwd := strings.TrimSpace(asStr(pw))
+		if len(pwd) >= 4 {
+			if err := s.Store.SetChatPassword(pwd); err != nil {
+				writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
+				return
+			}
+		} else if pwd == "" {
+			// 清空密码
+			if err := s.Store.SetChatPassword(""); err != nil {
+				writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
+				return
+			}
+		}
+	}
+
 	s.Hub.Reload()
 	writeJSON(w, 200, map[string]any{"ok": true}, nil)
 }
 
 // applySettings 把控制台提交的字段写入设置（只认白名单，忽略未知键）。
+// 注意：此函数在 UpdateSettings 锁内调用，不能访问 s。
 func applySettings(st *config.Settings, p map[string]any) {
 	f := func(key string, dst *float64) {
 		if v, ok := p[key]; ok {
@@ -837,6 +911,8 @@ func applySettings(st *config.Settings, p map[string]any) {
 	s2("default_image_tier", &st.DefaultImageTier)
 	s2("optimization_mode", &st.OptimizationMode)
 	i("image_record_retention_days", &st.ImageRecordRetention)
+
+	// chat_password is handled separately in apiSetSettings to avoid accessing s here
 	i("retry_max", &st.RetryMax)
 	i("retry_base_backoff_ms", &st.RetryBaseBackoffMS)
 	i("retry_max_backoff_ms", &st.RetryMaxBackoffMS)
