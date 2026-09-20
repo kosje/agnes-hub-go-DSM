@@ -200,6 +200,17 @@ function renderApp(){
     await api("/api/logout",{method:"POST"});
     location.reload();
   };
+  // 移动端侧边栏开关
+  const hamburger=document.getElementById("btnHamburger");
+  const sidebar=document.getElementById("sidebar");
+  const overlay=document.getElementById("sidebarOverlay");
+  if(hamburger){
+    const toggleSidebar=()=>{const open=sidebar.classList.toggle("open");overlay.classList.toggle("show",open);};
+    hamburger.onclick=toggleSidebar;
+    overlay.onclick=toggleSidebar;
+    // 窗口变大时自动关闭侧边栏
+    window.addEventListener("resize",()=>{if(window.innerWidth>768){sidebar.classList.remove("open");overlay.classList.remove("show");}});
+  }
 
   document.getElementById("btnSend").onclick=sendChat;
   document.getElementById("textInput").onkeydown=e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat();}};
