@@ -492,3 +492,6 @@ function renderMarkdown(text){
   html=html.replace(/\n/g,"<br>");
   return html;
 }
+
+/* ==================== INIT ==================== */
+window.addEventListener("DOMContentLoaded", () => { checkChatAuth(); });
