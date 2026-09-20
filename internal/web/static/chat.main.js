@@ -71,13 +71,13 @@ function renderAdminLogin(){
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
-      <h1>Agnes Chat</h1>
-      <p class="muted">AI Image & Video Generation</p>
+      <h1>Agnes AI 助手</h1>
+      <p class="muted">AI 对话 · 生图 · 生视频</p>
       <div id="toast" class="hide"></div>
-      <label>Admin Password</label>
-      <input id="adminPw" type="password" placeholder="admin password">
-      <div style="margin-top:12px"><button class="primary" id="btnAdminLogin">Login</button></div>
-      <div class="hint">Default: admin123</div>
+      <label>管理员密码</label>
+      <input id="adminPw" type="password" placeholder="请输入管理员密码">
+      <div style="margin-top:12px"><button class="primary" id="btnAdminLogin">登录</button></div>
+      <div class="hint">默认密码: admin123</div>
     </div>
   </div>`;
   document.getElementById("btnAdminLogin").onclick=async()=>{
@@ -121,7 +121,7 @@ function renderApp(){
   document.getElementById("app").innerHTML=`
   <div class="topbar">
     <h1><span class="logo">🤖</span>Agnes AI 助手</h1>
-    <select id="keySel" class="model-sel" title="API Key"><option value="">加载中...</option></select>
+    <span id="topbarInfo" class="topbar-info">加载中...</span>
     <button class="sm" id="btnRefresh">刷新</button>
     <button class="sm danger" id="btnLogout">退出</button>
   </div>
@@ -151,21 +151,21 @@ function renderApp(){
   </div>
   <div id="toast" class="hide"></div>`;
 
-  // Load keys
-  api("/api/keys").then(d=>{
-    state.keys=(d.keys||[]).filter(k=>k.enabled);
-    const sel=document.getElementById("keySel");
-    if(state.keys.length===0){
-      sel.innerHTML="<option value=''>无可用密钥</option>";
-      toast("未配置任何可用的 API Key","warn");
+  // Load accounts (auto-pool, no manual key selection)
+  Promise.all([api("/api/keys"), api("/api/accounts")]).then(([keysRes, accountsRes])=>{
+    state.keys=(keysRes.keys||[]).filter(k=>k.enabled);
+    state.accounts=accountsRes.accounts||[];
+    const info=document.getElementById("topbarInfo");
+    if(state.accounts.length>0){
+      const names=state.accounts.map(a=>esc(a.name)).join("、");
+      info.textContent=`账号池: ${state.accounts.length} 个 · ${names}`;
+    }else if(state.keys.length>0){
+      info.textContent=`已配置 ${state.keys.length} 个密钥`;
     }else{
-      sel.innerHTML=state.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.name)} (${esc(k.key.slice(0,8))}...)</option>`).join("");
-      if(!state.activeKey) state.activeKey=state.keys[0].key;
-      sel.value=state.activeKey;
+      info.textContent="未配置账号";
+      toast("未配置任何可用的 API Key 或账号","warn");
     }
   }).catch(()=>{});
-
-  document.getElementById("keySel").onchange=e=>{state.activeKey=e.target.value;};
 
   document.getElementById("tabChat").onclick=()=>switchTab("chat");
   document.getElementById("tabImage").onclick=()=>switchTab("image");
@@ -318,11 +318,20 @@ async function generateImage(){
   const model=document.getElementById("imgModel").value;
   if(!prompt)return;
   const result=document.getElementById("imgResult");
-  result.innerHTML='<div class="muted"><span class="spinner"></span> Generating...</div>';
+  result.innerHTML='<div class="muted"><span class="spinner"></span> 正在生成图片...</div>';
   try{
+    const ratio=document.getElementById("imgRatio").value;
+    const style=document.getElementById("imgStyle").value;
+    // Map ratio to size string
+    const ratioToSize={
+      "1:1":"1024x1024","16:9":"1280x720","9:16":"720x1280",
+      "4:3":"1024x768","3:4":"768x1024"
+    };
+    const body={model,prompt,n:1,size:ratioToSize[ratio]||"1024x1024"};
+    if(style) body.style=style;
     const resp=await api("/v1/images/generations",{
       method:"POST",
-      body:JSON.stringify({model,prompt,n:1,size:"1024x1024"})
+      body:JSON.stringify(body)
     });
     result.innerHTML="";
     const data=resp.data||[];
