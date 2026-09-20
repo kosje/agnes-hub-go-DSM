@@ -203,6 +203,10 @@ function renderApp(){
   document.getElementById("btnSend").onclick=sendChat;
   document.getElementById("textInput").onkeydown=e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat();}};
 
+  // 渲染生图/生视频视图（必须在 renderApp 之后调用）
+  renderImageView();
+  renderVideoView();
+
   loadHistory();
 }
 
@@ -249,7 +253,7 @@ async function sendChat(){
   bubble.innerHTML='<span class="spinner"></span> 正在生成回答...';
 
   try{
-    const resp=await api("/v1/chat/completions",{
+    const resp=await api("/api/chat/v1/chat/completions",{
       method:"POST",
       body:JSON.stringify({
         model:state.model||"agnes-auto",
@@ -353,7 +357,7 @@ async function generateImage(){
     };
     const body={model,prompt,n:1,size:ratioToSize[ratio]||"1024x1024"};
     if(style) body.style=style;
-    const resp=await api("/v1/images/generations",{
+    const resp=await api("/api/chat/v1/images/generations",{
       method:"POST",
       body:JSON.stringify(body)
     });
@@ -405,7 +409,7 @@ async function generateVideo(){
   const result=document.getElementById("vidResult");
   result.innerHTML='<div class="muted"><span class="spinner"></span> Submitting...</div>';
   try{
-    const resp=await api("/v1/videos",{
+    const resp=await api("/api/chat/v1/videos",{
       method:"POST",
       body:JSON.stringify({model,prompt})
     });
@@ -424,7 +428,7 @@ async function generateVideo(){
 async function pollVideo(jobId,resultEl){
   const poll=async()=>{
     try{
-      const resp=await api(`/v1/videos/${jobId}`);
+      const resp=await api(`/api/chat/v1/videos/${jobId}`);
       if(resp.status==="completed"&&resp.video_url){
         resultEl.innerHTML+=`<div class="video-wrap"><video controls src="${esc(resp.video_url)}"></video></div>`;
         return;
@@ -497,12 +501,3 @@ function renderMarkdown(text){
   html=html.replace(/\n/g,"<br>");
   return html;
 }
-
-/* ==================== INIT ==================== */
-// 延迟到 DOM 就绪，避免 getElementById 返回 null
-window.addEventListener("DOMContentLoaded", () => {
-  checkChatAuth();
-  switchTab("chat");
-  renderImageView();
-  renderVideoView();
-});

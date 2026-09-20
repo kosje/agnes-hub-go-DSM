@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,6 +87,11 @@ func (s *Server) consoleRoutes() {
 	})
 	m.HandleFunc("POST /api/chat/login", s.apiChatLogin)
 	m.HandleFunc("GET /api/chat/session", s.apiChatSession)
+	// Chat 代理端点：免下游密钥，自动走账号池 + RPM 限制
+	m.HandleFunc("POST /api/chat/v1/chat/completions", s.handleChatProxy)
+	m.HandleFunc("POST /api/chat/v1/images/generations", s.handleChatMediaProxy)
+	m.HandleFunc("POST /api/chat/v1/videos", s.handleChatMediaProxy)
+	m.HandleFunc("GET /api/chat/v1/videos/{job_id}", s.handleChatMediaProxy)
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,4 +1457,327 @@ func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 		s.Updater.RequestRestart()
 	}
 	writeJSON(w, 200, result, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Chat 代理端点（免下游密钥，自动走账号池）
+// ---------------------------------------------------------------------------
+
+// handleChatProxy 代理文本对话请求到账号池，无需下游 API Key。
+func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
+	body, _, e := readBody(r)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	requested := strings.TrimSpace(asStr(body["model"]))
+	wantsStream := truthy(body["stream"])
+
+	var decision intent.Result
+	if intent.IsAutoModel(requested) || requested == "" {
+		decision = intent.Decide("/v1/chat/completions", body, requested,
+			autoIntentConfig(settings), s.rules, settings.ModelAliases,
+			pool.ModalityOfModel, "")
+	} else {
+		decision = intent.Result{
+			Modality:       pool.ModalityOfModel(requested, settings.ModelAliases),
+			Source:         "model",
+			Score:          1,
+			Reason:         fmt.Sprintf("模型名 %s 已明确模态", requested),
+			ModelRequested: requested,
+			Prompt:         intent.ExtractPrompt(body),
+		}
+		if decision.Modality == "" {
+			decision.Modality = intent.Text
+		}
+	}
+
+	// 非文本模态（图片/视频意图）转发到媒体代理
+	if decision.Modality != intent.Text {
+		s.handleChatMediaProxy(w, r)
+		return
+	}
+
+	// 文本路径：走账号池，无需下游密钥
+	poolClass := "text"
+	if !intent.IsAutoModel(requested) {
+		poolClass = pool.Classify(requested, body, settings.ModelAliases, settings.DefaultImageTier)
+	}
+
+	model, modelErr := s.resolveAutoModel(settings, intent.Text)
+	if modelErr != nil {
+		writeErr(w, modelErr)
+		return
+	}
+	decision.ModelUsed = model
+
+	bodyFor := func(a *config.Account) ([]byte, string) {
+		if intent.IsAutoModel(requested) || requested == "" {
+			manifest := pool.ManifestOf(a, settings)
+			chosen := intent.ChooseModel(manifest.Text, autoIntentConfig(settings).PreferredModels["text"])
+			if chosen == "" {
+				chosen = pool.FallbackModel["text"]
+			}
+			clone := make(map[string]any, len(body))
+			for k, v := range body {
+				clone[k] = v
+			}
+			clone["model"] = chosen
+			buf, _ := json.Marshal(clone)
+			return buf, chosen
+		}
+		resolved := pool.ResolveModel(requested, settings.ModelAliases)
+		clone := cloneBody(body)
+		clone["model"] = resolved
+		buf, _ := json.Marshal(clone)
+		return buf, resolved
+	}
+
+	sessionKey := s.Hub.SessionKey(headerMap(r), "")
+	opts := relay.Options{
+		SessionKey: sessionKey, PoolClass: poolClass,
+		RequiredModel: model, Method: http.MethodPost, Path: "/v1/chat/completions",
+		BodyFor: bodyFor, Idempotent: true,
+	}
+
+	ctx := r.Context()
+	if !wantsStream {
+		result, err := relay.Do(ctx, s.Hub, s.Client, opts)
+		if err != nil {
+			writeErr(w, relayError(err))
+			return
+		}
+		raw := result.ReadAll()
+		headers := passthroughHeaders(result.Header)
+		for k, v := range decision.Headers() {
+			headers[k] = v
+		}
+		headers["X-Agnes-Hub-Model"] = result.ModelUsed
+		if result.Account != nil {
+			headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
+			headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+		}
+		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+		if result.Status >= 400 {
+			writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+			return
+		}
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		return
+	}
+
+	// 流式路径
+	type outcome struct {
+		result *relay.Result
+		err    error
+	}
+	ch := make(chan outcome, 1)
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		result, err := relay.Do(ctx2, s.Hub, s.Client, opts)
+		ch <- outcome{result: result, err: err}
+	}()
+
+	select {
+		case out := <-ch:
+			s.finishChatStream(w, out.result, out.err, decision, opts)
+			return
+	case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
+	}
+
+	// 心跳路径
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	for k, v := range decision.Headers() {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	for {
+		select {
+		case out := <-ch:
+			if out.err != nil {
+				writeSSEComment(w, flusher, "error: "+out.err.Error())
+				return
+			}
+			raw := out.result.ReadAll()
+			if out.result.Status >= 400 {
+				writeSSEComment(w, flusher, "error: HTTP "+strconv.Itoa(out.result.Status))
+				return
+			}
+			// 转发上游流
+			_ = json.NewEncoder(&flushSSE{w: w, f: flusher}).Encode(decodeOrRaw(raw))
+			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, out.result.Stream)
+			out.result.Close()
+			return
+		case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
+			writeSSEComment(w, flusher, "agnes-hub chat proxy keepalive")
+		case <-ctx2.Done():
+			return
+		}
+	}
+}
+
+// flushSSE 是一个 io.Writer，将 JSON 编码为 SSE data: 帧。
+type flushSSE struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (f *flushSSE) Write(p []byte) (int, error) {
+	_, err := f.w.Write([]byte("data: "))
+	if err != nil {
+		return 0, err
+	}
+	n, err := f.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	_, err = f.w.Write([]byte("\n\n"))
+	if f.f != nil {
+		f.f.Flush()
+	}
+	return n, err
+}
+
+// finishChatStream 处理流式结果并写入响应。
+func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, err error,
+	decision intent.Result, opts relay.Options) {
+	if err != nil {
+		writeErr(w, relayError(err))
+		return
+	}
+	raw := result.ReadAll()
+	headers := passthroughHeaders(result.Header)
+	for k, v := range decision.Headers() {
+		headers[k] = v
+	}
+	headers["X-Agnes-Hub-Model"] = result.ModelUsed
+	if result.Account != nil {
+		headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
+		headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+	}
+	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+	if result.Status >= 400 {
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		return
+	}
+	writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+}
+
+// handleChatMediaProxy 代理图片/视频请求到账号池，无需下游 API Key。
+func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
+	body, _, e := readBody(r)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	requested := strings.TrimSpace(asStr(body["model"]))
+
+	var modality string
+	path := r.URL.Path
+	switch {
+	case strings.HasSuffix(path, "images/generations"):
+		modality = intent.Image
+	case strings.HasSuffix(path, "videos"), strings.Contains(path, "videos/"):
+		modality = intent.Video
+	default:
+		modality = intent.Text
+	}
+
+	decision := intent.Decide(path, body, firstNonEmpty(requested, settings.AutoModelName),
+		autoIntentConfig(settings), s.rules, settings.ModelAliases, pool.ModalityOfModel, modality)
+
+	poolClass := ""
+	switch decision.Modality {
+	case intent.Image:
+		poolClass = pool.PoolForModality(intent.Image, body, settings.DefaultImageTier)
+	case intent.Video:
+		poolClass = "video"
+	default:
+		poolClass = "text"
+	}
+
+	model, modelErr := s.pickMediaModel(settings, decision, decision.Modality)
+	if modelErr != nil {
+		writeErr(w, modelErr)
+		return
+	}
+	decision.ModelUsed = model
+
+	cfg := autoIntentConfig(settings)
+	var upstreamBody map[string]any
+	var bodyFor func(*config.Account) ([]byte, string)
+
+	if decision.Modality == intent.Image {
+		upstreamBody = intent.BuildImageBody(decision, model, cfg, body)
+		decision.DroppedFields = intent.DroppedFields(body, intent.ImageFieldWhitelist)
+		bodyFor = s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Image, model)
+	} else if decision.Modality == intent.Video {
+		upstreamBody = intent.BuildVideoBody(decision, model, cfg, body)
+		decision.DroppedFields = intent.DroppedFields(body, intent.VideoFieldWhitelist)
+		bodyFor = s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Video, model)
+	} else {
+		// 兜底：作为文本处理
+		bodyFor = func(a *config.Account) ([]byte, string) {
+			if intent.IsAutoModel(requested) || requested == "" {
+				manifest := pool.ManifestOf(a, settings)
+				chosen := intent.ChooseModel(manifest.Text, autoIntentConfig(settings).PreferredModels["text"])
+				if chosen == "" {
+					chosen = pool.FallbackModel["text"]
+				}
+				clone := make(map[string]any, len(body))
+				for k, v := range body {
+					clone[k] = v
+				}
+				clone["model"] = chosen
+				buf, _ := json.Marshal(clone)
+				return buf, chosen
+			}
+			resolved := pool.ResolveModel(requested, settings.ModelAliases)
+			clone := cloneBody(body)
+			clone["model"] = resolved
+			buf, _ := json.Marshal(clone)
+			return buf, resolved
+		}
+	}
+
+	sessionKey := s.Hub.SessionKey(headerMap(r), "")
+	isIdempotent := strings.HasPrefix(path, "GET /v1/videos/") || strings.Contains(path, "videos/")
+	opts := relay.Options{
+		SessionKey: sessionKey, PoolClass: poolClass,
+		RequiredModel: model, Method: http.MethodPost, Path: path,
+		BodyFor: bodyFor, Idempotent: isIdempotent,
+	}
+
+	result, err := relay.Do(r.Context(), s.Hub, s.Client, opts)
+	if err != nil {
+		writeErr(w, relayError(err))
+		return
+	}
+	raw := result.ReadAll()
+	decision.ModelUsed = result.ModelUsed
+	headers := passthroughHeaders(result.Header)
+	for k, v := range decision.Headers() {
+		headers[k] = v
+	}
+	headers["X-Agnes-Hub-Model"] = result.ModelUsed
+	if result.Account != nil {
+		headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
+		headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+	}
+	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+	if result.Status >= 400 {
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		return
+	}
+	writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 }
