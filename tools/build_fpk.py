@@ -440,11 +440,6 @@ def build_outer(app_data, md5):
             for name in ("ICON.PNG", "ICON_256.PNG"):
                 _add_file(outer, os.path.join(FPK_DIR, name), name)
 
-            # 独立的 manifest.checksum 文件（与已验证可装的 1.0.0 fpk 保持一致）
-            cs = os.path.join(FPK_DIR, "manifest.checksum")
-            if os.path.exists(cs):
-                _add_file(outer, cs, "manifest.checksum")
-
             ti = tarfile.TarInfo(name="app.tgz")
             ti.size = len(app_data)
             ti.uid = ti.gid = 0
@@ -456,8 +451,10 @@ def build_outer(app_data, md5):
 
 
 def _stamp_manifest_checksum(md5):
-    """往 manifest 末尾补 checksum= 字段（对齐 fnOS 官方参考 fpk），
-    并额外写一份 manifest.checksum 文件（对齐已验证可装的 1.0.0 fpk）。"""
+    """往 manifest 末尾补 checksum= 字段（对齐 fnOS 官方参考 fpk）。
+    注意：不要额外写独立的 manifest.checksum 文件——真机可装的官方 fpk
+    （m365-copilot2api-1.6.29.fpk 同机实测）外层没有该文件，只靠 manifest 内
+    checksum=<app.tgz 的 MD5> 字段；多带一个反而是安装失败的变量。"""
     mp = os.path.join(FPK_DIR, "manifest")
     with open(mp, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
@@ -465,8 +462,10 @@ def _stamp_manifest_checksum(md5):
         lines.append("%s = %s" % ("checksum".ljust(22), md5))
     with open(mp, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("\n".join(lines) + "\n")
-    with open(os.path.join(FPK_DIR, "manifest.checksum"), "w", encoding="utf-8", newline="") as f:
-        f.write(md5 + "\n")
+    # 清掉历史遗留的 manifest.checksum（若存在），避免被打进外层 tar
+    legacy = os.path.join(FPK_DIR, "manifest.checksum")
+    if os.path.exists(legacy):
+        os.remove(legacy)
 
 
 def main():
