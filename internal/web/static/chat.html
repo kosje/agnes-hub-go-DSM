@@ -41,8 +41,8 @@ textarea{min-height:90px;resize:vertical}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .msg.user{margin-left:auto;align-items:flex-end}
 .msg.ass{margin-right:auto;align-items:flex-start}
-.msg-bubble{padding:12px 16px;border-radius:16px;word-break:break-word;font-size:14px;line-height:1.6;white-space:pre-wrap}
-.msg.user .msg-bubble{background:var(--brand);color:#fff;border-radius:16px 16px 4px 16px}
+.msg-bubble{padding:12px 16px;border-radius:16px;word-break:break-word;font-size:14px;line-height:1.6;white-space:normal}
+.msg.user .msg-bubble{background:var(--brand);color:#fff;border-radius:16px 16px 4px 16px;white-space:pre-wrap}
 .msg.ass .msg-bubble{background:var(--panel);border:1px solid var(--line);border-radius:16px 16px 16px 4px;box-shadow:0 2px 8px rgba(0,0,0,.04)}
 .msg img{max-width:100%;border-radius:12px;margin-top:8px;cursor:pointer;transition:transform .15s}
 .msg img:hover{transform:scale(1.02)}
@@ -96,6 +96,29 @@ textarea{min-height:90px;resize:vertical}
 .empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
 .empty-state .empty-icon{font-size:48px;margin-bottom:16px;opacity:.5}
 .empty-state p{font-size:14px;margin:0 0 8px}
+
+/* ============ Markdown 渲染样式 ============ */
+.msg-bubble .md-h{margin:.5em 0 .35em;line-height:1.3;font-weight:650;color:var(--ink)}
+.msg-bubble .md-h:first-child{margin-top:0}
+.msg-bubble .md-h1{font-size:1.35em}
+.msg-bubble .md-h2{font-size:1.2em}
+.msg-bubble .md-h3{font-size:1.08em}
+.msg-bubble .md-h4,.msg-bubble .md-h5,.msg-bubble .md-h6{font-size:1em}
+.msg-bubble .md-p{margin:.5em 0}
+.msg-bubble .md-p:first-child{margin-top:0}
+.msg-bubble .md-p:last-child{margin-bottom:0}
+.msg-bubble .md-ul,.msg-bubble .md-ol{margin:.5em 0;padding-left:1.5em}
+.msg-bubble .md-ul{list-style:disc}
+.msg-bubble .md-ol{list-style:decimal}
+.msg-bubble .md-ul li,.msg-bubble .md-ol li{margin:.25em 0}
+.msg-bubble .md-pre{background:#0f172a;color:#e2e8f0;border-radius:10px;padding:12px 14px;overflow:auto;margin:.6em 0;font-size:12.5px;line-height:1.5;white-space:pre}
+.msg-bubble .md-pre code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.msg-bubble .md-code{background:#eef1f5;color:#b4232f;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
+.msg-bubble .md-quote{border-left:3px solid var(--brand);background:var(--brand-soft);margin:.55em 0;padding:.45em .9em;color:var(--muted);border-radius:0 8px 8px 0}
+.msg-bubble .md-hr{border:none;border-top:1px solid var(--line);margin:.9em 0}
+.msg-bubble .md-a{color:var(--brand);text-decoration:underline}
+.msg-bubble .md-img{max-width:100%;border-radius:10px;margin:.4em 0;display:block}
+.msg-bubble .md-del{text-decoration:line-through;color:var(--muted)}
 </style>
 </head>
 <body>

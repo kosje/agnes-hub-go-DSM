@@ -299,7 +299,7 @@ async function sendChat(){
             const d=c.delta||{};
             if(d.content)full+=d.content;
             else if(c.message&&c.message.content)full=c.message.content;
-            bubble.textContent=full;
+            bubble.innerHTML=renderMarkdown(full);
           }catch(e){}
         }
       }
@@ -308,7 +308,7 @@ async function sendChat(){
       const j=await resp.json();
       const c=(j.choices&&j.choices[0])||{};
       full=(c.message&&c.message.content)||(c.delta&&c.delta.content)||c.text||"";
-      bubble.textContent=full;
+      bubble.innerHTML=renderMarkdown(full);
     }
     if(!full)bubble.textContent="（无内容返回）";
     // Save to history
@@ -595,15 +595,92 @@ function populateModelSelects(){
 }
 
 /* ==================== UTILS ==================== */
-function renderMarkdown(text){
-  // Simple markdown: bold, links, code
-  let html=esc(text);
-  html=html.replace(/\*\*(.*?)\*\*/g,"<b>$1</b>");
-  html=html.replace(/\*(.*?)\*/g,"<i>$1</i>");
-  html=html.replace(/`(.*?)`/g,"<code style='background:#f0f0f0;padding:1px 4px;border-radius:4px;font-size:13px'>$1</code>");
-  html=html.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
-  html=html.replace(/\n/g,"<br>");
+// 轻量 Markdown 渲染：先整体 HTML 转义防 XSS，再做块级/行内解析。
+// 支持：标题、有序/无序列表、引用、分割线、围栏代码块、行内代码、
+// 粗体/斜体/删除线、链接、图片。链接仅放行 http/https/相对路径。
+function renderMarkdown(src){
+  if(src==null) return "";
+  let s=esc(src);
+
+  // 1) 抽取围栏代码块（优先，避免内部内容被后续规则误伤）
+  const codeBlocks=[];
+  s=s.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,lang,code)=>{
+    const idx=codeBlocks.length;
+    codeBlocks.push('<pre class="md-pre"><code>'+code.replace(/\n$/,"")+'</code></pre>');
+    return " CODE"+idx+" ";
+  });
+
+  // 2) 抽取行内代码
+  const inlineCodes=[];
+  s=s.replace(/`([^`\n]+?)`/g,(m,code)=>{
+    const idx=inlineCodes.length;
+    inlineCodes.push('<code class="md-code">'+code+'</code>');
+    return " IC"+idx+" ";
+  });
+
+  // 3) 块级解析
+  const lines=s.split("\n");
+  let html="";
+  let inList=null;
+  const closeList=()=>{ if(inList){ html+=(inList==="ul"?"</ul>":"</ol>"); inList=null; } };
+  const isSpecial=(ln)=>/^(#{1,6})\s/.test(ln)||/^\s*[-*+]\s+/.test(ln)||/^\s*\d+\.\s+/.test(ln)||/^&gt;/.test(ln)||/^\s*([-*_])(\s*\1){2,}\s*$/.test(ln)||/^ CODE\d+ $/.test(ln);
+  let i=0;
+  while(i<lines.length){
+    const line=lines[i];
+    let cm=line.match(/^ CODE(\d+) $/);
+    if(cm){ closeList(); html+=codeBlocks[+cm[1]]; i++; continue; }
+    let hm=line.match(/^(#{1,6})\s+(.*)$/);
+    if(hm){ closeList(); const lvl=hm[1].length; html+="<h"+lvl+' class="md-h md-h'+lvl+'">'+inline(hm[2])+"</h"+lvl+">"; i++; continue; }
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)){ closeList(); html+='<hr class="md-hr">'; i++; continue; }
+    if(/^&gt;\s?/.test(line)){
+      closeList();
+      let q="";
+      while(i<lines.length && /^&gt;\s?/.test(lines[i])){ q+=lines[i].replace(/^&gt;\s?/,"")+"<br>"; i++; }
+      html+='<blockquote class="md-quote">'+inline(q.replace(/<br>$/,""))+"</blockquote>";
+      continue;
+    }
+    let ulm=line.match(/^\s*[-*+]\s+(.*)$/);
+    let olm=line.match(/^\s*\d+\.\s+(.*)$/);
+    if(ulm||olm){
+      const type=ulm?"ul":"ol";
+      if(inList!==type){ closeList(); html+=(type==="ul"?'<ul class="md-ul">':'<ol class="md-ol">'); inList=type; }
+      html+="<li>"+inline(ulm?ulm[1]:olm[1])+"</li>";
+      i++; continue;
+    }
+    if(/^\s*$/.test(line)){ closeList(); i++; continue; }
+    closeList();
+    let para=line;
+    i++;
+    while(i<lines.length && !/^\s*$/.test(lines[i]) && !isSpecial(lines[i])){
+      para+="<br>"+lines[i];
+      i++;
+    }
+    html+='<p class="md-p">'+inline(para)+"</p>";
+  }
+  closeList();
+
+  // 4) 还原行内代码
+  html=html.replace(/ IC(\d+) /g,(m,idx)=>inlineCodes[+idx]);
   return html;
+
+  function inline(t){
+    // 图片
+    t=t.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g,(m,alt,url)=>{
+      if(/^(https?:|\/|#|data:image\/)/i.test(url)) return '<img src="'+url+'" alt="'+alt+'" class="md-img">';
+      return m;
+    });
+    // 链接
+    t=t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g,(m,txt,url)=>{
+      if(/^(https?:|\/|#)/i.test(url)) return '<a href="'+url+'" target="_blank" rel="noopener noreferrer" class="md-a">'+txt+"</a>";
+      return txt;
+    });
+    t=t.replace(/\*\*([^*]+?)\*\*/g,"<strong>$1</strong>");
+    t=t.replace(/__([^_]+?)__/g,"<strong>$1</strong>");
+    t=t.replace(/(^|[^\*])\*([^*\n]+?)\*(?!\*)/g,"$1<em>$2</em>");
+    t=t.replace(/(^|[^_])_([^_\n]+?)_(?!_)/g,"$1<em>$2</em>");
+    t=t.replace(/~~([^~]+?)~~/g,"<del>$1</del>");
+    return t;
+  }
 }
 
 /* ==================== INIT ==================== */
