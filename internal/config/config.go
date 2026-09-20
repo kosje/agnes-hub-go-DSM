@@ -226,6 +226,8 @@ type Settings struct {
 	ProbeModel           string             `json:"probe_model"`
 	OptimizationMode     string             `json:"optimization_mode"`
 	ImageRecordRetention int                `json:"image_record_retention_days"`
+	ImageMaxCapacity     int                `json:"image_max_capacity"`
+	VideoMaxCapacity     int                `json:"video_max_capacity"`
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
 }
@@ -281,6 +283,8 @@ func DefaultSettings() Settings {
 		ProbeModel:          "agnes-2.5-flash",
 		OptimizationMode:    "concurrent_batch",
 		ImageRecordRetention: 30,
+		ImageMaxCapacity:    500,
+		VideoMaxCapacity:    200,
 	}
 }
 
@@ -451,6 +455,12 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.ImageRecordRetention <= 0 {
 		v.ImageRecordRetention = d.ImageRecordRetention
+	}
+	if v.ImageMaxCapacity <= 0 {
+		v.ImageMaxCapacity = d.ImageMaxCapacity
+	}
+	if v.VideoMaxCapacity <= 0 {
+		v.VideoMaxCapacity = d.VideoMaxCapacity
 	}
 }
 
@@ -955,6 +965,43 @@ func (s *Store) PutJob(job *VideoJob) {
 		s.Jobs = map[string]*VideoJob{}
 	}
 	s.Jobs[job.JobID] = job
+	s.evictVideoJobsLocked()
+	_ = s.saveJobsLocked()
+}
+
+// evictVideoJobsLocked 在持锁状态下按容量上限淘汰最旧记录（调用前必须已加写锁）。
+func (s *Store) evictVideoJobsLocked() {
+	cap := s.Settings.VideoMaxCapacity
+	if cap <= 0 || len(s.Jobs) <= cap {
+		return
+	}
+	ids := make([]*VideoJob, 0, len(s.Jobs))
+	for _, j := range s.Jobs {
+		ids = append(ids, j)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].CreatedAt < ids[j].CreatedAt })
+	for i := 0; i < len(ids)-cap; i++ {
+		delete(s.Jobs, ids[i].JobID)
+	}
+}
+
+// DeleteVideoJob 删除单条视频记录。
+func (s *Store) DeleteVideoJob(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.Jobs[id]; !ok {
+		return false
+	}
+	delete(s.Jobs, id)
+	_ = s.saveJobsLocked()
+	return true
+}
+
+// ClearVideoJobs 清空全部视频记录。
+func (s *Store) ClearVideoJobs() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Jobs = map[string]*VideoJob{}
 	_ = s.saveJobsLocked()
 }
 
@@ -998,7 +1045,7 @@ func (s *Store) JobsSnapshot() []*VideoJob {
 
 // ---- 图片任务 ----
 
-// PutImageJob 记录图片任务。
+// PutImageJob 记录图片任务，并在超过容量上限时淘汰最旧记录。
 func (s *Store) PutImageJob(job *ImageJob) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1006,6 +1053,44 @@ func (s *Store) PutImageJob(job *ImageJob) {
 		s.ImageJobs = map[string]*ImageJob{}
 	}
 	s.ImageJobs[job.JobID] = job
+	s.evictImageJobsLocked()
+	_ = s.saveImageJobsLocked()
+}
+
+// evictImageJobsLocked 在持锁状态下按容量上限淘汰最旧记录（调用前必须已加写锁）。
+func (s *Store) evictImageJobsLocked() {
+	cap := s.Settings.ImageMaxCapacity
+	if cap <= 0 || len(s.ImageJobs) <= cap {
+		return
+	}
+	// 按创建时间升序排序，删掉最旧的若干条
+	ids := make([]*ImageJob, 0, len(s.ImageJobs))
+	for _, j := range s.ImageJobs {
+		ids = append(ids, j)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].CreatedAt < ids[j].CreatedAt })
+	for i := 0; i < len(ids)-cap; i++ {
+		delete(s.ImageJobs, ids[i].JobID)
+	}
+}
+
+// DeleteImageJob 删除单条图片记录。
+func (s *Store) DeleteImageJob(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.ImageJobs[id]; !ok {
+		return false
+	}
+	delete(s.ImageJobs, id)
+	_ = s.saveImageJobsLocked()
+	return true
+}
+
+// ClearImageJobs 清空全部图片记录。
+func (s *Store) ClearImageJobs() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ImageJobs = map[string]*ImageJob{}
 	_ = s.saveImageJobsLocked()
 }
 

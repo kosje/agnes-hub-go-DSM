@@ -244,24 +244,60 @@ async function sendChat(){
   bubble.innerHTML='<span class="spinner"></span> 正在生成回答...';
 
   try{
-    const resp=await api("/api/chat/v1/chat/completions",{
+    // 注意：服务端返回 SSE 流式（text/event-stream）；需自行解析 data: 帧，
+    // api() 的 JSON.parse 无法处理 SSE，故这里用原生 fetch 流式读取。
+    const resp=await fetch(API_URL+"/api/chat/v1/chat/completions",{
       method:"POST",
+      credentials:"same-origin",
+      headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
         model:state.model||"agnes-auto",
         messages:[{role:"user",content:text}],
         stream:true
       })
     });
+    if(!resp.ok){
+      let msg="HTTP "+resp.status;
+      try{ const j=await resp.json(); if(j&&j.error&&j.error.message)msg=j.error.message; }catch(e){}
+      throw new Error(msg);
+    }
+    const ct=resp.headers.get("content-type")||"";
     bubble.textContent="";
     let full="";
-    if(resp.choices&&resp.choices[0]){
-      const delta=resp.choices[0].delta||{};
-      full=delta.content||"";
-      bubble.textContent=full;
-    }else if(resp.choices&&resp.choices[0]&&resp.choices[0].message){
-      full=resp.choices[0].message.content||"";
+    if(ct.indexOf("text/event-stream")>=0){
+      const reader=resp.body.getReader();
+      const dec=new TextDecoder();
+      let buf="";
+      while(true){
+        const {done,value}=await reader.read();
+        if(done)break;
+        buf+=dec.decode(value,{stream:true});
+        let idx;
+        while((idx=buf.indexOf("\n"))>=0){
+          const line=buf.slice(0,idx);
+          buf=buf.slice(idx+1);
+          const t=line.trim();
+          if(!t.startsWith("data:"))continue;
+          const data=t.slice(5).trim();
+          if(data==="[DONE]")continue;
+          try{
+            const j=JSON.parse(data);
+            const c=(j.choices&&j.choices[0])||{};
+            const d=c.delta||{};
+            if(d.content)full+=d.content;
+            else if(c.message&&c.message.content)full=c.message.content;
+            bubble.textContent=full;
+          }catch(e){}
+        }
+      }
+    }else{
+      // 非流式 JSON 兜底
+      const j=await resp.json();
+      const c=(j.choices&&j.choices[0])||{};
+      full=(c.message&&c.message.content)||(c.delta&&c.delta.content)||c.text||"";
       bubble.textContent=full;
     }
+    if(!full)bubble.textContent="（无内容返回）";
     // Save to history
     state.history.push({id:Date.now(),type:"chat",text:text.substring(0,60),ts:Date.now()/1000,model:state.model||"agnes-auto"});
     renderHistory();
@@ -452,21 +488,44 @@ function renderHistory(){
   const imgList=document.getElementById("imgHistory");
   const vidList=document.getElementById("vidHistory");
   if(imgList&&state.imgJobs){
-    imgList.innerHTML=(state.imgJobs.slice(-20).reverse()).map(j=>`
+    const items=(state.imgJobs.slice(-20).reverse()).map(j=>`
       <div class="history-item" onclick="showImgJob('${esc(j.job_id)}')">
+        <button class="del" title="删除" onclick="event.stopPropagation();deleteImgJob('${esc(j.job_id)}')">×</button>
         <div class="muted">${timeAgo(j.created_at)}</div>
         <div>${esc((j.prompt||"").substring(0,40))}</div>
         <div class="tag ok">${esc(j.status)}</div>
       </div>`).join("");
+    imgList.innerHTML=`<div class="hist-head"><span>图片记录 (${state.imgJobs.length})</span><button class="sm" onclick="clearImgJobs()">清空</button></div>`+items;
   }
   if(vidList&&state.vidJobs){
-    vidList.innerHTML=(state.vidJobs.slice(-20).reverse()).map(j=>`
+    const items=(state.vidJobs.slice(-20).reverse()).map(j=>`
       <div class="history-item">
+        <button class="del" title="删除" onclick="event.stopPropagation();deleteVidJob('${esc(j.job_id)}')">×</button>
         <div class="muted">${timeAgo(j.created_at)}</div>
         <div>${esc((j.prompt||"").substring(0,40))}</div>
         <div class="tag ${j.status==='completed'?'ok':j.status==='failed'?'warn':''}">${esc(j.status)}</div>
       </div>`).join("");
+    vidList.innerHTML=`<div class="hist-head"><span>视频记录 (${state.vidJobs.length})</span><button class="sm" onclick="clearVidJobs()">清空</button></div>`+items;
   }
+}
+
+async function deleteImgJob(id){
+  try{ await api("/api/image-jobs/"+encodeURIComponent(id),{method:"DELETE"}); state.imgJobs=state.imgJobs.filter(j=>j.job_id!==id); renderHistory(); toast("已删除图片记录","good"); }
+  catch(e){ toast(e.message,"bad"); }
+}
+async function clearImgJobs(){
+  if(!confirm("确认清空全部图片记录？此操作不可恢复。"))return;
+  try{ await api("/api/image-jobs/clear",{method:"POST"}); state.imgJobs=[]; renderHistory(); toast("已清空图片记录","good"); }
+  catch(e){ toast(e.message,"bad"); }
+}
+async function deleteVidJob(id){
+  try{ await api("/api/video-jobs/"+encodeURIComponent(id),{method:"DELETE"}); state.vidJobs=state.vidJobs.filter(j=>j.job_id!==id); renderHistory(); toast("已删除视频记录","good"); }
+  catch(e){ toast(e.message,"bad"); }
+}
+async function clearVidJobs(){
+  if(!confirm("确认清空全部视频记录？此操作不可恢复。"))return;
+  try{ await api("/api/video-jobs/clear",{method:"POST"}); state.vidJobs=[]; renderHistory(); toast("已清空视频记录","good"); }
+  catch(e){ toast(e.message,"bad"); }
 }
 
 async function showImgJob(jobId){

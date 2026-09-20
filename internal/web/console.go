@@ -64,6 +64,10 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/bindings/clear", s.apiClearBindings)
 	m.HandleFunc("GET /api/video-jobs", s.apiVideoJobs)
 	m.HandleFunc("GET /api/image-jobs", s.apiImageJobs)
+	m.HandleFunc("DELETE /api/video-jobs/{id}", s.apiDeleteVideoJob)
+	m.HandleFunc("DELETE /api/image-jobs/{id}", s.apiDeleteImageJob)
+	m.HandleFunc("POST /api/video-jobs/clear", s.apiClearVideoJobs)
+	m.HandleFunc("POST /api/image-jobs/clear", s.apiClearImageJobs)
 
 	m.HandleFunc("GET /api/settings", s.apiGetSettings)
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
@@ -116,6 +120,11 @@ func (s *Server) chatAuthed(r *http.Request) bool {
 	// 未设置密码则允许访问
 	settings := s.Store.SettingsSnapshot()
 	return settings.ChatPasswordHash == ""
+}
+
+// authedOrChat 同时接受管理员会话或 Chat 密码会话（图片/视频库接口在两种入口下都要可用）。
+func (s *Server) authedOrChat(r *http.Request) bool {
+	return s.authed(r) || s.chatAuthed(r)
 }
 
 func (s *Server) deny(w http.ResponseWriter) {
@@ -815,7 +824,7 @@ func (s *Server) apiClearBindings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	if !s.authedOrChat(r) {
 		s.deny(w)
 		return
 	}
@@ -823,11 +832,67 @@ func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiImageJobs(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	if !s.authedOrChat(r) {
 		s.deny(w)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"jobs": s.Store.ImageJobsSnapshot()}, nil)
+}
+
+// apiDeleteImageJob 删除单条图片记录。
+func (s *Server) apiDeleteImageJob(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "missing id"})
+		return
+	}
+	if !s.Store.DeleteImageJob(id) {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "image job not found"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// apiClearImageJobs 清空全部图片记录。
+func (s *Server) apiClearImageJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	s.Store.ClearImageJobs()
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// apiDeleteVideoJob 删除单条视频记录。
+func (s *Server) apiDeleteVideoJob(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "missing id"})
+		return
+	}
+	if !s.Store.DeleteVideoJob(id) {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "video job not found"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// apiClearVideoJobs 清空全部视频记录。
+func (s *Server) apiClearVideoJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	s.Store.ClearVideoJobs()
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +987,8 @@ func applySettings(st *config.Settings, p map[string]any) {
 	s2("default_image_tier", &st.DefaultImageTier)
 	s2("optimization_mode", &st.OptimizationMode)
 	i("image_record_retention_days", &st.ImageRecordRetention)
+	i("image_max_capacity", &st.ImageMaxCapacity)
+	i("video_max_capacity", &st.VideoMaxCapacity)
 
 	// chat_password is handled separately in apiSetSettings to avoid accessing s here
 	i("retry_max", &st.RetryMax)

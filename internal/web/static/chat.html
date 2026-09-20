@@ -71,6 +71,11 @@ textarea{min-height:90px;resize:vertical}
 .img-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:12px}
 .img-grid img{width:100%;border-radius:12px;cursor:pointer;border:1px solid var(--line);transition:all .15s;box-shadow:0 2px 8px rgba(0,0,0,.06)}
 .img-grid img:hover{transform:scale(1.02);box-shadow:0 4px 16px rgba(0,0,0,.12)}
+.hist-head{display:flex;justify-content:space-between;align-items:center;margin:4px 0 10px;font-size:12px;color:var(--muted)}
+.history-item{position:relative;padding-right:30px}
+.history-item .del{position:absolute;top:8px;right:8px;width:20px;height:20px;line-height:1;padding:0;border-radius:50%;border:1px solid var(--line);background:#fff;color:var(--muted);font-size:14px;cursor:pointer;opacity:0;transition:opacity .15s}
+.history-item:hover .del{opacity:1}
+.history-item .del:hover{background:var(--bad-soft);color:var(--bad);border-color:var(--bad)}
 
 /* 生图设置面板 */
 .img-settings{background:var(--bg);border-radius:12px;padding:14px;margin-bottom:14px;border:1px solid var(--line)}

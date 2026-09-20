@@ -138,6 +138,7 @@ function renderShell(){
         <div class="muted" id="subline">加载中…</div>
       </div>
       <div class="row">
+        <a class="sm primary" href="/chat" target="_blank" rel="noopener" style="text-decoration:none">💬 对话 UI</a>
         <button class="sm" id="btnRefresh">刷新</button>
         <button class="sm" id="btnPw">修改密码</button>
         <button class="sm danger" id="btnLogout">退出</button>
@@ -600,6 +601,8 @@ function viewSettings(){
         <option value="concurrent_parallel" ${s.optimization_mode==="concurrent_parallel"?"selected":""}>并发并行 (Concurrent Parallel)</option>
       </select><div class="hint">concurrent_batch: 多账号并发处理批次请求; concurrent_parallel: 完全并行处理</div></div>
       ${fld("s_img_ret","图片记录保留天数", s.image_record_retention_days||30,"number","超过天数后自动清理历史记录")}
+      ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+      ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录；0 = 不限制")}
     </div>
   </div>
   <div class="card">
@@ -640,7 +643,8 @@ function bindSettingsEvents(){
       default_image_tier:g("s_tier"), retry_max:Number(g("s_retry")),
       retry_base_backoff_ms:Number(g("s_rbase")), retry_max_backoff_ms:Number(g("s_rmax")),
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
-      optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret"))
+      optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
+      image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap"))
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));

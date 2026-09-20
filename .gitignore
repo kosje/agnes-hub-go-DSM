@@ -20,3 +20,4 @@ __pycache__/
 # fpk 构建产物（由 tools/build_fpk.py 生成，图标源文件在 assets/）
 fpk-bundle/
 dist/
+*.exe~
