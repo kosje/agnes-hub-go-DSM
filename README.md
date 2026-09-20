@@ -464,9 +464,9 @@ python tools/build_catalog.py         # 生成群晖套件源 docs/catalog.json
 # 1. 交叉编译（源码零改动，Go 自带交叉编译，不需要 CGO）
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
 
-# 2. 打包（产出 dist/agnes-hub-x86_64-1.0.2-0001.spk）
+# 2. 打包（当前产出 dist/agnes-hub-x86_64-1.0.2-0002.spk）
 python tools/build_spk.py
-SPK_BUILD=2 python tools/build_spk.py    # 换构建号；群晖要求每次发布构建号递增
+SPK_BUILD=3 python tools/build_spk.py    # 下次发布换构建号；群晖要求每次递增
 
 # 3. 生成套件源（产出 docs/catalog.json，并把 SPK 复制到 docs/ 一起发布）
 python tools/build_catalog.py
@@ -480,7 +480,7 @@ python tools/build_catalog.py
 用 `--link-from-release`，但不推荐，原因见「直接下载」一节。
 
 构建是**可复现**的：同源码同版本号连续构建两次，SPK 的 md5 完全一致
-（tar 条目的 mtime 与 gzip 容器头都已归零）。这点很重要 ——
+（tar 条目的 mtime 与内层 gzip 容器头都已归零）。这点很重要 ——
 套件源 catalog 里声明的 md5 必须与实际发布的文件对得上。
 
 > 改动过源码（**哪怕只改注释**）后必须重新构建并重新提交 `docs/`：
@@ -489,16 +489,15 @@ python tools/build_catalog.py
 
 ### 适用机型
 
-群晖的「套件架构」不等于 CPU 品牌。本套件是 `arch="x86_64"`，覆盖全部
-Intel / AMD 64 位机型：apollolake、avoton、braswell、broadwell 系列、bromolow、
+群晖的「套件架构」不等于 CPU 品牌，也不只看 CPU 指令集。SPK 的 `INFO`
+必须列出 DSM 使用的具体平台代号；本套件用同一份 amd64 二进制覆盖 Intel / AMD
+64 位机型，包括 apollolake、avoton、braswell、broadwell 系列、bromolow、
 cedarview、coffeelake、denverton、geminilake、grantley、kvmx64、purley、
-skylaked、v1000。
+skylaked、v1000 等。
 
 不确定的话，在 DSM 里执行 `cat /etc/synoinfo.conf | grep unique`，
 看到 `synology_apollolake_...` 这类即为 x86_64 平台。架构不匹配时 DSM
 会直接拒绝安装，不要改文件名或换包内二进制。
-
-> 32 位的 armv7（alpine / alpine4k）与 armada370 等老机型不在支持范围内。
 
 > 32 位的 armv7（alpine / alpine4k）与 armada370 等老机型不在支持范围内。
 
@@ -508,7 +507,7 @@ skylaked、v1000。
 生成，用 GitHub Pages 托管。加一次源，之后有新版本套件中心会直接提示更新：
 
 ```bash
-python tools/build_catalog.py --tag v1.0.2-0001   # 产出 docs/catalog.json + 图标 + 落地页
+python tools/build_catalog.py --tag v1.0.2-0002   # 产出 docs/catalog.json + 图标 + 落地页
 git add docs && git commit -m "chore: 更新套件源" && git push
 ```
 
@@ -566,8 +565,11 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 
 ### 几个容易踩的群晖约束
 
+- **SPK 外层必须是未压缩 tar**，只有里面的 `package.tgz` 使用 gzip。若把外层也
+  做成 tar.gz，浏览器和桌面解压工具仍能打开，但 DSM 会判定套件格式无效。
 - **一个 SPK 只能装一种架构**。群晖官方要求不要把多平台二进制打进同一个 spk，
-  所以 `build_spk.py` 按架构产出独立的包（默认只出 x86_64）。
+  所以 `build_spk.py` 按 CPU 架构产出独立的包（默认只出 x86_64），并在 INFO
+  中列出兼容该二进制的具体 DSM 平台代号。
 - **`INFO` 的值必须带双引号**（`package="agnes-hub"`），且 `version` 必须是
   「功能号-构建号」（`1.0.2-0001`）。构建号每次发布要递增，否则套件中心认为版本没变、不提示升级。
 - **`thirdparty="yes"` 不能漏**。DSM 靠它判定这是第三方套件、走「信任层级」那套流程；

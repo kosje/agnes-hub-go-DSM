@@ -17,7 +17,7 @@
      必须全部存在，缺一个会被判定为「套件损坏」。数据目录用 SYNOPKG_PKGVAR。
 
 产出结构（对齐群晖官方 Package Developer Guide）：
-    agnes-hub-<arch>-<version>.spk   (外层 tar.gz)
+    agnes-hub-<arch>-<version>.spk   (外层必须是未压缩 tar)
       ├── INFO                         key="value" 行文本，含 package.tgz 的 checksum
       ├── package.tgz                  内层 tar.gz，只放单架构二进制
       │   └── agnes-hub-go
@@ -64,17 +64,31 @@ OS_MIN_VER = "7.0-40000"
 MAINTAINER = "kosje"
 MAINTAINER_URL = "https://github.com/kosje/agnes-hub-go-DSM"
 
-# 群晖套件架构值 -> 交叉编译产物文件名。
-# 架构值取「家族名」而非具体平台代号：x86_64 覆盖 apollolake/avoton/braswell/
-# broadwell*/bromolow/cedarview/coffeelake/denverton/geminilake/grantley/kvmx64/
-# purley/skylaked/v1000 等全部 Intel/AMD 64 位机型；armv8 覆盖 rtd1296/
-# rtd1619/rtd1619b/armada37xx。
+# 分发架构标签 -> 交叉编译产物文件名。
+#
+# 注意：这里的标签用于命令行和产物文件名，不能直接写进 INFO 的 arch。DSM
+# 用具体平台代号（例如 DS918+ 是 apollolake）匹配套件；只写 x86_64 会导致
+# 绝大多数 Intel/AMD NAS 在安装阶段报“不支持此平台”。同一份 amd64 二进制
+# 可以安全用于下面所有 x86_64 平台，所以 INFO 要列出完整的平台集合。
 # 32 位的 armv7（alpine/alpine4k）与 armada370 等老机型不在支持范围内：
 # 需要 GOARCH=arm GOARM=7，且这类机器基本已停产。
 ARCH_TARGETS = [
     ("x86_64", "agnes-hub-go-linux-amd64"),
     ("armv8", "agnes-hub-go-linux-arm64"),
 ]
+
+PACKAGE_ARCHES = {
+    "x86_64": (
+        "apollolake avoton braswell broadwell broadwellnk broadwellnkv2 "
+        "broadwellntbap bromolow cedarview coffeelake denverton epyc7002 "
+        "epyc7003 epyc7003ntb geminilake geminilakenk grantley icelaked "
+        "kvmx64 purley r1000 r1000nk skylaked v1000 v1000nk x64 x86_64"
+    ),
+    "armv8": "armada37xx rtd1296 rtd1619 rtd1619b aarch64 armv8",
+}
+
+# 每次发布 SPK 都必须递增。仍可用 SPK_BUILD 临时覆盖。
+DEFAULT_SPK_BUILD = "2"
 
 DESCRIPTION = (
     "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定"
@@ -246,7 +260,7 @@ def spk_version(go_version):
     群晖 version 必须是「功能号-构建号」；构建号要在每次发布时递增，
     否则套件中心认为版本没变、不会提示升级。用 SPK_BUILD 环境变量指定。
     """
-    build = os.environ.get("SPK_BUILD", "1")
+    build = os.environ.get("SPK_BUILD", DEFAULT_SPK_BUILD)
     if not build.isdigit():
         sys.exit("[ERROR] SPK_BUILD 必须是纯数字，当前为 %r" % build)
     return "%s-%04d" % (go_version, int(build))
@@ -489,7 +503,7 @@ def build_info(arch, spk_ver, checksum, extractsize_kb):
         'displayname="Agnes Hub"',
         'desc="%s"' % DESCRIPTION,
         'description="%s"' % DESCRIPTION,
-        'arch="%s"' % arch,
+        'arch="%s"' % PACKAGE_ARCHES[arch],
         'os_min_ver="%s"' % OS_MIN_VER,
         # thirdparty 必须声明。DSM 靠它判定这是第三方套件，从而走「信任层级」
         # 那套流程；缺了它 DSM 会把包当成群晖官方包，要求有效的官方签名，
@@ -567,16 +581,67 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
 
 
 def build_spk(bundle, out_path):
+    """组装 DSM SPK。
+
+    SPK 外层必须是未压缩 tar；只有其中的 package.tgz 使用 gzip。DSM 套件中心
+    不会把 gzip 压缩的外层当作有效 SPK，即使常见桌面解压工具可以打开它。
+    """
     os.makedirs(OUT_DIR, exist_ok=True)
-    with open(out_path, "wb") as fout:
-        with _tar_gz_writer(fout) as tar:
-            _add_file(tar, os.path.join(bundle, "INFO"), "INFO", mode=0o644)
-            _add_file(tar, os.path.join(bundle, "package.tgz"), "package.tgz", mode=0o644)
-            _add_dir_recursive(tar, os.path.join(bundle, "scripts"), "scripts")
-            _add_dir_recursive(tar, os.path.join(bundle, "conf"), "conf")
-            _add_file(tar, os.path.join(bundle, "PACKAGE_ICON.PNG"), "PACKAGE_ICON.PNG", mode=0o644)
-            _add_file(tar, os.path.join(bundle, "PACKAGE_ICON_256.PNG"), "PACKAGE_ICON_256.PNG", mode=0o644)
+    with tarfile.open(out_path, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        _add_file(tar, os.path.join(bundle, "INFO"), "INFO", mode=0o644)
+        _add_file(tar, os.path.join(bundle, "package.tgz"), "package.tgz", mode=0o644)
+        _add_dir_recursive(tar, os.path.join(bundle, "scripts"), "scripts")
+        _add_dir_recursive(tar, os.path.join(bundle, "conf"), "conf")
+        _add_file(tar, os.path.join(bundle, "PACKAGE_ICON.PNG"), "PACKAGE_ICON.PNG", mode=0o644)
+        _add_file(tar, os.path.join(bundle, "PACKAGE_ICON_256.PNG"), "PACKAGE_ICON_256.PNG", mode=0o644)
+    validate_spk(out_path)
     return out_path
+
+
+def validate_spk(path):
+    """在发布前检查 DSM 最容易静默拒绝的 SPK 格式约束。"""
+    with open(path, "rb") as fh:
+        if fh.read(2) == b"\x1f\x8b":
+            raise ValueError("SPK 外层被 gzip 压缩；DSM 要求外层为未压缩 tar")
+
+    required = {
+        "INFO", "package.tgz", "scripts/start-stop-status",
+        "scripts/preinst", "scripts/postinst", "scripts/preuninst",
+        "scripts/postuninst", "scripts/preupgrade", "scripts/postupgrade",
+        "conf/privilege", "PACKAGE_ICON.PNG", "PACKAGE_ICON_256.PNG",
+    }
+    # r: 明确只接受未压缩 tar，避免 r:* 又把错误的 gzip 外层悄悄放过。
+    with tarfile.open(path, mode="r:") as outer:
+        members = {m.name: m for m in outer.getmembers()}
+        missing = sorted(required - set(members))
+        if missing:
+            raise ValueError("SPK 缺少必要条目：%s" % "、".join(missing))
+
+        info_raw = outer.extractfile("INFO").read().decode("utf-8")
+        fields = {}
+        for line in info_raw.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                fields[key] = value.strip().strip('"')
+        package_data = outer.extractfile("package.tgz").read()
+        if fields.get("checksum") != hashlib.md5(package_data).hexdigest():
+            raise ValueError("INFO checksum 与 package.tgz 不一致")
+        actual_arches = set(fields.get("arch", "").split())
+        known_arch_sets = [set(value.split()) for value in PACKAGE_ARCHES.values()]
+        if actual_arches not in known_arch_sets:
+            raise ValueError("INFO arch 与已定义的 DSM 平台集合不一致")
+
+        for script in (name for name in required if name.startswith("scripts/")):
+            if members[script].mode & 0o111 == 0:
+                raise ValueError("%s 不可执行" % script)
+
+        with tarfile.open(fileobj=io.BytesIO(package_data), mode="r:gz") as inner:
+            binary = inner.getmember("agnes-hub-go")
+            if binary.mode & 0o111 == 0:
+                raise ValueError("package.tgz 中的 agnes-hub-go 不可执行")
+            binary_file = inner.extractfile(binary)
+            if binary_file.read(4) != b"\x7fELF":
+                raise ValueError("package.tgz 中的 agnes-hub-go 不是 Linux ELF")
 
 
 def select_targets(spec):
