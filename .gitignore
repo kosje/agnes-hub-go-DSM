@@ -18,3 +18,5 @@ __pycache__/
 spk-bundle/
 dist/
 *.spk
+# 例外：docs/ 下的 SPK 是套件源实际分发的文件，必须提交
+!docs/*.spk

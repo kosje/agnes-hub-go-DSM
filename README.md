@@ -15,13 +15,19 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 
 ### 直接下载
 
-[Releases](https://github.com/kosje/agnes-hub-go-DSM/releases) 只提供群晖套件：
+群晖套件有两个下载地址，内容完全相同：
 
-| 资产 | 用途 |
+| 地址 | 说明 |
 | --- | --- |
-| `agnes-hub-x86_64-<版本>.spk` | 群晖 DSM 套件安装包（Intel / AMD 64 位机型，见第 11 节） |
+| `https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-<版本>.spk` | **推荐**。GitHub Pages 直出，无跳转 |
+| [Releases](https://github.com/kosje/agnes-hub-go-DSM/releases) | GitHub Release，会 302 跳到 `objects.githubusercontent.com` |
 
-也可以用套件源让套件中心自动检查更新，见第 11 节。
+> **为什么推荐前者**：Release 的下载地址不是直出，而是 302 跳到
+> `objects.githubusercontent.com`。该域名在国内经常不可达，DSM 也可能不跟跨域跳转，
+> 表现就是套件中心能列出套件、点安装却报「下载失败」。Pages 是静态直出、无跳转，
+> 而且 catalog 和图标本身就托管在同一个域上 —— 能拉到 catalog 就一定拉得到包。
+
+更好的做法是加套件源，让套件中心自动检查更新，见第 11 节。
 
 > Windows 与通用 Linux 的产物（`agnes-hub-go.exe` / `agnes-hub-go-linux-amd64`）
 > 不在 Releases 里，需要时按第 7 节的命令自行构建。
@@ -79,7 +85,9 @@ agnes-hub-go/
 │   └── multi_account_probe.py  多账号吞吐探针（本地 mock 上游，零配额）
 ├── docs/                      群晖套件源（GitHub Pages 根目录，由 build_catalog.py 生成）
 │   ├── catalog.json            x86_64 套件源
-│   └── index.html              落地页：怎么加源、怎么装
+│   ├── index.html              落地页：怎么加源、怎么装
+│   ├── agnes-hub-<arch>-<版本>.spk   套件本体（catalog 的 link 指向这里）
+│   └── agnes-hub-72.png / -256.png   套件中心列表与详情页图标
 ├── assets/
 │   ├── ICON.PNG                图标源文件（横幅图，build_spk 会裁出方形图标）
 │   └── ICON_256.PNG            同上（当前与 ICON.PNG 内容相同）
@@ -460,16 +468,24 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agn
 python tools/build_spk.py
 SPK_BUILD=2 python tools/build_spk.py    # 换构建号；群晖要求每次发布构建号递增
 
-# 3. 生成套件源（产出 docs/catalog.json，供 GitHub Pages 托管）
+# 3. 生成套件源（产出 docs/catalog.json，并把 SPK 复制到 docs/ 一起发布）
 python tools/build_catalog.py
 ```
 
 `build_spk.py` 默认只出 x86_64 —— 本项目只分发群晖 x86_64 机型。
 `ARCH_TARGETS` 里保留了 armv8，需要时用 `--arch armv8` 或 `--arch all` 打开。
 
+`build_catalog.py` 会把 SPK 复制一份到 `docs/`，catalog 的 `link` 指向这份副本
+（Pages 直出、无跳转）。Release 上仍保留一份作为镜像；想让 `link` 指回 Release
+用 `--link-from-release`，但不推荐，原因见「直接下载」一节。
+
 构建是**可复现**的：同源码同版本号连续构建两次，SPK 的 md5 完全一致
 （tar 条目的 mtime 与 gzip 容器头都已归零）。这点很重要 ——
 套件源 catalog 里声明的 md5 必须与实际发布的文件对得上。
+
+> 改动过源码（**哪怕只改注释**）后必须重新构建并重新提交 `docs/`：
+> Go 的 build ID 会把源码内容算进去，注释变化同样会改变二进制，
+> 进而让 catalog 声明的 md5 与 Pages 上的文件对不上。
 
 ### 适用机型
 

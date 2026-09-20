@@ -12,15 +12,23 @@
 请求的 arch 参数做的，静态托管做不到。所以一个架构一份 catalog，
 x86_64 用 catalog.json（最常见，也是本项目的默认），其余用 catalog-<arch>.json。
 
+**为什么 SPK 也要放到 Pages 上**：catalog 的 link 默认指向 Pages 上的 SPK 副本，
+不是 GitHub Release。Release 的下载地址会 302 跳到 objects.githubusercontent.com，
+该域名在国内经常不可达、DSM 也可能不跟跨域跳转，表现为套件中心能列出套件、
+点安装却报「下载失败」。Pages 直出静态文件、无跳转，且 catalog 与图标本身就
+托管在这里 —— 能拉到 catalog 就一定拉得到包。Release 上仍保留一份作为镜像。
+
 用法：
     python tools/build_catalog.py                     # 用 dist/ 下的 spk
     python tools/build_catalog.py --tag v1.0.2-0001   # 指定 Release tag
+    python tools/build_catalog.py --link-from-release # link 指回 Release（不推荐）
 """
 
 import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 
@@ -69,10 +77,9 @@ def read_spk_info(path):
     return fields
 
 
-def make_entry(spk_path, tag, thumb_urls):
+def make_entry(spk_path, link, thumb_urls):
     info = read_spk_info(spk_path)
     data = open(spk_path, "rb").read()
-    name = os.path.basename(spk_path)
     version = info["version"]
 
     return {
@@ -84,7 +91,7 @@ def make_entry(spk_path, tag, thumb_urls):
         # 群晖只在下载量超过 1000 时才显示，第三方源填 0 即可
         "download_count": 0,
         "recent_download_count": 0,
-        "link": "%s/releases/download/%s/%s" % (REPO_URL, tag, name),
+        "link": link,
         "size": len(data),
         "md5": hashlib.md5(data).hexdigest(),
         "thumbnail": [thumb_urls[0]],
@@ -207,8 +214,10 @@ LANDING = """<!DOCTYPE html>
 <p>升级<strong>保留</strong>数据目录，只有卸载套件才会连同删除。</p>
 
 <h2>手动下载</h2>
-<p>不想加套件源的话，到
-<a href="{repo}/releases">Releases</a> 直接下 SPK，用「套件中心 → 手动安装」装。</p>
+<p>不想加套件源的话，直接下这个文件，再用「套件中心 → 手动安装」装：</p>
+<p>{download_list}</p>
+<p class="sub">这些链接指向本站（GitHub Pages），不经过 GitHub Release 的跳转 ——
+国内网络访问 Release 下载地址常会失败。</p>
 
 <p class="sub" style="margin-top:2.5rem">
   源码与完整文档：<a href="{repo}">{repo_short}</a>
@@ -224,7 +233,10 @@ def main():
     ap.add_argument("--out", default="docs", help="输出目录（默认 docs/）")
     ap.add_argument("--icon", default="assets/ICON.PNG", help="图标源文件")
     ap.add_argument("--tag", default=None,
-                    help="Release tag（默认 v<SPK 版本>，如 v1.0.2-0001）")
+                    help="Release tag（默认 v<SPK 版本>，如 v1.0.2-0001）；"
+                         "仅 --link-from-release 时会用到")
+    ap.add_argument("--link-from-release", action="store_true",
+                    help="把 link 指向 GitHub Release 而不是 Pages（默认走 Pages）")
     ap.add_argument("--arch", default=PRIMARY_ARCH,
                     help="要纳入 catalog 的架构，逗号分隔；默认 %s，用 all 表示全部"
                          % PRIMARY_ARCH)
@@ -267,7 +279,18 @@ def main():
         version = info["version"]
         tag = args.tag or ("v%s" % version)
 
-        entry = make_entry(path, tag, thumb_urls)
+        # link 默认指向 Pages 上的 SPK 副本，而不是 GitHub Release。
+        # 原因：Release 的下载地址会 302 跳到 objects.githubusercontent.com，
+        # 这个域名在国内经常不可达，DSM 也可能不跟跨域跳转 —— 表现为套件中心
+        # 能列出套件但点安装报「下载失败」。而 Pages 是直出静态文件，无跳转，
+        # 且 catalog 与图标本身就托管在这里，能拉到 catalog 就一定能拉包。
+        if args.link_from_release:
+            link = "%s/releases/download/%s/%s" % (REPO_URL, tag, name)
+        else:
+            shutil.copy2(path, os.path.join(args.out, name))
+            link = "%s/%s" % (PAGES_BASE, name)
+
+        entry = make_entry(path, link, thumb_urls)
         out_name = catalog_name_for(arch)
         out_path = os.path.join(args.out, out_name)
         with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
@@ -303,7 +326,13 @@ def main():
         % (APP_ID, m["version"], m["arch"], m["size"] / 1024 / 1024, m["md5"])
         for m in sorted(meta, key=lambda x: x["arch"])
     )
+    download_list = "<br>\n".join(
+        '<a href="%s/%s"><code>%s</code></a>（%s，%.2f MB）'
+        % (PAGES_BASE, m["file"], m["file"], m["arch"], m["size"] / 1024 / 1024)
+        for m in sorted(meta, key=lambda x: x["arch"])
+    )
     landing = LANDING.format(source_rows=source_rows, version_rows=version_rows,
+                             download_list=download_list,
                              port=SERVICE_PORT, repo=REPO_URL, repo_short=REPO)
     index_path = os.path.join(args.out, "index.html")
     with open(index_path, "w", encoding="utf-8", newline="\n") as fh:
@@ -316,7 +345,11 @@ def main():
         print("  %-8s %s/%s" % (m["arch"], PAGES_BASE, m["catalog"]))
     print()
     print("注意：catalog 里的 version 必须与 SPK 内 INFO 的 version 完全一致，")
-    print("      套件中心就是靠它判断有无更新；link 指向的 Release tag 必须已存在。")
+    print("      套件中心就是靠它判断有无更新。")
+    if args.link_from_release:
+        print("      link 指向 Release，需确保对应 tag 已存在。")
+    else:
+        print("      SPK 已复制到 %s/ 并随 Pages 发布；记得一并提交。" % args.out)
     print("      字段依据：%s。" % CATALOG_FIELDS_NOTE)
 
 if __name__ == "__main__":
