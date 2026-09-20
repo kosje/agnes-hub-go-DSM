@@ -37,11 +37,15 @@ type Server struct {
 	Updater *updater.Updater
 	// Version 由 main 注入，供 /healthz 与自更新接口显示，避免写死在多处。
 	Version string
+	// intentCache 缓存 auto 路径的意图判定（body 哈希 + 规则指纹 → 结论）。
+	// 仅 handleTextish 命中 auto 模型时读写；显式模型名、媒体端点均不走。
+	intentCache *intent.Cache
 }
 
 // New 构造服务。
 func New(store *config.Store, h *hub.Hub, client *http.Client) *Server {
-	s := &Server{Store: store, Hub: h, Client: client, mux: http.NewServeMux(), rules: intent.DefaultRules()}
+	s := &Server{Store: store, Hub: h, Client: client, mux: http.NewServeMux(), rules: intent.DefaultRules(),
+		intentCache: intent.NewCache(0, 0)}
 	s.routes()
 	return s
 }
@@ -347,6 +351,32 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // 文本类端点（chat / responses / messages）—— 含 agnes-auto 判定
 // ---------------------------------------------------------------------------
 
+// decideCached 走 LRU 缓存的意图判定（仅 handleTextish 的 auto 路径用）。
+//
+// 命中条件（全部满足才用缓存）：
+//   - 规则集未变（指纹在 Key() 里，变了自动 miss，无需手动清）
+//   - body + requestedModel 哈希命中
+//   - 未超过 TTL（10 分钟）
+//
+// 命中时 Source 标记为 "cache"，Reason 写 "命中意图判定缓存"，
+// 下游观测端能直接区分「缓存判定」与「现场判定」。
+func (s *Server) decideCached(path string, body map[string]any, requested string, settings config.Settings) intent.Result {
+	icfg := autoIntentConfig(settings)
+	key := s.intentCache.Key(body, s.rules, icfg.MinConfidence, icfg.ContentScan, requested)
+	if cached := s.intentCache.Get(key); cached != nil {
+		out := *cached
+		if out.Source != "cache" {
+			out.Source = "cache"
+			out.Reason = "命中意图判定缓存"
+		}
+		return out
+	}
+	res := intent.Decide(path, body, requested, icfg, s.rules,
+		settings.ModelAliases, pool.ModalityOfModel, "")
+	s.intentCache.Put(key, res)
+	return res
+}
+
 func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path string) {
 	item, e := s.downstreamKey(r)
 	if e != nil {
@@ -364,8 +394,7 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 
 	var decision intent.Result
 	if intent.IsAutoModel(requested) || requested == "" {
-		decision = intent.Decide(path, body, requested, autoIntentConfig(settings), s.rules,
-			settings.ModelAliases, pool.ModalityOfModel, "")
+		decision = s.decideCached(path, body, requested, settings)
 	} else {
 		decision = intent.Result{
 			Modality:       pool.ModalityOfModel(requested, settings.ModelAliases),

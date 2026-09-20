@@ -30,6 +30,7 @@ import io
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -40,11 +41,29 @@ OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
 
 APP_ID = "agnes-hub"
-VERSION = "1.0.4"
 SERVICE_PORT = 4142
+
+
+def _version_from_main_go() -> str:
+    """版本单一来源：读 main.go 的 `var version = "x.y.z"`。
+
+    杜绝 build_fpk.py 与 main.go 两处手改不同步导致产物名 / manifest /
+    升级清理 VERSION_TAG 漂移（历史上 1.0.3 的 windows exe 误发事故根因）。
+    """
+    main_go = os.path.join(ROOT, "main.go")
+    with open(main_go, "r", encoding="utf-8") as f:
+        src = f.read()
+    m = re.search(r'var\s+version\s*=\s*"(\d+\.\d+\.\d+)"', src)
+    if not m:
+        sys.exit("[ERROR] 无法从 main.go 解析版本号（需要形如 `var version = \"1.0.5\"`）")
+    return m.group(1)
+
+
+VERSION = _version_from_main_go()
 # 嵌在二进制里的版本串，upgrade_init 用它判断「这个残留文件是不是本版本的」。
 # 必须与 main.go 的 var version 完全一致，否则升级前置清理会把自己刚装的删掉。
-VERSION_TAG = "1.0.4"
+# 这里直接取 VERSION，单一来源。
+VERSION_TAG = VERSION
 # 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
 FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
@@ -299,6 +318,10 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.5：控制台新增「到达密度 vs 文本池节拍」观测指标（判定多账号是否真正被吃到）；"
+    "意图判定 LRU 缓存（热路径 O(1)，规则变更静默失效）；"
+    "429 路径改批量落盘（消除同步磁盘 I/O 拖慢换号重试）；"
+    "HTTP 客户端单例化（全应用共享连接池，生图/视频轮询建连开销下降）。"
     "1.0.4：飞牛 fnOS 重装/升级/卸载时完整保留账号、设置、聊天记录；"
     "安装向导的管理员密码填写后覆盖原密码、留空则保留原密码；更换品牌 logo；"
     "修复 cmd/main 在部分 fnOS 版本下找不到二进制的问题。"

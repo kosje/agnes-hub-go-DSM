@@ -697,6 +697,39 @@ func (s *Store) MutateAccount(id string, fn func(*Account) bool) bool {
 	return false
 }
 
+// TouchStatsDirty 在写锁内改账号统计但**不**落盘，仅由调度器 30s 维护循环批量 flush。
+// 用途：429 风暴 / 高频成功路径避免每次请求都同步写 accounts.json。
+func (s *Store) TouchStatsDirty(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			return // 数据已在内存，落盘交给定期 flush（见 hub.flushFactors）
+		}
+	}
+}
+
+// FlushAccounts 把内存中所有账号的状态写一次 accounts.json。
+// 用于维护循环的批量落盘（替代热路径里的同步写盘）。
+func (s *Store) FlushAccounts() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.saveAccountsLocked()
+}
+
+// MutateAccountNoSave 在写锁内改账号但不落盘（由调用方负责标 dirty / 定时落盘）。
+func (s *Store) MutateAccountNoSave(id string, fn func(*Account) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			fn(a)
+			return true
+		}
+	}
+	return false
+}
+
 // MutateAccountMap 批量写回 (账号 × 池) 二维校准因子。
 //
 // 入参 key 形如 "<account_id>|<pool_class>"。做成批量接口是为了降低写放大：

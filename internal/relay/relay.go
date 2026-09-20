@@ -213,6 +213,8 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 	exclude := map[string]bool{}
 	var totalWait int64
 	var last *Result
+	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
+	h.Arrivals.Add()
 
 	for attempt := 0; attempt <= retryMax; attempt++ {
 		picked, err := h.Pick(opts.SessionKey, opts.PoolClass, opts.Pinned, opts.RequiredModel, exclude)

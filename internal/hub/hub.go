@@ -68,7 +68,83 @@ type Hub struct {
 	reviveAt      map[string]time.Time
 	pendingFactor map[string]bool
 
+	// Arrivals 到达密度环形缓冲区：记录最近 ARRIVAL_WINDOW 内的请求到达时间戳。
+	// 用于控制台展示「到达密度 vs 节拍」，帮助判断宿主是否在并发发请求、
+	// 多账号是否真正被吃到。单 goroutine 写入（调度主循环），控制台读取时加锁。
+	Arrivals arrivalRing
+
+	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
+}
+
+// arrivalRing 是固定容量环形时间戳数组（并发安全）。
+const ARRIVAL_WINDOW = 60 * time.Second
+
+type arrivalRing struct {
+	mu    sync.Mutex
+	items [512]time.Time
+	n     int    // 有效条目数（≤ 容量）
+	pos   int    // 下一个写入位置
+	total int64  // 总计数（含已滑出窗口的）
+}
+
+// Add 记录一次请求到达。
+func (r *arrivalRing) Add() {
+	r.mu.Lock()
+	now := time.Now()
+	r.items[r.pos%len(r.items)] = now
+	r.pos++
+	if r.n < len(r.items) {
+		r.n++
+	}
+	r.total++
+	r.mu.Unlock()
+}
+
+// Counts 返回 (窗口内总数, 秒级时间桶切片、每秒均值)。
+// 秒桶长度 60，下标 0 = 60s 前、59 = 当前秒，控制台渲染迷你直方图用。
+// 滑出窗口的条目从 n 中扣除（惰性，下一次 Counts 才真正清理）。
+func (r *arrivalRing) Counts() (total int, perSecond []int, avgPerSec float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	perSecond = make([]int, 60)
+	active := 0
+	// 遍历有效条目，滑出窗口的标记为 0
+	for i := 0; i < r.n; i++ {
+		idx := (r.pos - r.n + i + len(r.items)) % len(r.items)
+		t := r.items[idx]
+		age := now.Sub(t)
+		if age > ARRIVAL_WINDOW {
+			r.items[idx] = time.Time{} // 清掉避免下次再算
+			continue
+		}
+		sec := int(age.Seconds())
+		bucket := 59 - sec
+		if bucket < 0 || bucket > 59 {
+			continue
+		}
+		perSecond[bucket]++
+		active++
+	}
+	// 把滑出窗口但还没清掉的条目从 n 中扣除（最多 512 次，无性能问题）
+	valid := 0
+	for i := 0; i < r.n; i++ {
+		idx := (r.pos - r.n + i + len(r.items)) % len(r.items)
+		if !r.items[idx].IsZero() && now.Sub(r.items[idx]) <= ARRIVAL_WINDOW {
+			valid++
+		}
+	}
+	r.n = valid
+	avgPerSec = float64(valid) / 60.0
+	return valid, perSecond, avgPerSec
+}
+
+// TotalCount 返回到达总数（进程启动以来）。
+func (r *arrivalRing) TotalCount() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.total
 }
 
 // New 构造调度器。
@@ -382,6 +458,7 @@ func (h *Hub) StartMaintenance(ctx context.Context) {
 }
 
 // flushFactors 把二维校准因子合并落盘（降写放大：30 秒一次批量写，而不是每次 429 都写）。
+// 同时把 429/成功/熔断 路径里改过但尚未写盘的账号统计一并落盘。
 func (h *Hub) flushFactors() {
 	h.mu.Lock()
 	dirty := make([]string, 0, len(h.pendingFactor))
@@ -394,10 +471,12 @@ func (h *Hub) flushFactors() {
 		values[k] = h.poolFactors[k]
 	}
 	h.mu.Unlock()
-	if len(dirty) == 0 {
-		return
+	if len(dirty) > 0 {
+		h.store.MutateAccountMap(values, dirty)
 	}
-	h.store.MutateAccountMap(values, dirty)
+	// 兜底：把统计字段（RateLimited / LastError / 熔断状态等）批量写一次，
+	// 热路径里改这些字段的代码一律走 MutateAccountNoSave，这里统一落盘。
+	h.store.FlushAccounts()
 }
 
 // BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。
@@ -689,12 +768,13 @@ func (h *Hub) OnRateLimited(a *config.Account, poolClass string) {
 	h.penaltyUntil[a.ID] = time.Now().Add(cooldown)
 	h.mu.Unlock()
 
-	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+	// 429 路径不写盘：统计与池因子只在内存改，由 30s 维护循环（flushFactors →
+	// store.FlushAccounts）批量落盘，避免 429 风暴时每个请求都阻塞一次磁盘 I/O
+	// 拖慢整个换号重试循环。重启最坏丢 30s 内累计的 429 统计，可接受。
+	h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Stats.RateLimited++
 		acc.LastRateLimited = float64(time.Now().UnixNano()) / 1e9
 		if s.CalibrationEnabled {
-			// 立即落盘该池因子（不等 30s 批量 flush），保证进程重启后校准不丢；
-			// 但只写这一个池键，不做账号级降权。
 			if acc.PoolFactors == nil {
 				acc.PoolFactors = map[string]float64{}
 			}
@@ -750,7 +830,7 @@ func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 	h.mu.Unlock()
 	h.Metrics.BreakerOpened.Add(1)
 
-	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Enabled = false
 		acc.Stats.Errors++
 		acc.Stats.LastError = truncate(reason, 200) +
@@ -762,7 +842,7 @@ func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 
 // NoteError 记录一次性错误（不熔断）。
 func (h *Hub) NoteError(a *config.Account, reason string) {
-	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Stats.Errors++
 		acc.Stats.LastError = truncate(reason, 200)
 		return true
@@ -771,7 +851,7 @@ func (h *Hub) NoteError(a *config.Account, reason string) {
 
 // NoteSuccess 记一次成功（统计）。
 func (h *Hub) NoteSuccess(a *config.Account) {
-	_ = h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
+	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Stats.Requests++
 		acc.Stats.LastUsedAt = float64(time.Now().UnixNano()) / 1e9
 		return true
@@ -839,12 +919,49 @@ func (h *Hub) Snapshot() map[string]any {
 		"bindings":     len(h.store.BindingsSnapshot()),
 		"keys":         len(h.store.KeysSnapshot()),
 		"pool_classes": config.PoolClasses,
+		// 到达密度 vs 节拍（多账号是否真被吃到的核心观测）
+		"arrival": h.arrivalDensity(),
 		"auto_routing": map[string]any{
 			"enabled":        true,
 			"model_name":     s.AutoModelName,
 			"content_scan":   s.AutoIntent.ContentScan,
 			"min_confidence": s.AutoIntent.MinConfidence,
 		},
+	}
+}
+
+// arrivalDensity 计算最近 60s 的到达密度，并给出文本池节拍的比值。
+// 比值 >1 表示到达比节拍更密，多账号可线性扩容；<1 表示到达稀疏，
+// 账号数不是瓶颈。
+func (h *Hub) arrivalDensity() map[string]any {
+	active, perSecond, avgPerSec := h.Arrivals.Counts()
+	// 取任一账号的 text 池 RPM 作为基准间隔
+	textRPM := 0.0
+	h.mu.Lock()
+	for k, p := range h.pacers {
+		if strings.HasSuffix(k, "|text") && p.RPM() > 0 {
+			textRPM = p.RPM()
+			break
+		}
+	}
+	h.mu.Unlock()
+	textIntervalSec := 0.0
+	if textRPM > 0 {
+		textIntervalSec = 60.0 / textRPM
+	}
+	ratio := 0.0
+	if textIntervalSec > 0 {
+		ratio = avgPerSec * textIntervalSec
+	}
+	return map[string]any{
+		"window_sec":       int(ARRIVAL_WINDOW.Seconds()),
+		"active_60s":       active,
+		"avg_per_sec":      round2(avgPerSec),
+		"text_rpm":         round2(textRPM),
+		"text_interval_ms": int(textIntervalSec * 1000),
+		// ratio > 1 表示到达更密于节拍 → 多账号真正吃到
+		"ratio": round2(ratio),
+		"per_second": perSecond,
 	}
 }
 

@@ -484,7 +484,7 @@ func (s *Server) apiTestAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
-	client := relay.BuildClient()
+	client := s.Client
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
@@ -1347,7 +1347,7 @@ func (s *Server) probeRates(ctx context.Context, account *config.Account, modali
 	rates []float64, perRate int) ([]map[string]any, error) {
 
 	settings := s.Store.SettingsSnapshot()
-	client := relay.BuildClient()
+	client := s.Client
 	var results []map[string]any
 
 	for _, rpm := range rates {
