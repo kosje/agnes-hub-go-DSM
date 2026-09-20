@@ -95,23 +95,6 @@ textarea{min-height:90px;resize:vertical}
 </head>
 <body>
 <div id="app"></div>
-<script>
-const state={tab:"chat",session:null,keys:[],activeKey:null,history:[],curHistoryId:null,messages:[],model:"",sending:false,imJobId:null};
-const API_URL="";
-async function api(p,o={}){
-  const opts={credentials:"same-origin",headers:{"Content-Type":"application/json"},...o};
-  if(state.activeKey) opts.headers["Authorization"]="Bearer "+state.activeKey;
-  const r=await fetch(API_URL+p,opts);
-  const t=await r.text();
-  let d=null; try{d=t?JSON.parse(t):null;}catch(e){d={raw:t};}
-  if(!r.ok){const m=(d&&d.error&&d.error.message)||("HTTP "+r.status);throw new Error(m);}
-  return d;
-}
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function toast(m,k){const e=document.getElementById("toast");if(!e)return;e.className="banner "+(k||"good");e.textContent=m;e.classList.remove("hide");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.add("hide"),4000);}
-function fmtDate(ts){if(!ts)return"";const d=new Date(ts*1000);return d.toLocaleDateString("zh-CN")+" "+d.toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit"});}
-function timeAgo(ts){const s=Math.floor(Date.now()/1000)-ts;if(s<60)return s+"秒前";if(s<3600)return Math.floor(s/60)+"分钟前";if(s<86400)return Math.floor(s/3600)+"小时前";return Math.floor(s/86400)+"天前";}
-</script>
 <script src="chat.main.js"></script>
 </body>
 </html>
