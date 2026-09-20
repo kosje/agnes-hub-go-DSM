@@ -40,11 +40,11 @@ OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
 
 APP_ID = "agnes-hub"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SERVICE_PORT = 4142
 # 嵌在二进制里的版本串，upgrade_init 用它判断「这个残留文件是不是本版本的」。
 # 必须与 main.go 的 var version 完全一致，否则升级前置清理会把自己刚装的删掉。
-VERSION_TAG = "1.0.1"
+VERSION_TAG = "1.0.2"
 # 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
 FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
