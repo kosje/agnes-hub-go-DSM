@@ -1,5 +1,7 @@
 // chat.main.js - Agnes Chat UI logic
 
+const state={tab:"chat",session:null,keys:[],accounts:[],activeKey:null,history:[],curHistoryId:null,messages:[],model:"",sending:false,imJobId:null};
+
 /* ==================== LOGIN ==================== */
 async function checkSession(){
   try{
@@ -45,13 +47,13 @@ function renderChatPasswordLogin(){
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
-      <h1>Agnes Chat</h1>
-      <p class="muted">AI Image & Video Generation</p>
+      <h1>Agnes AI 助手</h1>
+      <p class="muted">AI 对话 · 生图 · 生视频</p>
       <div id="toast" class="hide"></div>
-      <label>Chat Password</label>
-      <input id="chatPw" type="password" placeholder="enter chat password">
-      <div style="margin-top:12px"><button class="primary" id="btnChatLogin">Login</button></div>
-      <div class="hint">Enter the chat password set by administrator</div>
+      <label>Chat 访问密码</label>
+      <input id="chatPw" type="password" placeholder="请输入 Chat 访问密码">
+      <div style="margin-top:12px"><button class="primary" id="btnChatLogin">登录</button></div>
+      <div class="hint">请输入管理员设置的 Chat 访问密码</div>
     </div>
   </div>`;
   document.getElementById("btnChatLogin").onclick=async()=>{
@@ -94,13 +96,13 @@ function renderLogin(){
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
-      <h1>Agnes Chat</h1>
-      <p class="muted">AI Image & Video Generation</p>
+      <h1>Agnes AI 助手</h1>
+      <p class="muted">AI 对话 · 生图 · 生视频</p>
       <div id="toast" class="hide"></div>
-      <label>Password</label>
-      <input id="pw" type="password" placeholder="admin password">
-      <div style="margin-top:12px"><button class="primary" id="btnLogin">Login</button></div>
-      <div class="hint">Default: admin123</div>
+      <label>访问密码</label>
+      <input id="pw" type="password" placeholder="请输入访问密码">
+      <div style="margin-top:12px"><button class="primary" id="btnLogin">登录</button></div>
+      <div class="hint">默认密码: admin123</div>
     </div>
   </div>`;
   document.getElementById("btnLogin").onclick=async()=>{
@@ -118,30 +120,30 @@ function renderLogin(){
 function renderApp(){
   document.getElementById("app").innerHTML=`
   <div class="topbar">
-    <h1>Agnes Chat</h1>
-    <select id="keySel" class="model-sel" title="API Key"><option value="">Loading keys...</option></select>
-    <button class="sm" id="btnRefresh">Refresh</button>
-    <button class="sm danger" id="btnLogout">Logout</button>
+    <h1><span class="logo">🤖</span>Agnes AI 助手</h1>
+    <select id="keySel" class="model-sel" title="API Key"><option value="">加载中...</option></select>
+    <button class="sm" id="btnRefresh">刷新</button>
+    <button class="sm danger" id="btnLogout">退出</button>
   </div>
   <div class="chat-layout">
     <div class="chat-main">
       <div class="tabs">
-        <button data-tab="chat" class="on" id="tabChat">Chat</button>
-        <button data-tab="image" id="tabImage">Image</button>
-        <button data-tab="video" id="tabVideo">Video</button>
+        <button data-tab="chat" class="on" id="tabChat">💬 对话</button>
+        <button data-tab="image" id="tabImage">🎨 生图</button>
+        <button data-tab="video" id="tabVideo">🎬 生视频</button>
       </div>
       <div id="chatView" class="msg-list"></div>
       <div id="imageView" class="hide" style="padding:16px;overflow-y:auto;flex:1"></div>
       <div id="videoView" class="hide" style="padding:16px;overflow-y:auto;flex:1"></div>
       <div id="inputArea" class="input-area">
         <div class="input-row">
-          <input id="textInput" class="msg-input" placeholder="Type a message..." rows="3">
-          <button class="primary send-btn" id="btnSend">Send</button>
+          <input id="textInput" class="msg-input" placeholder="输入消息... (Enter 发送，Shift+Enter 换行)" rows="3">
+          <button class="primary send-btn" id="btnSend">发送</button>
         </div>
       </div>
     </div>
     <div class="sidebar">
-      <h3>History</h3>
+      <h3>📋 历史记录</h3>
       <div id="historyList"></div>
       <div id="imgHistory" class="hide"></div>
       <div id="vidHistory" class="hide"></div>
@@ -154,8 +156,8 @@ function renderApp(){
     state.keys=(d.keys||[]).filter(k=>k.enabled);
     const sel=document.getElementById("keySel");
     if(state.keys.length===0){
-      sel.innerHTML="<option value=''>No enabled keys</option>";
-      toast("No enabled API keys configured","warn");
+      sel.innerHTML="<option value=''>无可用密钥</option>";
+      toast("未配置任何可用的 API Key","warn");
     }else{
       sel.innerHTML=state.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.name)} (${esc(k.key.slice(0,8))}...)</option>`).join("");
       if(!state.activeKey) state.activeKey=state.keys[0].key;
@@ -163,7 +165,7 @@ function renderApp(){
     }
   }).catch(()=>{});
 
-  sel.onchange=e=>{state.activeKey=e.target.value;};
+  document.getElementById("keySel").onchange=e=>{state.activeKey=e.target.value;};
 
   document.getElementById("tabChat").onclick=()=>switchTab("chat");
   document.getElementById("tabImage").onclick=()=>switchTab("image");
@@ -205,14 +207,14 @@ function addMsg(role,content,model,ts){
 }
 
 async function sendChat(){
-  if(state.sending||!state.activeKey)return;
+  if(state.sending)return;
   const input=document.getElementById("textInput");
   const text=input.value.trim();
   if(!text)return;
   input.value="";
   state.sending=true;
   document.getElementById("btnSend").disabled=true;
-  document.getElementById("btnSend").innerHTML='<span class="spinner"></span>';
+  document.getElementById("btnSend").innerHTML='<span class="spinner"></span> 思考中...';
 
   // Add user message
   const userMsg=addMsg("user",text,null,Date.now()/1000);
@@ -220,7 +222,7 @@ async function sendChat(){
   // Add assistant placeholder
   const assMsg=addMsg("ass","",state.model||"agnes-auto",Date.now()/1000);
   const bubble=assMsg.querySelector(".msg-bubble");
-  bubble.innerHTML='<span class="spinner"></span> Waiting...';
+  bubble.innerHTML='<span class="spinner"></span> 正在生成回答...';
 
   try{
     const resp=await api("/v1/chat/completions",{
@@ -234,7 +236,6 @@ async function sendChat(){
     bubble.textContent="";
     let full="";
     if(resp.choices&&resp.choices[0]){
-      // Non-streaming or first chunk
       const delta=resp.choices[0].delta||{};
       full=delta.content||"";
       bubble.textContent=full;
@@ -246,12 +247,12 @@ async function sendChat(){
     state.history.push({id:Date.now(),type:"chat",text:text.substring(0,60),ts:Date.now()/1000,model:state.model||"agnes-auto"});
     renderHistory();
   }catch(e){
-    bubble.textContent="Error: "+e.message;
+    bubble.textContent="错误: "+e.message;
     bubble.style.color="var(--bad)";
   }finally{
     state.sending=false;
     document.getElementById("btnSend").disabled=false;
-    document.getElementById("btnSend").textContent="Send";
+    document.getElementById("btnSend").textContent="发送";
   }
 }
 
@@ -259,18 +260,56 @@ async function sendChat(){
 function renderImageView(){
   const view=document.getElementById("imageView");
   view.innerHTML=`
-    <label>Prompt</label>
-    <textarea id="imgPrompt" placeholder="Describe the image you want to generate..."></textarea>
-    <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-      <select id="imgModel" style="width:200px">
-        <option value="agnes-auto">agnes-auto (auto-detect)</option>
-        <option value="agnes-image-2.5-flash">agnes-image-2.5-flash</option>
-        <option value="agnes-image-2.1-flash">agnes-image-2.1-flash</option>
-        <option value="dall-e-3">dall-e-3</option>
-      </select>
-      <button class="primary" id="btnGenImg">Generate</button>
-    </div>
-    <div id="imgResult" class="img-grid" style="margin-top:12px"></div>`;
+    <div class="card">
+      <h3 style="margin:0 0 12px;font-size:15px">🎨 AI 生图</h3>
+      <label>提示词</label>
+      <textarea id="imgPrompt" placeholder="描述你想生成的图片... 例如：一只可爱的猫咪在夕阳下奔跑"></textarea>
+      
+      <div class="img-settings" style="margin-top:14px">
+        <h4>⚙️ 生成设置</h4>
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>图片比例</label>
+            <select id="imgRatio">
+              <option value="1:1">1:1 方形 (1024×1024)</option>
+              <option value="16:9">16:9 宽屏 (1280×720)</option>
+              <option value="9:16">9:16 竖屏 (720×1280)</option>
+              <option value="4:3">4:3 标准 (1024×768)</option>
+              <option value="3:4">3:4 肖像 (768×1024)</option>
+            </select>
+          </div>
+          <div class="setting-group">
+            <label>艺术风格</label>
+            <select id="imgStyle">
+              <option value="">默认 (无特殊风格)</option>
+              <option value="photorealistic">写实摄影</option>
+              <option value="anime">动漫风格</option>
+              <option value="oil-painting">油画风格</option>
+              <option value="watercolor">水彩风格</option>
+              <option value="pixel-art">像素艺术</option>
+              <option value="3d-render">3D 渲染</option>
+              <option value="sketch">素描手绘</option>
+            </select>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>生成模型</label>
+            <select id="imgModel">
+              <option value="agnes-auto">agnes-auto (自动选择)</option>
+              <option value="agnes-image-2.5-flash">agnes-image-2.5-flash</option>
+              <option value="agnes-image-2.1-flash">agnes-image-2.1-flash</option>
+              <option value="dall-e-3">dall-e-3</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      
+      <div style="margin-top:12px">
+        <button class="primary" id="btnGenImg" style="width:100%">🖼️ 开始生成</button>
+      </div>
+      <div id="imgResult" style="margin-top:16px"></div>
+    </div>`;
   document.getElementById("btnGenImg").onclick=generateImage;
 }
 
@@ -308,17 +347,21 @@ async function generateImage(){
 function renderVideoView(){
   const view=document.getElementById("videoView");
   view.innerHTML=`
-    <label>Prompt</label>
-    <textarea id="vidPrompt" placeholder="Describe the video you want to generate..."></textarea>
-    <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-      <select id="vidModel" style="width:200px">
-        <option value="agnes-auto">agnes-auto (auto-detect)</option>
-        <option value="agnes-video-2.5-flash">agnes-video-2.5-flash</option>
-        <option value="agnes-video-v2.0">agnes-video-v2.0</option>
-      </select>
-      <button class="primary" id="btnGenVid">Generate</button>
-    </div>
-    <div id="vidResult" style="margin-top:12px"></div>`;
+    <div class="card">
+      <h3 style="margin:0 0 12px;font-size:15px">🎬 AI 生视频</h3>
+      <label>提示词</label>
+      <textarea id="vidPrompt" placeholder="描述你想生成的视频... 例如：夕阳下的海滩，海浪轻拍沙滩"></textarea>
+      
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+        <select id="vidModel" style="width:200px">
+          <option value="agnes-auto">agnes-auto (自动选择)</option>
+          <option value="agnes-video-2.5-flash">agnes-video-2.5-flash</option>
+          <option value="agnes-video-v2.0">agnes-video-v2.0</option>
+        </select>
+        <button class="primary" id="btnGenVid">🎥 提交生成</button>
+      </div>
+      <div id="vidResult" style="margin-top:16px"></div>
+    </div>`;
   document.getElementById("btnGenVid").onclick=generateVideo;
 }
 
@@ -335,13 +378,13 @@ async function generateVideo(){
     });
     const jobId=resp.job_id||resp.id;
     if(jobId){
-      result.innerHTML=`<div class="banner good">Video submitted. Job ID: ${esc(jobId)}</div>`;
+      result.innerHTML=`<div class="banner good">✅ 视频已提交生成！任务 ID: ${esc(jobId)}</div>`;
       pollVideo(jobId,result);
       state.history.push({id:Date.now(),type:"video",text:prompt.substring(0,60),ts:Date.now()/1000,model,jobs:[jobId]});
       renderHistory();
     }
   }catch(e){
-    result.innerHTML=`<div class="banner bad">${esc(e.message)}</div>`;
+    result.innerHTML=`<div class="banner bad">❌ ${esc(e.message)}</div>`;
   }
 }
 
@@ -353,12 +396,12 @@ async function pollVideo(jobId,resultEl){
         resultEl.innerHTML+=`<div class="video-wrap"><video controls src="${esc(resp.video_url)}"></video></div>`;
         return;
       }else if(resp.status==="failed"){
-        resultEl.innerHTML+=`<div class="banner bad">Failed: ${esc(resp.error||"unknown")}</div>`;
+        resultEl.innerHTML+=`<div class="banner bad">❌ 生成失败: ${esc(resp.error||"未知错误")}</div>`;
         return;
       }
       setTimeout(poll,3000);
     }catch(e){
-      resultEl.innerHTML+=`<div class="banner warn">Poll error: ${esc(e.message)}</div>`;
+      resultEl.innerHTML+=`<div class="banner warn">⚠️ 轮询错误: ${esc(e.message)}</div>`;
     }
   };
   setTimeout(poll,3000);
@@ -403,9 +446,9 @@ async function showImgJob(jobId){
     const resp=await api(`/api/image-jobs/${jobId}`);
     const view=document.getElementById("imageView");
     view.innerHTML=`
-      <button class="sm" onclick="switchTab('image')">← Back</button>
-      <h3>Image Job: ${esc(jobId)}</h3>
-      <p class="muted">Model: ${esc(resp.model||"?")} · Status: ${esc(resp.status||"?")}</p>
+      <button class="sm" onclick="switchTab('image')">← 返回</button>
+      <h3>图片任务: ${esc(jobId)}</h3>
+      <p class="muted">模型: ${esc(resp.model||"?")} · 状态: ${esc(resp.status||"?")}</p>
       <img src="${esc(resp.url||"")}" style="max-width:100%;border-radius:8px;margin-top:10px">`;
   }catch(e){toast(e.message,"bad");}
 }
