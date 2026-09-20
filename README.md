@@ -457,9 +457,18 @@ ssh <user>@<nas-host>
 sudo appcenter-cli install-fpk /tmp/agnes-hub-go-1.0.1.fpk
 ```
 
-`.fpk` 是两层 tar.gz：外层放 `manifest`（**key=value 纯文本，不能写成 JSON**，
-否则安装报 `code 10111`）+ `manifest.checksum` + 图标，内层 `app.tgz` 放
-`app/cmd/config/wizard`。`config/privilege` 与 `config/resource` 必须存在。
+`.fpk` 是两层 tar.gz：
+
+- **外层**：`manifest`（`**key=value` 纯文本，不能写成 JSON，否则安装报 `code 10111`）
+  + `ICON.PNG` / `ICON_256.PNG` + `cmd/`（生命周期脚本，含 `main`/`install_init`/`upgrade_init`…）
+  + `config/`（`privilege` 与 `resource` 必须存在，否则应用中心拒绝）+ `wizard/install`（空数组即可）
+  + `app.tgz`。
+- **内层 `app.tgz`**：**只放 `app/` 下的双架构二进制**，不要塞 `cmd/config/wizard`
+  （否则应用中心找不到 `cmd/main` 直接安装失败）。
+
+完整性校验不是独立 `manifest.checksum` 文件，而是 `manifest` 内的 `checksum=<app.tgz 的 MD5>` 字段，
+应用中心据此校验 `app.tgz` 未被篡改。`cmd/main` 必须支持 `start`/`stop`/`status` 子命令
+（fnOS 应用中心以 `cmd/main start` 拉起、`cmd/main status` 探活，期望运行中返回 0、未运行返回 3）。
 `tools/build_fpk.py` 已经把这套结构固化好，只需交叉编译出 ELF 后运行它。
 
 一键联调（上传 + 安装 + 前台跑起来看日志）：
