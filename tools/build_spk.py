@@ -363,13 +363,15 @@ def _box_resize(src_w, src_h, src, dst_w, dst_h):
     return out
 
 
-def make_icons(src_png, out_64, out_256):
-    """从 assets/ICON.PNG 生成群晖要求的两个方形图标。
+def make_icon_set(src_png, targets):
+    """从 assets/ICON.PNG 生成任意尺寸的方形图标。
 
     源图是「左侧方形 App 图标 + 右侧标语文字」的横幅（当前 270×114）。
-    群晖要求 PACKAGE_ICON.PNG 为 64×64、PACKAGE_ICON_256.PNG 为 256×256，
     方形图标就贴在左上角，所以取 min(宽,高) 作为边长从 (0,0) 裁切。
     若以后把源图换成真正的方形图标，这个规则会自然退化为「整图」。
+
+    targets 是 [(边长, 输出路径), ...]。群晖 SPK 要 64/256，
+    套件中心的缩略图要 72/256，所以尺寸做成参数而不是写死。
     """
     w, h, px = _png_decode_rgba(src_png)
     side = min(w, h)
@@ -382,10 +384,15 @@ def make_icons(src_png, out_64, out_256):
         s = y * w * 4
         crop[y * side * 4:(y + 1) * side * 4] = px[s:s + side * 4]
 
-    for dst, size in ((out_64, 64), (out_256, 256)):
+    for size, dst in targets:
         scaled = _box_resize(side, side, crop, size, size)
         _png_encode_rgba(dst, size, size, scaled)
     return w, h, side
+
+
+def make_icons(src_png, out_64, out_256):
+    """群晖 SPK 要求的两个方形图标（64×64 与 256×256）。"""
+    return make_icon_set(src_png, [(64, out_64), (256, out_256)])
 
 
 # ---------------------------------------------------------------------------

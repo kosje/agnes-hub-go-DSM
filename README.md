@@ -15,7 +15,7 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 
 ### 直接下载
 
-[Releases](https://github.com/my788525/agnes-hub-go/releases) 里按平台提供：
+[Releases](https://github.com/kosje/agnes-hub-go-DSM/releases) 里按平台提供：
 
 | 资产 | 用途 |
 | --- | --- |
@@ -75,8 +75,14 @@ agnes-hub-go/
 │   ├── check_bat.py            实测 bat 的编码与三个分支（不启动服务）
 │   ├── smoke_test.py           零配额端到端冒烟（不碰上游）
 │   ├── build_fpk.py            打包飞牛 fnOS 的 .fpk 安装包（不碰上游）
+│   ├── build_spk.py            打包群晖 DSM 的 .spk 安装包（x86_64 / armv8 各一份）
+│   ├── build_catalog.py        生成群晖套件源 catalog + 落地页（托管到 GitHub Pages）
 │   ├── deploy_nas.py           SSH 上传 + 安装 + 前台联调（口令走环境变量）
 │   └── multi_account_probe.py  多账号吞吐探针（本地 mock 上游，零配额）
+├── docs/                      群晖套件源（GitHub Pages 根目录，由 build_catalog.py 生成）
+│   ├── catalog.json            x86_64 套件源
+│   ├── catalog-armv8.json      armv8 套件源
+│   └── index.html              落地页：该加哪个源地址
 ├── assets/
 │   ├── ICON.PNG                飞牛应用中心列表图标（64×64）
 │   └── ICON_256.PNG            飞牛应用详情页图标（256×256）
@@ -461,7 +467,7 @@ sudo appcenter-cli install-fpk /tmp/agnes-hub-go-1.0.1.fpk
 
 `.fpk` 是两层 tar.gz：
 
-- **外层**：`manifest`（`**key=value` 纯文本，不能写成 JSON，否则安装报 `code 10111`）
+- **外层**：`manifest`（`key=value` 纯文本，不能写成 JSON，否则安装报 `code 10111`）
   + `ICON.PNG` / `ICON_256.PNG` + `cmd/`（生命周期脚本，含 `main`/`install_init`/`upgrade_init`…）
   + `config/`（`privilege` 与 `resource` 必须存在，否则应用中心拒绝）+ `wizard/install`（空数组即可）
   + `app.tgz`。
@@ -512,7 +518,35 @@ SPK_BUILD=2 python tools/build_spk.py    # 换构建号；群晖要求每次发�
 
 > 32 位的 armv7（alpine / alpine4k）与 armada370 等老机型不在支持范围内。
 
-### 安装
+### 添加套件源（推荐，能在套件中心里检查更新）
+
+`docs/` 下是给 DSM 用的**套件源**（package source catalog）目录，由 `tools/build_catalog.py`
+生成，用 GitHub Pages 托管。加一次源，之后有新版本套件中心会直接提示更新：
+
+```bash
+python tools/build_catalog.py --tag v1.0.2-0001   # 产出 docs/catalog*.json + 图标 + 落地页
+git add docs && git commit -m "chore: 更新套件源" && git push
+```
+
+在 DSM 里 **套件中心 → 设置 → 套件来源 → 新增**，填对应架构的地址：
+
+| 架构 | 套件源地址 |
+| --- | --- |
+| x86_64 | `https://kosje.github.io/agnes-hub-go-DSM/catalog.json` |
+| armv8 | `https://kosje.github.io/agnes-hub-go-DSM/catalog-armv8.json` |
+
+**为什么按架构分文件**：群晖 catalog 的条目里没有架构字段 —— 架构过滤是服务端按请求的
+`arch` 参数做的（见 SynoCommunity/spkrepo 的 `views/nas.py`）。GitHub Pages 是静态托管，
+没法按参数返回不同内容，所以一个架构一份 catalog：x86_64 用 `catalog.json`，
+其余用 `catalog-<arch>.json`。同一个文件里塞两个架构会让套件中心出现两个同名条目，
+装错那个会被 DSM 以架构不符拒绝。
+
+> **发新版时三处必须对齐**：SPK 内 `INFO` 的版本号、Release tag、catalog 的 `version`。
+> 套件中心就是拿 catalog 的 `version` 与已安装版本比对来判断有无更新的，
+> 写错会导致「明明发了新版却不提示更新」。`build_catalog.py` 的 tag 默认取
+> `v<SPK 版本>`，按正常流程走不会错位。
+
+### 手动安装
 
 1. DSM → **套件中心** → 右上角 **手动安装** → 选择与 NAS 架构匹配的 `.spk`。
 2. 若提示「套件来源不受信任」：到 **套件中心 → 设置 → 常规 → 信任层级** 选「任何发行者」，

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agnes Hub — 群晖 DSM 套件源</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem;
+         font: 16px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  h1 { font-size: 1.9rem; margin: 0 0 .4rem; }
+  .sub { opacity: .65; margin-bottom: 2rem; }
+  h2 { font-size: 1.15rem; margin: 2.2rem 0 .7rem;
+        padding-bottom: .35rem; border-bottom: 1px solid rgba(128,128,128,.28); }
+  code, pre { font-family: ui-monospace, Consolas, monospace; }
+  code { background: rgba(128,128,128,.16); padding: .12em .4em; border-radius: 4px;
+          font-size: .9em; word-break: break-all; }
+  pre { background: rgba(128,128,128,.12); padding: .85rem 1rem; border-radius: 8px;
+         overflow-x: auto; font-size: .87rem; }
+  table { border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .93rem; }
+  th, td { border: 1px solid rgba(128,128,128,.32); padding: .5rem .7rem; text-align: left; }
+  th { background: rgba(128,128,128,.12); }
+  .note { border-left: 3px solid #4a90d9; padding: .6rem 1rem; margin: 1rem 0;
+           background: rgba(74,144,217,.09); border-radius: 0 6px 6px 0; }
+  ol, ul { padding-left: 1.4rem; }
+  li { margin: .3rem 0; }
+</style>
+</head>
+<body>
+<h1>Agnes Hub — 群晖 DSM 套件源</h1>
+<p class="sub">Agnes AI 多账号聚合中转 + RPM 限流排队网关，打包为群晖套件。</p>
+
+<h2>添加套件源</h2>
+<p>群晖的套件源<strong>按 CPU 架构区分</strong>，请按你的机型选对应地址
+（协议里 catalog 条目不含架构字段，架构过滤由服务端做，静态托管只能一架构一份文件）。</p>
+<table>
+  <tr><th>你的机型</th><th>要添加的套件源地址</th></tr>
+  <tr><td>Intel / AMD 64 位机型（apollolake、avoton、braswell、broadwell、bromolow、cedarview、coffeelake、denverton、geminilake、grantley、kvmx64、purley、skylaked、v1000 等）</td><td><code>https://kosje.github.io/agnes-hub-go-DSM/catalog.json</code></td></tr>
+  <tr><td>ARM64 机型（rtd1296、rtd1619、rtd1619b、armada37xx，如 DS223 / DS423 系列）</td><td><code>https://kosje.github.io/agnes-hub-go-DSM/catalog-armv8.json</code></td></tr>
+</table>
+<p>在 DSM 里：<strong>套件中心 → 设置 → 套件来源 → 新增</strong>，把上面的地址粘进去。</p>
+
+<div class="note">
+  <strong>如果提示「套件来源不受信任」</strong>：到
+  <strong>套件中心 → 设置 → 常规 → 信任层级</strong> 选「任何发行者」，再重新添加。
+  这是第三方未签名套件的统一门槛，与本套件无关。
+</div>
+
+<h2>当前版本</h2>
+<table>
+  <tr><th>套件</th><th>版本</th><th>架构</th><th>大小</th><th>MD5</th></tr>
+  <tr><td>agnes-hub</td><td>1.0.2-0001</td><td>armv8</td><td>2.41 MB</td><td><code>c67434ddec11bc35678dfffc52219b65</code></td></tr>
+  <tr><td>agnes-hub</td><td>1.0.2-0001</td><td>x86_64</td><td>2.63 MB</td><td><code>33a953300eb25b97f3621bc31e798fe1</code></td></tr>
+</table>
+
+<h2>安装后</h2>
+<ul>
+  <li>控制台：<code>http://&lt;NAS 地址&gt;:4142/console</code>，初始密码 <code>admin123</code>，请立即修改</li>
+  <li>客户端接入：<code>http://&lt;NAS 地址&gt;:4142/v1</code>，模型名 <code>agnes-auto</code></li>
+  <li>数据目录：<code>/var/packages/agnes-hub/var/data</code>（含 <code>accounts.json</code>，请自行备份）</li>
+</ul>
+
+<h2>关于升级</h2>
+<p>套件由套件中心管理，<strong>内置自更新已禁用</strong>（启动时带 <code>-no-selfupdate</code>）。
+原因是套件的 <code>INFO</code> 里登记了 <code>package.tgz</code> 的 checksum，
+若允许进程内替换二进制，套件实际内容就会与已安装版本对不上，下次升级必然冲突。
+本套件源会把新版本列进套件中心，直接点「更新」即可。</p>
+<p>升级<strong>保留</strong>数据目录，只有卸载套件才会连同删除。</p>
+
+<h2>手动下载</h2>
+<p>不想加套件源的话，到
+<a href="https://github.com/kosje/agnes-hub-go-DSM/releases">Releases</a> 直接下 SPK，用「套件中心 → 手动安装」装。</p>
+
+<p class="sub" style="margin-top:2.5rem">
+  源码与完整文档：<a href="https://github.com/kosje/agnes-hub-go-DSM">kosje/agnes-hub-go-DSM</a>
+</p>
+</body>
+</html>

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""生成群晖「套件源」目录（package source catalog），供 GitHub Pages 静态托管。
+
+群晖套件中心添加套件源后，会带上 `?build=&arch=&language=&major=` 去拉这个 JSON，
+据此列出可用套件并判断有无新版本。协议细节依据三份互相独立的实现交叉核对：
+  - SynoCommunity/spkrepo  spkrepo/views/nas.py + spkrepo/domain/catalog.py（权威）
+  - jdel/sspks             lib/SSpkS/Output/JsonOutput.php
+  - kromatv/kroma          packages/synology-repo/src/gen-catalog.ts（现代静态托管实现）
+三者一致：DSM 7+ 的响应顶层是 {"packages": [...]}。
+
+**为什么按架构分文件**：catalog 条目里没有 arch 字段 —— 架构过滤是服务端按
+请求的 arch 参数做的，静态托管做不到。所以一个架构一份 catalog，
+x86_64 用 catalog.json（最常见，也是本项目的默认），其余用 catalog-<arch>.json。
+
+用法：
+    python tools/build_catalog.py                     # 用 dist/ 下的 spk
+    python tools/build_catalog.py --tag v1.0.2-0001   # 指定 Release tag
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tarfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_spk import (  # noqa: E402
+    APP_ID,
+    DESCRIPTION,
+    MAINTAINER,
+    MAINTAINER_URL,
+    SERVICE_PORT,
+    make_icon_set,
+)
+
+REPO = "kosje/agnes-hub-go-DSM"
+PAGES_BASE = "https://kosje.github.io/agnes-hub-go-DSM"
+REPO_URL = "https://github.com/%s" % REPO
+
+# 主架构用 catalog.json，其余用 catalog-<arch>.json
+PRIMARY_ARCH = "x86_64"
+
+# 套件中心里显示的变更说明（HTML）。发新版时改这里。
+CHANGELOG = (
+    "首个群晖 DSM 套件版本，基于 agnes-hub-go 1.0.2 构建。<br>"
+    "· 新增 -no-selfupdate 开关：套件由套件中心负责升级，禁用进程内替换二进制<br>"
+    "· 以套件专用账户运行（非 root），支持开机自启与套件中心启停<br>"
+    "· 数据目录位于 /var/packages/agnes-hub/var/data，升级保留、卸载删除"
+)
+
+CATALOG_FIELDS_NOTE = "SynoCommunity/spkrepo 的 build_entry_data 与 sspks 的字段清单"
+
+
+def read_spk_info(path):
+    """从 SPK 里读 INFO，取出权威的 version / arch / package 等字段。
+
+    版本号以 SPK 内 INFO 为准 —— 套件中心就是拿安装后的版本与 catalog 的
+    version 比对来判断有无更新，两边必须完全一致。
+    """
+    with tarfile.open(path, "r:gz") as t:
+        raw = t.extractfile("INFO").read().decode("utf-8")
+    fields = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            fields[k.strip()] = v.strip().strip('"')
+    return fields
+
+
+def make_entry(spk_path, tag, thumb_urls):
+    info = read_spk_info(spk_path)
+    data = open(spk_path, "rb").read()
+    name = os.path.basename(spk_path)
+    version = info["version"]
+
+    return {
+        "package": info.get("package", APP_ID),
+        "version": version,
+        "dname": "Agnes Hub",
+        "desc": DESCRIPTION,
+        "price": 0,
+        # 群晖只在下载量超过 1000 时才显示，第三方源填 0 即可
+        "download_count": 0,
+        "recent_download_count": 0,
+        "link": "%s/releases/download/%s/%s" % (REPO_URL, tag, name),
+        "size": len(data),
+        "md5": hashlib.md5(data).hexdigest(),
+        "thumbnail": [thumb_urls[0]],
+        "thumbnail_retina": [thumb_urls[1]],
+        "snapshot": [],
+        "qinst": True,
+        "qstart": True,
+        "qupgrade": True,
+        "deppkgs": None,
+        "conflictpkgs": None,
+        "start": True,
+        "startable": "yes",
+        "maintainer": MAINTAINER,
+        "maintainer_url": MAINTAINER_URL,
+        "distributor": MAINTAINER,
+        "distributor_url": MAINTAINER_URL,
+        "support_url": REPO_URL + "/issues",
+        "changelog": CHANGELOG,
+        "thirdparty": True,
+        "category": 0,
+        "subcategory": 0,
+        "type": 0,
+        "silent_install": True,
+        "silent_uninstall": True,
+        "silent_upgrade": True,
+    }
+
+
+def catalog_name_for(arch):
+    return "catalog.json" if arch == PRIMARY_ARCH else "catalog-%s.json" % arch
+
+
+LANDING = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agnes Hub — 群晖 DSM 套件源</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem;
+         font: 16px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }}
+  h1 {{ font-size: 1.9rem; margin: 0 0 .4rem; }}
+  .sub {{ opacity: .65; margin-bottom: 2rem; }}
+  h2 {{ font-size: 1.15rem; margin: 2.2rem 0 .7rem;
+        padding-bottom: .35rem; border-bottom: 1px solid rgba(128,128,128,.28); }}
+  code, pre {{ font-family: ui-monospace, Consolas, monospace; }}
+  code {{ background: rgba(128,128,128,.16); padding: .12em .4em; border-radius: 4px;
+          font-size: .9em; word-break: break-all; }}
+  pre {{ background: rgba(128,128,128,.12); padding: .85rem 1rem; border-radius: 8px;
+         overflow-x: auto; font-size: .87rem; }}
+  table {{ border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .93rem; }}
+  th, td {{ border: 1px solid rgba(128,128,128,.32); padding: .5rem .7rem; text-align: left; }}
+  th {{ background: rgba(128,128,128,.12); }}
+  .note {{ border-left: 3px solid #4a90d9; padding: .6rem 1rem; margin: 1rem 0;
+           background: rgba(74,144,217,.09); border-radius: 0 6px 6px 0; }}
+  ol, ul {{ padding-left: 1.4rem; }}
+  li {{ margin: .3rem 0; }}
+</style>
+</head>
+<body>
+<h1>Agnes Hub — 群晖 DSM 套件源</h1>
+<p class="sub">Agnes AI 多账号聚合中转 + RPM 限流排队网关，打包为群晖套件。</p>
+
+<h2>添加套件源</h2>
+<p>群晖的套件源<strong>按 CPU 架构区分</strong>，请按你的机型选对应地址
+（协议里 catalog 条目不含架构字段，架构过滤由服务端做，静态托管只能一架构一份文件）。</p>
+<table>
+  <tr><th>你的机型</th><th>要添加的套件源地址</th></tr>
+  {source_rows}
+</table>
+<p>在 DSM 里：<strong>套件中心 → 设置 → 套件来源 → 新增</strong>，把上面的地址粘进去。</p>
+
+<div class="note">
+  <strong>如果提示「套件来源不受信任」</strong>：到
+  <strong>套件中心 → 设置 → 常规 → 信任层级</strong> 选「任何发行者」，再重新添加。
+  这是第三方未签名套件的统一门槛，与本套件无关。
+</div>
+
+<h2>当前版本</h2>
+<table>
+  <tr><th>套件</th><th>版本</th><th>架构</th><th>大小</th><th>MD5</th></tr>
+  {version_rows}
+</table>
+
+<h2>安装后</h2>
+<ul>
+  <li>控制台：<code>http://&lt;NAS 地址&gt;:{port}/console</code>，初始密码 <code>admin123</code>，请立即修改</li>
+  <li>客户端接入：<code>http://&lt;NAS 地址&gt;:{port}/v1</code>，模型名 <code>agnes-auto</code></li>
+  <li>数据目录：<code>/var/packages/agnes-hub/var/data</code>（含 <code>accounts.json</code>，请自行备份）</li>
+</ul>
+
+<h2>关于升级</h2>
+<p>套件由套件中心管理，<strong>内置自更新已禁用</strong>（启动时带 <code>-no-selfupdate</code>）。
+原因是套件的 <code>INFO</code> 里登记了 <code>package.tgz</code> 的 checksum，
+若允许进程内替换二进制，套件实际内容就会与已安装版本对不上，下次升级必然冲突。
+本套件源会把新版本列进套件中心，直接点「更新」即可。</p>
+<p>升级<strong>保留</strong>数据目录，只有卸载套件才会连同删除。</p>
+
+<h2>手动下载</h2>
+<p>不想加套件源的话，到
+<a href="{repo}/releases">Releases</a> 直接下 SPK，用「套件中心 → 手动安装」装。</p>
+
+<p class="sub" style="margin-top:2.5rem">
+  源码与完整文档：<a href="{repo}">{repo_short}</a>
+</p>
+</body>
+</html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dist", default="dist", help="SPK 所在目录（默认 dist/）")
+    ap.add_argument("--out", default="docs", help="输出目录（默认 docs/）")
+    ap.add_argument("--icon", default="assets/ICON.PNG", help="图标源文件")
+    ap.add_argument("--tag", default=None,
+                    help="Release tag（默认 v<SPK 版本>，如 v1.0.2-0001）")
+    args = ap.parse_args()
+
+    spks = sorted(f for f in os.listdir(args.dist) if f.endswith(".spk"))
+    if not spks:
+        sys.exit("[ERROR] %s 下没有 .spk，先跑 tools/build_spk.py" % args.dist)
+
+    os.makedirs(args.out, exist_ok=True)
+
+    # 图标：套件中心列表用 72×72，视网膜屏用 256×256
+    make_icon_set(args.icon, [
+        (72, os.path.join(args.out, "%s-72.png" % APP_ID)),
+        (256, os.path.join(args.out, "%s-256.png" % APP_ID)),
+    ])
+    thumb_urls = ["%s/%s-72.png" % (PAGES_BASE, APP_ID),
+                  "%s/%s-256.png" % (PAGES_BASE, APP_ID)]
+
+    written = []
+    meta = []
+    for name in spks:
+        path = os.path.join(args.dist, name)
+        info = read_spk_info(path)
+        arch = info["arch"]
+        version = info["version"]
+        tag = args.tag or ("v%s" % version)
+
+        entry = make_entry(path, tag, thumb_urls)
+        out_name = catalog_name_for(arch)
+        out_path = os.path.join(args.out, out_name)
+        with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"packages": [entry]}, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        written.append(out_path)
+        meta.append({
+            "arch": arch,
+            "version": version,
+            "size": entry["size"],
+            "md5": entry["md5"],
+            "file": name,
+            "catalog": out_name,
+            "tag": tag,
+        })
+        print("  [%s] %s" % (arch, out_path))
+        print("      version=%s  size=%d  md5=%s" % (version, entry["size"], entry["md5"]))
+
+    # 落地页
+    arch_label = {
+        "x86_64": "Intel / AMD 64 位机型（apollolake、avoton、braswell、broadwell、"
+                  "bromolow、cedarview、coffeelake、denverton、geminilake、grantley、"
+                  "kvmx64、purley、skylaked、v1000 等）",
+        "armv8": "ARM64 机型（rtd1296、rtd1619、rtd1619b、armada37xx，如 DS223 / DS423 系列）",
+    }
+    source_rows = "\n  ".join(
+        "<tr><td>%s</td><td><code>%s/%s</code></td></tr>"
+        % (arch_label.get(m["arch"], m["arch"]), PAGES_BASE, m["catalog"])
+        for m in sorted(meta, key=lambda x: x["arch"] != PRIMARY_ARCH)
+    )
+    version_rows = "\n  ".join(
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%.2f MB</td><td><code>%s</code></td></tr>"
+        % (APP_ID, m["version"], m["arch"], m["size"] / 1024 / 1024, m["md5"])
+        for m in sorted(meta, key=lambda x: x["arch"])
+    )
+    landing = LANDING.format(source_rows=source_rows, version_rows=version_rows,
+                             port=SERVICE_PORT, repo=REPO_URL, repo_short=REPO)
+    index_path = os.path.join(args.out, "index.html")
+    with open(index_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(landing)
+    print("  落地页 %s" % index_path)
+
+    print()
+    print("套件源地址（DSM → 套件中心 → 设置 → 套件来源 → 新增）：")
+    for m in sorted(meta, key=lambda x: x["arch"] != PRIMARY_ARCH):
+        print("  %-8s %s/%s" % (m["arch"], PAGES_BASE, m["catalog"]))
+    print()
+    print("注意：catalog 里的 version 必须与 SPK 内 INFO 的 version 完全一致，")
+    print("      套件中心就是靠它判断有无更新；link 指向的 Release tag 必须已存在。")
+    print("      字段依据：%s。" % CATALOG_FIELDS_NOTE)
+
+if __name__ == "__main__":
+    main()
