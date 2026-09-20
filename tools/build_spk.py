@@ -27,15 +27,23 @@
       └── PACKAGE_ICON_256.PNG         256×256
 
 用法：
-    python tools/build_spk.py                      # 输出到 dist/
+    python tools/build_spk.py                      # 默认只出 x86_64，输出到 dist/
     SPK_BUILD=7 python tools/build_spk.py          # 指定构建号 -> 1.0.2-0007
+    python tools/build_spk.py --arch armv8         # 只出 armv8
+    python tools/build_spk.py --arch all           # 两个架构都出
     SPK_OUT_DIR=D:/somewhere python tools/build_spk.py
 
-构建前需要先交叉编译出两个 Linux 二进制（源码零改动，Go 标准库自带交叉编译）：
+默认只出 x86_64：本项目实际只分发群晖 x86_64 机型（DS918+ 等 apollolake 平台）。
+armv8 的目标保留在 ARCH_TARGETS 里，需要时用 --arch 打开。
+
+构建前需要先交叉编译出对应的 Linux 二进制（源码零改动，Go 标准库自带交叉编译）：
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
     CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-arm64 .
 """
 import hashlib
+import argparse
+import contextlib
+import gzip
 import io
 import json
 import os
@@ -399,6 +407,26 @@ def make_icons(src_png, out_64, out_256):
 # SPK 组装
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _tar_gz_writer(fileobj):
+    """产出 tar.gz，外层 gzip 头不带时间戳，保证构建可复现。
+
+    tarfile 的 "w:gz" 模式会把当前时间写进 gzip 头，导致同一份内容每次构建
+    产出不同字节 —— 大小一样但 md5 变化，catalog 里声明的 md5 就失效了。
+    这里手工套一层 GzipFile 并把 mtime 归零。tar 条目自身的 mtime 已在
+    _add_file 里设为 0。
+
+    gzip 必须显式关闭：tarfile 对「外部传入的 fileobj」不会代为关闭，
+    不关就写不出 gzip 尾部的 CRC 与长度，产出的文件是坏的。
+    """
+    gz = gzip.GzipFile(fileobj=fileobj, mode="wb", compresslevel=9, mtime=0)
+    try:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tar:
+            yield tar
+    finally:
+        gz.close()
+
+
 def _write(path, content, mode=0o755):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
@@ -439,8 +467,7 @@ def build_package_tgz(binary_path, out_path):
     群晖官方明确要求不要把多平台二进制打进同一个 spk，所以这里只有一份。
     """
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9,
-                      format=tarfile.GNU_FORMAT) as tar:
+    with _tar_gz_writer(buf) as tar:
         _add_file(tar, binary_path, "agnes-hub-go", mode=0o755)
     data = buf.getvalue()
     with open(out_path, "wb") as f:
@@ -542,8 +569,7 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
 def build_spk(bundle, out_path):
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(out_path, "wb") as fout:
-        with tarfile.open(fileobj=fout, mode="w:gz", compresslevel=9,
-                          format=tarfile.GNU_FORMAT) as tar:
+        with _tar_gz_writer(fout) as tar:
             _add_file(tar, os.path.join(bundle, "INFO"), "INFO", mode=0o644)
             _add_file(tar, os.path.join(bundle, "package.tgz"), "package.tgz", mode=0o644)
             _add_dir_recursive(tar, os.path.join(bundle, "scripts"), "scripts")
@@ -553,14 +579,37 @@ def build_spk(bundle, out_path):
     return out_path
 
 
+def select_targets(spec):
+    """把 --arch 的取值解析成 [(arch, 二进制名), ...]。
+
+    默认只出 x86_64：本项目实际只分发群晖 x86_64 机型（apollolake 等）。
+    armv8 目标保留在 ARCH_TARGETS 里，需要时用 --arch armv8 或 --arch all。
+    """
+    if spec == "all":
+        return list(ARCH_TARGETS)
+    wanted = [a.strip() for a in spec.split(",") if a.strip()]
+    known = {a for a, _ in ARCH_TARGETS}
+    unknown = [a for a in wanted if a not in known]
+    if unknown:
+        sys.exit("[ERROR] 未知架构 %s，可选：%s 或 all"
+                 % ("、".join(unknown), "、".join(sorted(known))))
+    return [t for t in ARCH_TARGETS if t[0] in wanted]
+
+
 def main():
+    ap = argparse.ArgumentParser(description="打包群晖 DSM 套件（SPK）")
+    ap.add_argument("--arch", default="x86_64",
+                    help="目标架构，逗号分隔；默认 x86_64。可选 x86_64 / armv8 / all")
+    args = ap.parse_args()
+    targets = select_targets(args.arch)
+
     go_version = read_version()
     spk_ver = spk_version(go_version)
     icon_src = os.path.join(ROOT, "assets", "ICON.PNG")
     if not os.path.exists(icon_src):
         sys.exit("[ERROR] 缺少图标源文件 assets/ICON.PNG")
 
-    missing = [b for _, b in ARCH_TARGETS if not os.path.exists(os.path.join(ROOT, b))]
+    missing = [b for _, b in targets if not os.path.exists(os.path.join(ROOT, b))]
     if missing:
         sys.exit("[ERROR] 缺少交叉编译产物：%s\n"
                  "请先执行：\n"
@@ -574,7 +623,7 @@ def main():
     print("图标源     : assets/ICON.PNG")
     print()
 
-    for arch, binary_name in ARCH_TARGETS:
+    for arch, binary_name in targets:
         binary_src = os.path.join(ROOT, binary_name)
         bundle, md5 = prepare_arch(arch, binary_src, spk_ver, icon_src)
         out = os.path.join(OUT_DIR, "%s-%s-%s.spk" % (APP_ID, arch, spk_ver))

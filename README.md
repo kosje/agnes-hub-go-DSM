@@ -9,22 +9,22 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 客户端只需要填一个模型名 `agnes-auto`，其余全部交给网关。
 
 - 纯 Go 标准库实现，**零第三方依赖**（规避代理被墙与供应链风险）
-- 单文件可执行程序，无运行时依赖，可直接交叉编译到飞牛 NAS
+- 单文件可执行程序，无运行时依赖，可直接交叉编译到 Linux NAS
 - 跨平台运行期数据：全 JSON 文件，免 SSH 即可备份 / 迁移
 - **内置自更新**：定时向 GitHub Releases 查新版本，控制台一键更新（见第 7.5 节）
 
 ### 直接下载
 
-[Releases](https://github.com/kosje/agnes-hub-go-DSM/releases) 里按平台提供：
+[Releases](https://github.com/kosje/agnes-hub-go-DSM/releases) 只提供群晖套件：
 
 | 资产 | 用途 |
 | --- | --- |
-| `agnes-hub-go-windows-<版本>.zip` | **Windows 绿色版**：解压即用，含 `agnes-hub-go.exe` + `agnes-hub-go.bat` + 说明，无需安装 Go 或任何运行时，支持 Win10+ |
-| `agnes-hub-go.exe` | Windows x64 裸二进制（自更新会下载它；手动运行请用上面的 zip） |
-| `agnes-hub-go-linux-amd64` | 飞牛 fnOS / 通用 Linux x64 |
-| `agnes-hub-go-linux-arm64` | Linux ARM64 |
-| `agnes-hub-go-<版本>.fpk` | 飞牛 fnOS 应用中心安装包 |
-| `agnes-hub-<架构>-<版本>.spk` | 群晖 DSM 套件安装包（见第 12 节） |
+| `agnes-hub-x86_64-<版本>.spk` | 群晖 DSM 套件安装包（Intel / AMD 64 位机型，见第 11 节） |
+
+也可以用套件源让套件中心自动检查更新，见第 11 节。
+
+> Windows 与通用 Linux 的产物（`agnes-hub-go.exe` / `agnes-hub-go-linux-amd64`）
+> 不在 Releases 里，需要时按第 7 节的命令自行构建。
 
 ---
 
@@ -74,18 +74,15 @@ agnes-hub-go/
 │   ├── make_bat.py             生成 GBK + CRLF 的 agnes-hub-go.bat
 │   ├── check_bat.py            实测 bat 的编码与三个分支（不启动服务）
 │   ├── smoke_test.py           零配额端到端冒烟（不碰上游）
-│   ├── build_fpk.py            打包飞牛 fnOS 的 .fpk 安装包（不碰上游）
-│   ├── build_spk.py            打包群晖 DSM 的 .spk 安装包（x86_64 / armv8 各一份）
+│   ├── build_spk.py            打包群晖 DSM 的 .spk 安装包（默认 x86_64）
 │   ├── build_catalog.py        生成群晖套件源 catalog + 落地页（托管到 GitHub Pages）
-│   ├── deploy_nas.py           SSH 上传 + 安装 + 前台联调（口令走环境变量）
 │   └── multi_account_probe.py  多账号吞吐探针（本地 mock 上游，零配额）
 ├── docs/                      群晖套件源（GitHub Pages 根目录，由 build_catalog.py 生成）
 │   ├── catalog.json            x86_64 套件源
-│   ├── catalog-armv8.json      armv8 套件源
-│   └── index.html              落地页：该加哪个源地址
+│   └── index.html              落地页：怎么加源、怎么装
 ├── assets/
-│   ├── ICON.PNG                飞牛应用中心列表图标（64×64）
-│   └── ICON_256.PNG            飞牛应用详情页图标（256×256）
+│   ├── ICON.PNG                图标源文件（横幅图，build_spk 会裁出方形图标）
+│   └── ICON_256.PNG            同上（当前与 ICON.PNG 内容相同）
 └── data/                       运行期数据（首次启动自动创建，勿提交）
 ```
 
@@ -272,16 +269,13 @@ Model      agnes-auto
 # Windows
 go build -trimpath -ldflags "-s -w" -o agnes-hub-go.exe .
 
-# 飞牛 NAS（x86_64）
+# 群晖 / 通用 Linux（x86_64）—— SPK 里放的就是这个
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
-
-# 飞牛 NAS（arm64，如 N100 之外的 ARM 机型）
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-arm64 .
 ```
 
 `go.mod` 刻意声明 `go 1.22` 而不是本机工具链版本：本项目零依赖、未使用
 1.23+ 语言特性，而 1.22 是「`ServeMux` 支持 `/v1/videos/{id}` 路径参数」的
-最低版本。声明得过新会让飞牛 / CI 上更常见的 1.22~1.24 工具链直接拒绝构建。
+最低版本。声明得过新会让 CI 上更常见的 1.22~1.24 工具链直接拒绝构建。
 
 ### 命令行标志
 
@@ -390,8 +384,8 @@ python tools/make_bat.py      # 由 tools/bat_src.utf8 生成 GBK + CRLF 的 bat
 python tools/check_bat.py     # 实测 bat 的编码与分支，断言不出现 "not recognized"
 python tools/smoke_test.py    # 启动真实进程，走完整 HTTP 链路，不碰上游
 python tools/multi_account_probe.py   # 多账号吞吐对照实验（本地 mock 上游）
-python tools/build_fpk.py             # 打包 dist/agnes-hub-go-<ver>.fpk
-python tools/deploy_nas.py            # 上传并安装到飞牛（需 NAS_PASS 环境变量）
+python tools/build_spk.py             # 打包 dist/agnes-hub-x86_64-<ver>.spk
+python tools/build_catalog.py         # 生成群晖套件源 docs/catalog.json
 ```
 
 `smoke_test.py` 覆盖的是「只有真正跑起来才会暴露」的那一层：进程启动、
@@ -456,65 +450,39 @@ python tools/deploy_nas.py            # 上传并安装到飞牛（需 NAS_PASS 
 
 ---
 
-## 11. 部署到飞牛 fnOS
-
-```bash
-python tools/build_fpk.py                            # 产出 dist/agnes-hub-go-1.0.1.fpk
-scp dist/agnes-hub-go-1.0.1.fpk <user>@<nas-host>:/tmp/
-ssh <user>@<nas-host>
-sudo appcenter-cli install-fpk /tmp/agnes-hub-go-1.0.1.fpk
-```
-
-`.fpk` 是两层 tar.gz：
-
-- **外层**：`manifest`（`key=value` 纯文本，不能写成 JSON，否则安装报 `code 10111`）
-  + `ICON.PNG` / `ICON_256.PNG` + `cmd/`（生命周期脚本，含 `main`/`install_init`/`upgrade_init`…）
-  + `config/`（`privilege` 与 `resource` 必须存在，否则应用中心拒绝）+ `wizard/install`（空数组即可）
-  + `app.tgz`。
-- **内层 `app.tgz`**：**只放 `app/` 下的双架构二进制**，不要塞 `cmd/config/wizard`
-  （否则应用中心找不到 `cmd/main` 直接安装失败）。
-
-完整性校验不是独立 `manifest.checksum` 文件，而是 `manifest` 内的 `checksum=<app.tgz 的 MD5>` 字段，
-应用中心据此校验 `app.tgz` 未被篡改。`cmd/main` 必须支持 `start`/`stop`/`status` 子命令
-（fnOS 应用中心以 `cmd/main start` 拉起、`cmd/main status` 探活，期望运行中返回 0、未运行返回 3）。
-`tools/build_fpk.py` 已经把这套结构固化好，只需交叉编译出 ELF 后运行它。
-
-一键联调（上传 + 安装 + 前台跑起来看日志）：
-
-```bash
-export NAS_PASS='<你的口令>'      # 或写进 .nas_pass 文件（已 gitignore）
-python tools/deploy_nas.py --host <nas-host> --user <user>
-```
-
-> **沙箱注意事项**：飞牛的 SSH 会话会拦截 `nohup` / `setsid` / `&` 等后台派生，
-> 所以 `deploy_nas.py` 走**前台联调**模式（窗口关掉服务就停）。要长期常驻，
-> 用应用中心的启停按钮，或写 systemd / init 脚本，不要依赖 SSH 后台进程。
-
----
-
-## 12. 部署到群晖 DSM
+## 11. 部署到群晖 DSM
 
 ```bash
 # 1. 交叉编译（源码零改动，Go 自带交叉编译，不需要 CGO）
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-arm64 .
 
-# 2. 打包（产出 dist/agnes-hub-x86_64-1.0.2-0001.spk 与 dist/agnes-hub-armv8-1.0.2-0001.spk）
+# 2. 打包（产出 dist/agnes-hub-x86_64-1.0.2-0001.spk）
 python tools/build_spk.py
 SPK_BUILD=2 python tools/build_spk.py    # 换构建号；群晖要求每次发布构建号递增
+
+# 3. 生成套件源（产出 docs/catalog.json，供 GitHub Pages 托管）
+python tools/build_catalog.py
 ```
 
-### 选哪个 SPK
+`build_spk.py` 默认只出 x86_64 —— 本项目只分发群晖 x86_64 机型。
+`ARCH_TARGETS` 里保留了 armv8，需要时用 `--arch armv8` 或 `--arch all` 打开。
 
-群晖的「套件架构」不等于 CPU 品牌，要按机型对应的 **Package Arch** 选：
+构建是**可复现**的：同源码同版本号连续构建两次，SPK 的 md5 完全一致
+（tar 条目的 mtime 与 gzip 容器头都已归零）。这点很重要 ——
+套件源 catalog 里声明的 md5 必须与实际发布的文件对得上。
 
-| SPK | 适用机型（平台代号） |
-| --- | --- |
-| `agnes-hub-x86_64-*.spk` | apollolake、avoton、braswell、broadwell 系列、bromolow、cedarview、coffeelake、denverton、geminilake、grantley、kvmx64、purley、skylaked、v1000 —— 全部 Intel / AMD 64 位机型 |
-| `agnes-hub-armv8-*.spk` | rtd1296、rtd1619、rtd1619b、armada37xx —— ARM64 机型（如 DS223 / DS423 系列） |
+### 适用机型
 
-不确定的话，在 DSM 里执行 `cat /proc/syno_platform`，或到「控制面板 → 信息中心」看 CPU 型号。
-架构不匹配时 DSM 会直接拒绝安装，不要改文件名或混用包内二进制。
+群晖的「套件架构」不等于 CPU 品牌。本套件是 `arch="x86_64"`，覆盖全部
+Intel / AMD 64 位机型：apollolake、avoton、braswell、broadwell 系列、bromolow、
+cedarview、coffeelake、denverton、geminilake、grantley、kvmx64、purley、
+skylaked、v1000。
+
+不确定的话，在 DSM 里执行 `cat /etc/synoinfo.conf | grep unique`，
+看到 `synology_apollolake_...` 这类即为 x86_64 平台。架构不匹配时 DSM
+会直接拒绝安装，不要改文件名或换包内二进制。
+
+> 32 位的 armv7（alpine / alpine4k）与 armada370 等老机型不在支持范围内。
 
 > 32 位的 armv7（alpine / alpine4k）与 armada370 等老机型不在支持范围内。
 
@@ -524,22 +492,35 @@ SPK_BUILD=2 python tools/build_spk.py    # 换构建号；群晖要求每次发�
 生成，用 GitHub Pages 托管。加一次源，之后有新版本套件中心会直接提示更新：
 
 ```bash
-python tools/build_catalog.py --tag v1.0.2-0001   # 产出 docs/catalog*.json + 图标 + 落地页
+python tools/build_catalog.py --tag v1.0.2-0001   # 产出 docs/catalog.json + 图标 + 落地页
 git add docs && git commit -m "chore: 更新套件源" && git push
 ```
 
-在 DSM 里 **套件中心 → 设置 → 套件来源 → 新增**，填对应架构的地址：
+**第 1 步 · 先放开信任层级**（不放开第三方套件装不上）：
 
-| 架构 | 套件源地址 |
-| --- | --- |
-| x86_64 | `https://kosje.github.io/agnes-hub-go-DSM/catalog.json` |
-| armv8 | `https://kosje.github.io/agnes-hub-go-DSM/catalog-armv8.json` |
+1. 打开 **套件中心** → 右上角 **设置**
+2. 切到 **常规** 标签 → 找到 **信任层级**
+3. 选 **「任何发行者」** → 确定
 
-**为什么按架构分文件**：群晖 catalog 的条目里没有架构字段 —— 架构过滤是服务端按请求的
-`arch` 参数做的（见 SynoCommunity/spkrepo 的 `views/nas.py`）。GitHub Pages 是静态托管，
-没法按参数返回不同内容，所以一个架构一份 catalog：x86_64 用 `catalog.json`，
-其余用 `catalog-<arch>.json`。同一个文件里塞两个架构会让套件中心出现两个同名条目，
-装错那个会被 DSM 以架构不符拒绝。
+> 三个选项的差别：*Synology Inc.* 只允许群晖官方套件；*Synology Inc. 和信任的发行者*
+> 还要求发行者持有证书；*任何发行者* 才放行未签名的第三方套件。本套件没有群晖签发的
+> 证书，所以必须选「任何发行者」。
+
+**第 2 步 · 添加套件源**：
+
+1. 同一个 **设置** 窗口 → 切到 **套件来源** 标签 → 点 **新增**
+2. **名称**：随便填，比如 `Agnes Hub`
+3. **位置**：`https://kosje.github.io/agnes-hub-go-DSM/catalog.json`
+4. 点 **确定**
+
+**第 3 步 · 安装**：切到套件中心的 **「社群」** 标签页（不是「所有套件」），
+就能看到 Agnes Hub，点「安装」即可。以后有新版本会在这里直接提示更新。
+
+**为什么地址里没有架构信息**：群晖 catalog 的条目里没有架构字段 —— 架构过滤是服务端
+按请求的 `arch` 参数做的（见 SynoCommunity/spkrepo 的 `views/nas.py`）。GitHub Pages
+是静态托管，没法按参数返回不同内容，所以一个架构一份 catalog。本项目只分发 x86_64，
+因此只有 `catalog.json` 一份。若以后要加 armv8，用 `build_catalog.py --arch all` 会
+额外产出 `catalog-armv8.json`，两个源地址分别添加即可。
 
 > **发新版时三处必须对齐**：SPK 内 `INFO` 的版本号、Release tag、catalog 的 `version`。
 > 套件中心就是拿 catalog 的 `version` 与已安装版本比对来判断有无更新的，
@@ -567,15 +548,17 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 数据目录在**升级时保留**，只有卸载套件才会连同删除。升级或卸载前请自行备份
 `accounts.json` 与 `downstream_keys.json`。
 
-### 与飞牛 fpk 的三处结构性差异
+### 几个容易踩的群晖约束
 
-- **一个 SPK 只装一种架构**。群晖官方要求不要把多平台二进制打进同一个 spk，
-  所以 `build_spk.py` 按架构循环产出多个包，而不是像 fpk 那样在脚本里用 `uname -m` 选。
+- **一个 SPK 只能装一种架构**。群晖官方要求不要把多平台二进制打进同一个 spk，
+  所以 `build_spk.py` 按架构产出独立的包（默认只出 x86_64）。
 - **`INFO` 的值必须带双引号**（`package="agnes-hub"`），且 `version` 必须是
   「功能号-构建号」（`1.0.2-0001`）。构建号每次发布要递增，否则套件中心认为版本没变、不提示升级。
+- **`thirdparty="yes"` 不能漏**。DSM 靠它判定这是第三方套件、走「信任层级」那套流程；
+  缺了它 DSM 会把包当成群晖官方包、要求有效的官方签名，安装直接被拒。
 - **生命周期脚本是固定文件名**：`scripts/start-stop-status` 加六个钩子
   （`preinst` / `postinst` / `preuninst` / `postuninst` / `preupgrade` / `postupgrade`），
-  六个钩子缺一个就会被判「套件损坏」。数据目录变量是 `SYNOPKG_PKGVAR`，不是 `TRIM_PKGVAR`。
+  六个钩子缺一个就会被判「套件损坏」。脚本里定位数据目录一律用 `SYNOPKG_PKGVAR`。
 
 ### 运行身份与自更新
 
@@ -589,7 +572,7 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 
 ---
 
-## 13. 已知边界与后续
+## 12. 已知边界与后续
 
 - **官方限流表的准确性**：表里的数字来自官方文档，真实边界需逐账号实测
   （已有 `rpm_overrides` 作为兜底）。
@@ -597,4 +580,6 @@ git add docs && git commit -m "chore: 更新套件源" && git push
   网关内阻塞等待，需实测上游的实际出片时延再定值。
 - **多账号提速有前提**：见第 10 节，串行单任务拿不到收益。
 - **未做自启 / 服务化**：Windows 端按约定只提供 bat 按需启动，关闭窗口即停止；
-  飞牛端交给应用中心托管；群晖端交给套件中心托管（含开机自启与启停按钮）。
+  群晖端交给套件中心托管（含开机自启与启停按钮）。
+- **群晖只支持 x86_64**：armv8 的构建目标在 `build_spk.py` 里保留着，但未纳入分发，
+  也没有实机验证过。armv7（alpine / alpine4k）等 32 位机型不支持。

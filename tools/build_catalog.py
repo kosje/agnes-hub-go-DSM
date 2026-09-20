@@ -149,19 +149,41 @@ LANDING = """<!DOCTYPE html>
 <h1>Agnes Hub — 群晖 DSM 套件源</h1>
 <p class="sub">Agnes AI 多账号聚合中转 + RPM 限流排队网关，打包为群晖套件。</p>
 
-<h2>添加套件源</h2>
-<p>群晖的套件源<strong>按 CPU 架构区分</strong>，请按你的机型选对应地址
-（协议里 catalog 条目不含架构字段，架构过滤由服务端做，静态托管只能一架构一份文件）。</p>
+<h2>在群晖上添加套件源</h2>
+
+<p><strong>第 1 步 · 先放开信任层级</strong>（不放开的话第三方套件装不上）</p>
+<ol>
+  <li>打开 <strong>套件中心</strong>，点右上角 <strong>设置</strong></li>
+  <li>切到 <strong>常规</strong> 标签，找到 <strong>信任层级</strong></li>
+  <li>选 <strong>「任何发行者」</strong> → 点 <strong>确定</strong></li>
+</ol>
+<p class="sub">三个选项的差别：<em>Synology Inc.</em> 只允许群晖官方套件；
+<em>Synology Inc. 和信任的发行者</em> 还要有证书；<em>任何发行者</em> 才放行未签名的第三方套件。</p>
+
+<p><strong>第 2 步 · 添加套件源</strong></p>
+<ol>
+  <li>同一个 <strong>设置</strong> 窗口，切到 <strong>套件来源</strong> 标签</li>
+  <li>点 <strong>新增</strong></li>
+  <li><strong>名称</strong>：随便填，比如 <code>Agnes Hub</code></li>
+  <li><strong>位置</strong>：填下面这个地址</li>
+</ol>
 <table>
-  <tr><th>你的机型</th><th>要添加的套件源地址</th></tr>
+  <tr><th>你的机型</th><th>要填的「位置」</th></tr>
   {source_rows}
 </table>
-<p>在 DSM 里：<strong>套件中心 → 设置 → 套件来源 → 新增</strong>，把上面的地址粘进去。</p>
+<ol start="5">
+  <li>点 <strong>确定</strong></li>
+</ol>
+
+<p><strong>第 3 步 · 安装</strong></p>
+<p>添加成功后，切到套件中心的 <strong>「社群」</strong> 标签页（不是「所有套件」），
+就能看到 Agnes Hub，点「安装」即可。以后有新版本会直接在这里提示更新。</p>
 
 <div class="note">
-  <strong>如果提示「套件来源不受信任」</strong>：到
-  <strong>套件中心 → 设置 → 常规 → 信任层级</strong> 选「任何发行者」，再重新添加。
-  这是第三方未签名套件的统一门槛，与本套件无关。
+  <strong>为什么地址里没有架构信息</strong>：群晖 catalog 的条目里没有架构字段 ——
+  架构过滤是服务端按请求的 <code>arch</code> 参数做的。本套件源是 GitHub Pages
+  静态托管，做不到按参数返回不同内容，所以一个架构一份文件。本项目只分发
+  <strong>x86_64</strong>（覆盖 DS918+ 等 apollolake 平台的全部 Intel/AMD 机型）。
 </div>
 
 <h2>当前版本</h2>
@@ -203,11 +225,28 @@ def main():
     ap.add_argument("--icon", default="assets/ICON.PNG", help="图标源文件")
     ap.add_argument("--tag", default=None,
                     help="Release tag（默认 v<SPK 版本>，如 v1.0.2-0001）")
+    ap.add_argument("--arch", default=PRIMARY_ARCH,
+                    help="要纳入 catalog 的架构，逗号分隔；默认 %s，用 all 表示全部"
+                         % PRIMARY_ARCH)
     args = ap.parse_args()
 
-    spks = sorted(f for f in os.listdir(args.dist) if f.endswith(".spk"))
-    if not spks:
+    all_spks = sorted(f for f in os.listdir(args.dist) if f.endswith(".spk"))
+    if not all_spks:
         sys.exit("[ERROR] %s 下没有 .spk，先跑 tools/build_spk.py" % args.dist)
+
+    # 按文件名里的 -<arch>- 过滤。dist/ 里可能同时存在多个架构的包
+    # （build_spk.py --arch all 会产出两个），但本项目的分发只面向 x86_64。
+    if args.arch == "all":
+        spks = all_spks
+    else:
+        wanted = {a.strip() for a in args.arch.split(",") if a.strip()}
+        spks = [f for f in all_spks if any("-%s-" % a in f for a in wanted)]
+        skipped = [f for f in all_spks if f not in spks]
+        if skipped:
+            print("跳过（不在 --arch=%s 范围内）：%s" % (args.arch, "、".join(skipped)))
+    if not spks:
+        sys.exit("[ERROR] 没有匹配 --arch=%s 的 SPK，dist/ 里有：%s"
+                 % (args.arch, "、".join(all_spks)))
 
     os.makedirs(args.out, exist_ok=True)
 
