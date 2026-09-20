@@ -17,15 +17,6 @@ function timeAgo(ts) { const s = Math.floor(Date.now() / 1000) - ts; if (s < 60)
 
 const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, history: [], curHistoryId: null, messages: [], model: "", sending: false, imJobId: null };
 
-/* ==================== INIT ==================== */
-// 延迟到 DOM 就绪，避免 getElementById 返回 null
-window.addEventListener("DOMContentLoaded", () => {
-  checkChatAuth();
-  switchTab("chat");
-  renderImageView();
-  renderVideoView();
-});
-
 /* ==================== LOGIN ==================== */
 async function checkSession(){
   try{
