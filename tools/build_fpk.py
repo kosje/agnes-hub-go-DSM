@@ -88,14 +88,14 @@ case "$ARCH" in
 esac
 
 BIN=""
-for cand in "$APP_DIR/$APP_ID/$BIN_NAME" "$APP_DIR/$BIN_NAME" "$APP_DIR/app/$BIN_NAME"; do
+for cand in "$APP_DIR/$APP_ID/app/$BIN_NAME" "$APP_DIR/app/$BIN_NAME" "$APP_DIR/$BIN_NAME"; do
   if [ -x "$cand" ]; then
     BIN="$cand"
     break
   fi
 done
 if [ -z "$BIN" ]; then
-  echo "binary not found (checked: $APP_DIR/$APP_ID/$BIN_NAME, $APP_DIR/$BIN_NAME, $APP_DIR/app/$BIN_NAME)" > "$TRIM_TEMP_LOGFILE"
+  echo "binary not found (checked: $APP_DIR/$APP_ID/app/$BIN_NAME, $APP_DIR/app/$BIN_NAME, $APP_DIR/$BIN_NAME)" > "$TRIM_TEMP_LOGFILE"
   exit 1
 fi
 
