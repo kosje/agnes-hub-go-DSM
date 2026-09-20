@@ -24,6 +24,7 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 | `agnes-hub-go-linux-amd64` | 飞牛 fnOS / 通用 Linux x64 |
 | `agnes-hub-go-linux-arm64` | Linux ARM64 |
 | `agnes-hub-go-<版本>.fpk` | 飞牛 fnOS 应用中心安装包 |
+| `agnes-hub-<架构>-<版本>.spk` | 群晖 DSM 套件安装包（见第 12 节） |
 
 ---
 
@@ -283,6 +284,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agn
 | `-host` | `AGNES_HUB_HOST` | `127.0.0.1` | `0.0.0.0` 表示允许局域网访问 |
 | `-port` | `AGNES_HUB_PORT` | `4142` | 监听端口 |
 | `-data` | `AGNES_HUB_DATA` | 可执行文件旁的 `data` | 数据目录 |
+| `-no-selfupdate` | `AGNES_HUB_NO_SELFUPDATE` | 关闭 | 禁用内置自更新。由套件中心 / 系统包管理器负责升级时必须打开（群晖 SPK 启动时自动带上） |
 | `-version` | — | — | 打印版本后退出 |
 
 ---
@@ -484,7 +486,76 @@ python tools/deploy_nas.py --host <nas-host> --user <user>
 
 ---
 
-## 12. 已知边界与后续
+## 12. 部署到群晖 DSM
+
+```bash
+# 1. 交叉编译（源码零改动，Go 自带交叉编译，不需要 CGO）
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-arm64 .
+
+# 2. 打包（产出 dist/agnes-hub-x86_64-1.0.2-0001.spk 与 dist/agnes-hub-armv8-1.0.2-0001.spk）
+python tools/build_spk.py
+SPK_BUILD=2 python tools/build_spk.py    # 换构建号；群晖要求每次发布构建号递增
+```
+
+### 选哪个 SPK
+
+群晖的「套件架构」不等于 CPU 品牌，要按机型对应的 **Package Arch** 选：
+
+| SPK | 适用机型（平台代号） |
+| --- | --- |
+| `agnes-hub-x86_64-*.spk` | apollolake、avoton、braswell、broadwell 系列、bromolow、cedarview、coffeelake、denverton、geminilake、grantley、kvmx64、purley、skylaked、v1000 —— 全部 Intel / AMD 64 位机型 |
+| `agnes-hub-armv8-*.spk` | rtd1296、rtd1619、rtd1619b、armada37xx —— ARM64 机型（如 DS223 / DS423 系列） |
+
+不确定的话，在 DSM 里执行 `cat /proc/syno_platform`，或到「控制面板 → 信息中心」看 CPU 型号。
+架构不匹配时 DSM 会直接拒绝安装，不要改文件名或混用包内二进制。
+
+> 32 位的 armv7（alpine / alpine4k）与 armada370 等老机型不在支持范围内。
+
+### 安装
+
+1. DSM → **套件中心** → 右上角 **手动安装** → 选择与 NAS 架构匹配的 `.spk`。
+2. 若提示「套件来源不受信任」：到 **套件中心 → 设置 → 常规 → 信任层级** 选「任何发行者」，
+   然后重新安装。这是第三方未签名套件的统一门槛，与包本身无关。
+3. 安装完成后套件会自动启动。点套件中心的「打开」，或直接访问
+   `http://<NAS 地址>:4142/console`，初始密码 `admin123`，**请立即修改**。
+4. 客户端接入填 `http://<NAS 地址>:4142/v1`，模型名 `agnes-auto`。
+
+### 端口与数据
+
+| 项 | 位置 |
+| --- | --- |
+| 监听端口 | `4142`（固定，客户端配置依赖它） |
+| 控制台 | `http://<NAS 地址>:4142/console` |
+| 数据目录 | `/var/packages/agnes-hub/var/data`（`accounts.json` 内含上游 API Key） |
+| 日志 | `/var/packages/agnes-hub/var/agnes-hub.log` |
+
+数据目录在**升级时保留**，只有卸载套件才会连同删除。升级或卸载前请自行备份
+`accounts.json` 与 `downstream_keys.json`。
+
+### 与飞牛 fpk 的三处结构性差异
+
+- **一个 SPK 只装一种架构**。群晖官方要求不要把多平台二进制打进同一个 spk，
+  所以 `build_spk.py` 按架构循环产出多个包，而不是像 fpk 那样在脚本里用 `uname -m` 选。
+- **`INFO` 的值必须带双引号**（`package="agnes-hub"`），且 `version` 必须是
+  「功能号-构建号」（`1.0.2-0001`）。构建号每次发布要递增，否则套件中心认为版本没变、不提示升级。
+- **生命周期脚本是固定文件名**：`scripts/start-stop-status` 加六个钩子
+  （`preinst` / `postinst` / `preuninst` / `postuninst` / `preupgrade` / `postupgrade`），
+  六个钩子缺一个就会被判「套件损坏」。数据目录变量是 `SYNOPKG_PKGVAR`，不是 `TRIM_PKGVAR`。
+
+### 运行身份与自更新
+
+套件以 DSM 创建的 `agnes-hub` 专用账户运行（`conf/privilege` 里 `run-as: package`），不是 root ——
+服务监听 4142（>1024）、不需要改系统文件，所以没有提权需求。
+
+**群晖版禁用内置自更新**：`scripts/start-stop-status` 启动时带 `-no-selfupdate`。
+因为套件由套件中心管理，`INFO` 里登记了 `package.tgz` 的 checksum；若允许进程内替换二进制，
+套件的实际内容就会与已安装版本对不上，下次升级必然冲突。群晖上升级请走
+**套件中心 → 手动安装**，覆盖安装新版本的 SPK。
+
+---
+
+## 13. 已知边界与后续
 
 - **官方限流表的准确性**：表里的数字来自官方文档，真实边界需逐账号实测
   （已有 `rpm_overrides` 作为兜底）。
@@ -492,4 +563,4 @@ python tools/deploy_nas.py --host <nas-host> --user <user>
   网关内阻塞等待，需实测上游的实际出片时延再定值。
 - **多账号提速有前提**：见第 10 节，串行单任务拿不到收益。
 - **未做自启 / 服务化**：Windows 端按约定只提供 bat 按需启动，关闭窗口即停止；
-  飞牛端交给应用中心托管。
+  飞牛端交给应用中心托管；群晖端交给套件中心托管（含开机自启与启停按钮）。

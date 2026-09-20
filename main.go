@@ -49,6 +49,8 @@ func main() {
 	host := flag.String("host", env("AGNES_HUB_HOST", "127.0.0.1"), "监听地址（0.0.0.0 表示允许局域网访问）")
 	port := flag.String("port", env("AGNES_HUB_PORT", "4142"), "监听端口")
 	dataDir := flag.String("data", env("AGNES_HUB_DATA", ""), "数据目录（默认 ./data）")
+	noSelfUpdate := flag.Bool("no-selfupdate", env("AGNES_HUB_NO_SELFUPDATE", "") != "",
+		"禁用内置自更新（由套件中心 / 系统包管理器负责升级时使用）")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
 	flag.Parse()
 
@@ -84,17 +86,24 @@ func main() {
 
 	// 初始化自更新器
 	exe, _ := os.Executable()
+	// 检查频率：12 小时。自更新是「有就换」，没必要更勤；
+	// 控制台上也可以随时手动点「检查更新」。
+	updRepo, checkInterval := "my788525/agnes-hub-go", 12*time.Hour
+	if *noSelfUpdate {
+		// 群晖套件等场景：二进制由套件中心管理，套件 INFO 里登记了 package.tgz 的 checksum。
+		// 若允许进程内替换二进制，套件的「实际内容」与「已安装版本」就会不一致，
+		// 下次套件中心校验或升级必然冲突 —— 所以这里彻底关掉检查，而不是只忽略检查结果。
+		updRepo, checkInterval = "", 0
+	}
 	updCfg := updater.Config{
-		Repo:       "my788525/agnes-hub-go",
-		BinaryName: "agnes-hub-go",
-		DataDir:    *dataDir,
-		// 检查频率：12 小时。自更新是「有就换」，没必要更勤；
-		// 控制台上也可以随时手动点「检查更新」。
-		CheckInterval: 12 * time.Hour,
+		Repo:          updRepo,
+		BinaryName:    "agnes-hub-go",
+		DataDir:       *dataDir,
+		CheckInterval: checkInterval,
 	}
 	upd := updater.New(updCfg, version, exe, nil)
 	srv.SetUpdater(upd)
-	upd.StartBackground(ctx, updCfg.CheckInterval)
+	upd.StartBackground(ctx, checkInterval)
 
 	// 应用完更新后要真的退出：光置一个标志位没人看，
 	// 必须有人把它翻译成取消信号，进程才会走到优雅关闭。
