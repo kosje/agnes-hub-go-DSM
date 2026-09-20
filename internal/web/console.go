@@ -79,6 +79,11 @@ func (s *Server) consoleRoutes() {
 
 	// 网页端：聊天 / 生图 / 生视频（免第三方 AI Coding 积分）
 	m.HandleFunc("GET /chat", s.handleChat)
+	m.HandleFunc("GET /chat.main.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", fmt.Sprint(len(chatMainJS)))
+		_, _ = w.Write(chatMainJS)
+	})
 	m.HandleFunc("POST /api/chat/login", s.apiChatLogin)
 	m.HandleFunc("GET /api/chat/session", s.apiChatSession)
 }
