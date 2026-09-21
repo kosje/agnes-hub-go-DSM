@@ -557,9 +557,38 @@ type PickResult struct {
 	Bound   *config.Account
 }
 
+// pickWithPriority 按区域优先级选择账号：先试首选区域的健康账号，再 fallback 另一区域。
+func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requiredModel string) *config.Account {
+	s := h.Settings()
+	primaryCN := s.RegionPriority != "com_first" // 默认 cn_first
+
+	primary, fallback := func() []*config.Account {
+		var out []*config.Account
+		for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
+			if config.IsCNHost(a.BaseURL) == primaryCN {
+				out = append(out, a)
+			}
+		}
+		return out
+	}(), func() []*config.Account {
+		var out []*config.Account
+		for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
+			if config.IsCNHost(a.BaseURL) != primaryCN {
+				out = append(out, a)
+			}
+		}
+		return out
+	}()
+
+	if best := bestOf(h, primary, poolClass, ""); best != nil {
+		return best
+	}
+	return bestOf(h, fallback, poolClass, "")
+}
+
 // Pick 选择账号。
 //
-// 优先级：钉死账号 > 粘性绑定（未溢出）> 预计等待最短。
+// 优先级：钉死账号 > 粘性绑定（未溢出）> 预计等待最短（按区域优先级）。
 // 全部账号处于冷却时**不退化为报错**，而是等最早解冻的那个 ——
 // 无人值守场景下「等一下」远好于「任务断掉」。
 func (h *Hub) Pick(sessionKey, poolClass, pinned, requiredModel string, exclude map[string]bool) (PickResult, error) {
@@ -606,11 +635,12 @@ func (h *Hub) Pick(sessionKey, poolClass, pinned, requiredModel string, exclude 
 		return PickResult{Account: alt, Penalty: h.PenaltyRemaining(alt.ID), Spilled: true, Bound: bound}, nil
 	}
 
-	final := poolCandidates
-	if len(final) == 0 {
-		// 忽略 exclude 再来一轮：单账号 / 全员冷却时，等待远好于直接失败
-		final = healthy(h.Candidates(poolClass, nil, requiredModel))
-		if len(final) == 0 {
+	// 按区域优先级选择：先试首选区域，再 fallback
+	chosen := h.pickWithPriority(poolClass, exclude, requiredModel)
+	if chosen == nil {
+		// 兜底：忽略 exclude 再查一轮（全员冷却时等最早解冻）
+		chosen = h.pickWithPriority(poolClass, nil, requiredModel)
+		if chosen == nil {
 			all := h.Candidates(poolClass, nil, requiredModel)
 			if len(all) == 0 {
 				return PickResult{}, fmt.Errorf("%w：池分类 %s 下没有可用账号（未配置 / 已停用 / 未声明该模态）",
@@ -628,10 +658,6 @@ func (h *Hub) Pick(sessionKey, poolClass, pinned, requiredModel string, exclude 
 		}
 	}
 
-	chosen := bestOf(h, final, poolClass, "")
-	if chosen == nil {
-		return PickResult{}, fmt.Errorf("%w：池分类 %s 无可用账号", ErrNoCapacity, poolClass)
-	}
 	if sessionKey != "" {
 		h.store.Bind(sessionKey, chosen.ID)
 	}
@@ -835,18 +861,6 @@ func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 		acc.Stats.Errors++
 		acc.Stats.LastError = truncate(reason, 200) +
 			fmt.Sprintf("（已熔断，%s 后自动复活低速试探）", reviveAfter)
-		return true
-	})
-	h.Reload()
-}
-
-// UpdateAccountBaseURL 切换某账号的 base_url（401/403 自动换站后用）。
-// 成功换站后调用，让后续请求直接走已验证的站点，避免重复探测。
-func (h *Hub) UpdateAccountBaseURL(accountID string, newBaseURL string) {
-	h.store.MutateAccount(accountID, func(acc *config.Account) bool {
-		acc.BaseURL = newBaseURL
-		acc.Enabled = true // 换站成功说明账号本身有效，恢复启用
-		acc.Stats.LastError = ""
 		return true
 	})
 	h.Reload()

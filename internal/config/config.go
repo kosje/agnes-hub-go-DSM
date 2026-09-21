@@ -51,6 +51,11 @@ const (
 	CNBaseURL      = "https://api.agnes-ai.cn/v1"
 )
 
+// IsCNHost 判断 base_url 是否属于中国站（agnes-ai.cn）。
+func IsCNHost(baseURL string) bool {
+	return strings.Contains(strings.ToLower(baseURL), "agnes-ai.cn")
+}
+
 // ---------------------------------------------------------------------------
 // 数据模型
 // ---------------------------------------------------------------------------

@@ -80,39 +80,6 @@ func UpstreamRoot(a *config.Account) string {
 	return strings.TrimRight(base, "/")
 }
 
-// AlternateBaseURL 返回「另一站点」的 base_url（用于 401/403 自动换站重试）。
-// 优先级：region_priority=cn_first → 当前是 cn 则切 com；com_first → 当前是 com 则切 cn。
-// 默认 cn_first。
-func AlternateBaseURL(a *config.Account, regionPriority string) string {
-	currentRoot := UpstreamRoot(a)
-	isCN := strings.Contains(currentRoot, "agnes-ai.cn")
-	_, isCom := strings.Contains(currentRoot, "agnes-ai.com"), true
-	_ = isCom
-
-	// 决定目标站点
-	targetIsCN := false
-	switch {
-	case isCN:
-		// 当前在 cn：若 com 优先则切 com，否则也切 com（cn 失败时唯一备选）
-		targetIsCN = false
-	case strings.Contains(currentRoot, "agnes-ai.com"):
-		// 当前在 com：若 cn 优先则切 cn，否则也切 cn（com 失败时唯一备选）
-		targetIsCN = true
-	default:
-		// 未知 base_url：按优先级选
-		switch regionPriority {
-		case "com_first":
-			targetIsCN = false
-		default: // cn_first
-			targetIsCN = true
-		}
-	}
-	if targetIsCN {
-		return config.CNBaseURL
-	}
-	return config.DefaultBaseURL
-}
-
 // UpstreamURL 拼接上游完整 URL。
 func UpstreamURL(a *config.Account, path string) string {
 	root := UpstreamRoot(a)
@@ -298,30 +265,6 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		}
 
 		exclude[account.ID] = true
-
-		// 401/403 凭据被拒：先尝试「同一账号 + 另一站点」再熔断。
-		// 同一个 API Key 在国内/国际站点各自鉴权，某站风控严时会 403，
-		// 切到另一站往往能救回。若换站也失败才走正常换账号/熔断流程。
-		if AuthFailStatus[result.Status] {
-			altURL := AlternateBaseURL(account, s.RegionPriority)
-			if altURL != "" && !strings.EqualFold(altURL, account.BaseURL) && !strings.Contains(altURL, account.BaseURL) {
-				altAccount := *account
-				altAccount.BaseURL = altURL
-				altResult, _, altErr := attemptOnce(ctx, h, client, &altAccount, opts, body, modelUsed, totalWait, attempt+1)
-				if altErr == nil && altResult.Status < 400 {
-					// 换站成功：更新账号的 base_url，后续请求直接走有效站点
-					h.UpdateAccountBaseURL(account.ID, altURL)
-					h.NoteSuccess(account)
-					h.OnSuccess(account, opts.PoolClass)
-					h.Metrics.WaitMS.Add(altResult.WaitMS)
-					return altResult, nil
-				}
-				if altErr != nil {
-					h.NoteError(account, fmt.Sprintf("换站 %s 失败: %v", altURL, altErr))
-				}
-			}
-		}
-
 		if attempt < retryMax {
 			sleepBackoff(ctx, s, attempt)
 			continue

@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.6"
+var version = "1.0.7"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
