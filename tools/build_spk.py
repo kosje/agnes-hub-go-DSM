@@ -60,6 +60,12 @@ BUNDLE_DIR = os.path.join(ROOT, "spk-bundle")
 
 APP_ID = "agnes-hub"
 SERVICE_PORT = 4142
+# DSM 桌面应用的 ID，同时用于 INFO 的 dsmappname 与 ui/config 的键（两处必须一致）。
+# 不带宽字符：参考的真实第三方套件（homebridge / PeerBanHelper / TorrServer /
+# 百度网盘）用的都是 SYNO.SDS.Xxx 或 vendor.app 形式，没有一家用连字符。
+DSM_APP_NAME = "SYNO.SDS.agneshub.Application"
+# 桌面图标点开后的落地路径（管理控制台）
+DSM_APP_URL = "/console"
 OS_MIN_VER = "7.0-40000"
 MAINTAINER = "kosje"
 MAINTAINER_URL = "https://github.com/kosje/agnes-hub-go-DSM"
@@ -397,17 +403,88 @@ def _box_resize(src_w, src_h, src, dst_w, dst_h):
     return out
 
 
-def make_icon_set(src_png, targets):
-    """从 assets/ICON.PNG 生成任意尺寸的方形图标。
+def _bilinear_resize(src_w, src_h, src, dst_w, dst_h):
+    """双线性放大。按预乘 alpha 插值，避免透明边缘混出暗边。
 
-    源图是「左侧方形 App 图标 + 右侧标语文字」的横幅（当前 270×114）。
-    方形图标就贴在左上角，所以取 min(宽,高) 作为边长从 (0,0) 裁切。
-    若以后把源图换成真正的方形图标，这个规则会自然退化为「整图」。
+    为什么不用 _box_resize 放大：整数倍放大时面积平均会退化成最近邻，
+    源图 64→256 会得到 4 像素见方的方块台阶。图标源只有 64×64，
+    放大必须走插值才能平滑。
+    """
+    out = bytearray(dst_w * dst_h * 4)
+    for ty in range(dst_h):
+        sy = (ty + 0.5) * src_h / dst_h - 0.5
+        y0 = max(0, min(src_h - 1, int(sy)))
+        y1 = min(src_h - 1, y0 + 1)
+        fy = max(0.0, min(1.0, sy - y0))
+        for tx in range(dst_w):
+            sx = (tx + 0.5) * src_w / dst_w - 0.5
+            x0 = max(0, min(src_w - 1, int(sx)))
+            x1 = min(src_w - 1, x0 + 1)
+            fx = max(0.0, min(1.0, sx - x0))
+
+            ar = ag = ab = aa = 0.0
+            for px_, py_, wgt in ((x0, y0, (1 - fx) * (1 - fy)),
+                                  (x1, y0, fx * (1 - fy)),
+                                  (x0, y1, (1 - fx) * fy),
+                                  (x1, y1, fx * fy)):
+                if wgt <= 0:
+                    continue
+                i = (py_ * src_w + px_) * 4
+                a = src[i + 3] / 255.0
+                ar += src[i] * a * wgt
+                ag += src[i + 1] * a * wgt
+                ab += src[i + 2] * a * wgt
+                aa += src[i + 3] * wgt
+
+            o = (ty * dst_w + tx) * 4
+            if aa <= 0:
+                out[o] = out[o + 1] = out[o + 2] = out[o + 3] = 0
+            else:
+                out[o] = min(255, int(round(ar * 255.0 / aa)))
+                out[o + 1] = min(255, int(round(ag * 255.0 / aa)))
+                out[o + 2] = min(255, int(round(ab * 255.0 / aa)))
+                out[o + 3] = min(255, int(round(aa)))
+    return out
+
+
+def _png_colortype(path):
+    """读 PNG 的 IHDR 取颜色类型：6=RGBA，2=RGB（无 alpha 通道）。"""
+    with open(path, "rb") as f:
+        head = f.read(29)
+    return struct.unpack(">IIBBBBB", head[16:29])[3]
+
+
+def _key_out_black(w, h, px, threshold=16):
+    """把纯黑背景抠成透明（in-place 返回新的 bytearray）。
+
+    上游的 assets/ICON.PNG 与 ICON_256.PNG 是「黑底 + logo」的 RGB 图，没有
+    alpha 通道 —— 直接拿来当图标，套件中心里会显示成一个黑方块。
+    这里按亮度键控：max(r,g,b) 小于阈值就判为背景。
+
+    实测该图背景是纯 0、logo 最暗也有 160，中间没有过渡像素，所以简单阈值就够；
+    边缘的抗锯齿交给后续 _box_resize 的面积平均去生成。
+    """
+    out = bytearray(px)
+    for i in range(0, w * h * 4, 4):
+        if max(out[i], out[i + 1], out[i + 2]) < threshold:
+            out[i + 3] = 0
+    return out
+
+
+def make_icon_set(src_png, targets):
+    """从图标源文件生成任意尺寸的方形图标。
+
+    源图应为正方形（当前 assets/ICON_256.PNG 是 256×256）。仍保留
+    「取 min(宽,高) 从 (0,0) 裁切」的规则，以防换成横幅图时不至于出错。
 
     targets 是 [(边长, 输出路径), ...]。群晖 SPK 要 64/256，
-    套件中心的缩略图要 72/256，所以尺寸做成参数而不是写死。
+    套件中心的缩略图要 72/256，桌面图标要 256，所以尺寸做成参数而不是写死。
     """
     w, h, px = _png_decode_rgba(src_png)
+    keyed = _png_colortype(src_png) == 2
+    if keyed:
+        # RGB 源没有 alpha，黑色是事实上的背景色，抠掉
+        px = _key_out_black(w, h, px)
     side = min(w, h)
     if side < 16:
         sys.exit("[ERROR] %s 尺寸过小（%dx%d），无法生成图标" % (src_png, w, h))
@@ -419,7 +496,11 @@ def make_icon_set(src_png, targets):
         crop[y * side * 4:(y + 1) * side * 4] = px[s:s + side * 4]
 
     for size, dst in targets:
-        scaled = _box_resize(side, side, crop, size, size)
+        if size > side:
+            # 放大必须插值：源图只有 side×side，整数倍面积平均会退化成最近邻
+            scaled = _bilinear_resize(side, side, crop, size, size)
+        else:
+            scaled = _box_resize(side, side, crop, size, size)
         _png_encode_rgba(dst, size, size, scaled)
     return w, h, side
 
@@ -531,6 +612,12 @@ def build_info(arch, spk_ver, checksum, extractsize_kb):
         'adminprotocol="http"',
         'adminport="%d"' % SERVICE_PORT,
         'adminurl="console"',
+        # DSM 桌面图标：dsmuidir 指向包内的 ui/ 目录，dsmappname 是应用 ID
+        # （必须与 ui/config 里的键一致）。reloadui 让安装后桌面自动刷新，
+        # 不用手动注销重登就能看到图标。
+        'dsmuidir="ui"',
+        'dsmappname="%s"' % DSM_APP_NAME,
+        'reloadui="yes"',
         # 4142 是固定端口（客户端配置依赖它），端口冲突时让服务自己启动失败
         # 并写日志，好过安装阶段直接被拒。
         'checkport="no"',
@@ -585,7 +672,27 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
     make_icons(icon_src, os.path.join(d, "PACKAGE_ICON.PNG"),
                os.path.join(d, "PACKAGE_ICON_256.PNG"))
 
-    # 5. INFO
+    # 5. DSM 桌面图标（ui/）
+    #    只有 INFO 里的 dsmuidir/dsmappname 还不够，必须有 ui/config 把这个
+    #    「应用」定义出来 —— 否则套件只出现在套件中心，DSM 桌面上不会有图标。
+    ui_images = os.path.join(d, "ui", "images")
+    os.makedirs(ui_images, exist_ok=True)
+    make_icon_set(icon_src, [(256, os.path.join(ui_images, "icon_256.png"))])
+    with open(os.path.join(d, "ui", "config"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({".url": {DSM_APP_NAME: {
+            "title": "Agnes Hub",
+            "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关",
+            "icon": "images/icon_256.png",
+            "type": "url",
+            "protocol": "http",
+            "port": str(SERVICE_PORT),
+            "url": DSM_APP_URL,
+            "allUsers": True,
+            "grantPrivilege": "local",
+        }}}, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+
+    # 6. INFO
     extractsize_kb = (os.path.getsize(binary_src) + 1023) // 1024
     _write(os.path.join(d, "INFO"), build_info(arch, spk_ver, md5, extractsize_kb), mode=0o644)
 
@@ -604,6 +711,7 @@ def build_spk(bundle, out_path):
         _add_file(tar, os.path.join(bundle, "package.tgz"), "package.tgz", mode=0o644)
         _add_dir_recursive(tar, os.path.join(bundle, "scripts"), "scripts")
         _add_dir_recursive(tar, os.path.join(bundle, "conf"), "conf")
+        _add_dir_recursive(tar, os.path.join(bundle, "ui"), "ui")
         _add_file(tar, os.path.join(bundle, "PACKAGE_ICON.PNG"), "PACKAGE_ICON.PNG", mode=0o644)
         _add_file(tar, os.path.join(bundle, "PACKAGE_ICON_256.PNG"), "PACKAGE_ICON_256.PNG", mode=0o644)
     validate_spk(out_path)
@@ -621,6 +729,8 @@ def validate_spk(path):
         "scripts/preinst", "scripts/postinst", "scripts/preuninst",
         "scripts/postuninst", "scripts/preupgrade", "scripts/postupgrade",
         "conf/privilege", "PACKAGE_ICON.PNG", "PACKAGE_ICON_256.PNG",
+        # DSM 桌面图标：缺了不会导致安装失败，但桌面上不会有图标
+        "ui/config", "ui/images/icon_256.png",
     }
     # r: 明确只接受未压缩 tar，避免 r:* 又把错误的 gzip 外层悄悄放过。
     with tarfile.open(path, mode="r:") as outer:
@@ -682,6 +792,9 @@ def main():
 
     go_version = read_version()
     spk_ver = spk_version(go_version)
+    # 图标源用 assets/ICON.PNG（64×64）。别用 ICON_256.PNG：实测它就是 ICON.PNG
+    # 用最近邻放大 4 倍的结果（逐像素零差异），本身没有任何额外信息，拿它当源
+    # 只会把 4 像素的方块台阶原样带进产物。放大到 256 时由 _bilinear_resize 平滑处理。
     icon_src = os.path.join(ROOT, "assets", "ICON.PNG")
     if not os.path.exists(icon_src):
         sys.exit("[ERROR] 缺少图标源文件 assets/ICON.PNG")
@@ -697,7 +810,7 @@ def main():
     os.makedirs(BUNDLE_DIR, exist_ok=True)
     print("Go 版本号  : %s" % go_version)
     print("套件版本号 : %s" % spk_ver)
-    print("图标源     : assets/ICON.PNG")
+    print("图标源     : %s" % os.path.relpath(icon_src, ROOT).replace("\\", "/"))
     print()
 
     for arch, binary_name in targets:

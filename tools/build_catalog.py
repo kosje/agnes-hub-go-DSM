@@ -52,12 +52,10 @@ PRIMARY_ARCH = "x86_64"
 
 # 套件中心里显示的变更说明（HTML）。发新版时改这里。
 CHANGELOG = (
-    "同步上游 my788525/agnes-hub-go 至 v1.0.9+amd（26 个提交）。<br>"
-    "· 新增 AMD 免费 API 支持、站点优先级自动切换<br>"
-    "· 新增 Prometheus /metrics、请求超时与 402 分流<br>"
-    "· 新增意图 LRU 缓存、429 批量落盘、HTTP 客户端单例化<br>"
-    "· 控制台重写，聊天页与后台均适配移动端<br>"
-    "· 图标换为方形（64×64 / 256×256）"
+    "修复图标与桌面集成。<br>"
+    "· 套件图标去掉黑底，改为透明背景<br>"
+    "· 256 图标改用双线性放大，消除方块台阶<br>"
+    "· 新增 DSM 桌面图标，可从桌面直接打开控制台"
 )
 
 CATALOG_FIELDS_NOTE = "SynoCommunity/spkrepo 的 build_entry_data 与 sspks 的字段清单"

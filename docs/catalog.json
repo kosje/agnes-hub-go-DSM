@@ -2,15 +2,15 @@
   "packages": [
     {
       "package": "agnes-hub",
-      "version": "1.0.9-0001",
+      "version": "1.0.9-0002",
       "dname": "Agnes Hub",
       "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生 / 生图 / 生视频；FIFO 严格节拍限流、软粘性溢出、二维自适应校准、熔断自动复活。数据保存在套件目录内，全 JSON 文件，免 SSH 即可备份迁移。",
       "price": 0,
       "download_count": 0,
       "recent_download_count": 0,
-      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.9-0001.spk",
-      "size": 2826240,
-      "md5": "a0f022c3ec541594dd6562f2a1968aa9",
+      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.9-0002.spk",
+      "size": 2887680,
+      "md5": "cc81fb562044bfec175d62ae54dc2a25",
       "thumbnail": [
         "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-72.png"
       ],
@@ -30,7 +30,7 @@
       "distributor": "kosje",
       "distributor_url": "https://github.com/kosje/agnes-hub-go-DSM",
       "support_url": "https://github.com/kosje/agnes-hub-go-DSM/issues",
-      "changelog": "同步上游 my788525/agnes-hub-go 至 v1.0.9+amd（26 个提交）。<br>· 新增 AMD 免费 API 支持、站点优先级自动切换<br>· 新增 Prometheus /metrics、请求超时与 402 分流<br>· 新增意图 LRU 缓存、429 批量落盘、HTTP 客户端单例化<br>· 控制台重写，聊天页与后台均适配移动端<br>· 图标换为方形（64×64 / 256×256）",
+      "changelog": "修复图标与桌面集成。<br>· 套件图标去掉黑底，改为透明背景<br>· 256 图标改用双线性放大，消除方块台阶<br>· 新增 DSM 桌面图标，可从桌面直接打开控制台",
       "thirdparty": true,
       "category": 0,
       "subcategory": 0,
