@@ -66,6 +66,7 @@ func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /healthz", s.handleHealth)
 	m.HandleFunc("GET /v1/models", s.handleModels)
+	m.HandleFunc("GET /metrics", s.handleMetrics)
 
 	m.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		s.handleTextish(w, r, "/v1/chat/completions")
