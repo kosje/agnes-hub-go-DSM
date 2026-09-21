@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.8"
+var version = "1.0.9"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -184,7 +184,7 @@ func main() {
 		cancel()
 		wg.Wait()
 	}
-	fmt.Println("agnes-hub-go 已停止。")
+	fmt.Println("baiPiao-hub 已停止。")
 }
 
 // buildListeners 按平台拆分到 listener_linux.go / listener_other.go：

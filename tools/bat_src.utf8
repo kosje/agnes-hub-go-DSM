@@ -2,15 +2,15 @@
 chcp 936 >nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
-title agnes-hub-go
+title baipiao-hub
 
-set "BIN=agnes-hub-go.exe"
+set "BIN=baipiao-hub.exe"
 set "HOST=127.0.0.1"
 set "PORT=4142"
 set "DATADIR=%~dp0data"
 
 echo ============================================================
-echo   agnes-hub-go   Agnes AI 多账号聚合中转 + RPM 限流排队网关
+echo   baipiao-hub   Agnes AI 多账号聚合中转 + RPM 限流排队网关
 echo ============================================================
 echo.
 
@@ -79,6 +79,6 @@ ver >nul
 set "CODE=%ERRORLEVEL%"
 
 echo.
-echo agnes-hub-go 已退出，退出码 %CODE%。
+echo baipiao-hub 已退出，退出码 %CODE%。
 pause
 exit /b %CODE%

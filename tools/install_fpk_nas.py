@@ -12,7 +12,7 @@
     4. D:/work/M365-fpk/.nas_pass（历史位置兜底）
 
 用法：
-    python tools/install_fpk_nas.py --host nas.lianu.com --fpk dist/agnes-hub-go-1.0.3.fpk
+    python tools/install_fpk_nas.py --host nas.lianu.com --fpk dist/baipiao-hub-1.0.3.fpk
 """
 import argparse
 import os
@@ -100,7 +100,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="nas.lianu.com")
     ap.add_argument("--user", default="admin")
-    ap.add_argument("--fpk", default=os.path.join(ROOT, "dist", "agnes-hub-go-1.0.3.fpk"))
+    ap.add_argument("--fpk", default=os.path.join(ROOT, "dist", "baipiao-hub-1.0.3.fpk"))
     ap.add_argument("--install-timeout", type=int, default=240)
     args = ap.parse_args()
 
@@ -119,9 +119,9 @@ def main():
 
     print("\n[2/5] 安装前状态 ...")
     show("已装应用目录：", nas.sudo("ls -d /vol1/@appcenter/%s 2>/dev/null && "
-                                    "grep -ao '1\\.0\\.[0-9]*' $(find /vol1/@appcenter/%s -name 'agnes-hub-go*' -type f 2>/dev/null | head -1) 2>/dev/null | head -1 "
+                                    "grep -ao '1\\.0\\.[0-9]*' $(find /vol1/@appcenter/%s -name 'baipiao-hub*' -type f 2>/dev/null | head -1) 2>/dev/null | head -1 "
                                     "|| echo '（未安装或无二进制）'" % (APP_ID, APP_ID)))
-    show("运行中进程：", nas.sudo("pgrep -af agnes-hub-go | head -3 || echo '（无）'"))
+    show("运行中进程：", nas.sudo("pgrep -af baipiao-hub | head -3 || echo '（无）'"))
     show("健康检查：", nas.sudo("curl -s -m 3 http://localhost:4142/healthz || echo '（无响应）'"))
 
     print("\n[3/5] 上传 fpk 到 /tmp ...")
@@ -135,9 +135,9 @@ def main():
     show("安装输出：", out)
 
     print("\n[5/5] 安装后验证 ...")
-    show("运行中进程：", nas.sudo("pgrep -af agnes-hub-go | head -3 || echo '（无）'"))
+    show("运行中进程：", nas.sudo("pgrep -af baipiao-hub | head -3 || echo '（无）'"))
     show("健康检查：", nas.sudo("curl -s -m 3 http://localhost:4142/healthz || echo '（无响应）'"))
-    show("新版本串：", nas.sudo("for f in $(find /vol1/@appcenter/%s /var/apps/%s -name 'agnes-hub-go*' -type f 2>/dev/null); do "
+    show("新版本串：", nas.sudo("for f in $(find /vol1/@appcenter/%s /var/apps/%s -name 'baipiao-hub*' -type f 2>/dev/null); do "
                                 "printf '%%s: ' \"$f\"; grep -ao '1\\.0\\.[0-9]*' \"$f\" | head -1; done" % (APP_ID, APP_ID)))
     show("桌面快捷方式文件：", nas.sudo("find /vol1/@appcenter/%s /var/apps/%s -path '*ui/config' 2>/dev/null | head -3; "
                                         "find /vol1/@appcenter/%s /var/apps/%s -path '*ui/images*' -name 'icon-*.png' 2>/dev/null | head -4" % (APP_ID, APP_ID, APP_ID, APP_ID)))

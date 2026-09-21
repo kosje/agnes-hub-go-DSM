@@ -520,7 +520,7 @@ func (h *Hub) SessionKey(headers map[string]string, downstreamKey string) string
 	if mode == "none" {
 		return ""
 	}
-	session := strings.TrimSpace(headers["x-agnes-session"])
+	session := strings.TrimSpace(headers["x-baipiao-session"])
 	if session == "" {
 		session = strings.TrimSpace(headers["x-session-id"])
 	}

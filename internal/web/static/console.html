@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>agnes-hub 控制台</title>
+<title>baiPiao-hub 控制台</title>
 <style>
   :root{
     --bg:#f6f7f9; --panel:#ffffff; --line:#e4e7ec; --ink:#1c2430; --muted:#65717f;
@@ -122,8 +122,8 @@ function renderLogin(mustChange){
   document.getElementById("app").innerHTML = `
   <div class="login">
     <div class="card">
-      <h1>agnes-hub 控制台</h1>
-      <p class="muted">Agnes AI 多账号聚合中转 · RPM 排队限流网关</p>
+      <h1>baiPiao-hub 控制台</h1>
+      <p class="muted">白嫖 Hub 聚合网关 · RPM 排队限流</p>
       <div id="toast" class="hide"></div>
       <label>管理员密码</label>
       <input id="pw" type="password" placeholder="请输入管理员密码" autocomplete="current-password">
@@ -157,7 +157,7 @@ function renderShell(){
   <div style="max-width:1240px;margin:0 auto;padding:20px">
     <div class="spread" style="margin-bottom:14px">
       <div>
-        <h1>agnes-hub 控制台</h1>
+        <h1>baiPiao-hub 控制台</h1>
         <div class="muted" id="subline">加载中…</div>
       </div>
       <div class="row">
@@ -258,7 +258,7 @@ function viewOverview(){
         <div class="muted" style="font-size:11px">${esc(a.access_type)}</div></td>
       <td>${a.enabled?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}
         ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却 ${Math.round(a.penalty_remaining_ms/1000)}s</span>`:""}
-        ${a.consecutive_failures?a.stats?.errors?`<span class="pill warn" title="连续失败 ${a.consecutive_failures}">连续失败 ${a.consecutive_failures}</span>`:"":'')}</td>
+        ${a.consecutive_failures && a.stats?.errors ? `<span class="pill warn" title="连续失败 ${a.consecutive_failures}">连续失败 ${a.consecutive_failures}</span>` : ''}</td>
       <td style="min-width:210px">${bars||'<span class="muted">无可用池</span>'}${declared}</td>
       <td class="mono">${num(a.stats?.requests)} / 错误 ${num(a.stats?.errors)} / 限流 ${num(a.stats?.rate_limited)}</td>
     </tr>`;
@@ -291,7 +291,7 @@ function manifestEditor(id, manifest){
   return MODALITIES.map(mod=>`
     <div>
       <label>${mod} 模型（逗号分隔；<b>留空 = 明示不支持该模态</b>）</label>
-      <input id="${id}_${mod}" value="${esc((m[mod]||[]).join(", "))}" placeholder="例如 agnes-2.5-flash, agnes-2.0-flash">
+      <input id="${id}_${mod}" value="${esc((m[mod]||[]).join(", "))}" placeholder="例如 default-model, default-model">
     </div>`).join("");
 }
 function viewAccounts(){
@@ -328,9 +328,9 @@ function viewAccounts(){
     <div class="card">
       <h2>添加账号</h2>
       <div class="grid">
-        <div><label>名称</label><input id="aName" placeholder="Agnes-中国站-1"></div>
+        <div><label>名称</label><input id="aName" placeholder="白嫖-1"></div>
         <div><label>API Key</label><input id="aKey" placeholder="sk-..."></div>
-        <div><label>Base URL</label><input id="aBase" placeholder="https://api.agnes-ai.cn/v1"></div>
+        <div><label>Base URL</label><input id="aBase" placeholder="https://api.api.example.cn/v1"></div>
         <div class="row">
           <div style="flex:1"><label>账号类型</label>
             <select id="aType">${["free","enterprise","tokenplan"].map(t=>`<option>${t}</option>`).join("")}</select></div>
@@ -345,8 +345,8 @@ function viewAccounts(){
     <div class="card">
       <h2>批量导入</h2>
       <label>每行一个账号：<span class="mono">名称,key[,base_url[,access_type[,group]]]</span>，以 # 开头的行会被忽略</label>
-      <textarea id="bulkText" placeholder="Agnes-1,sk-xxxx,https://api.agnes-ai.cn/v1,free,cn
-Agnes-2,sk-yyyy,https://api.agnes-ai.cn/v1,free,cn"></textarea>
+      <textarea id="bulkText" placeholder="白嫖-1,sk-xxxx,https://api.example.cn/v1,free,cn
+白嫖-2,sk-yyyy,https://api.example.cn/v1,free,cn"></textarea>
       <div class="row" style="margin-top:10px">
         <button class="primary" id="btnBulk">批量导入</button>
         <span class="muted">逐行校验，失败的行会单独回报原因</span>
@@ -470,7 +470,7 @@ function viewKeys(){
       <div style="flex:1"><label>总额度（0=不限）</label><input id="kTotal" type="number" value="0"></div>
       <div style="align-self:flex-end"><button class="primary" id="btnAddKey">签发</button></div>
     </div>
-    <div class="hint">客户端把 Base URL 指向 <span class="mono">http://127.0.0.1:4142/v1</span>，模型填 <span class="mono">agnes-auto</span>，Key 填这里签发的值。</div>
+    <div class="hint">客户端把 Base URL 指向 <span class="mono">http://127.0.0.1:4142/v1</span>，模型填 <span class="mono">auto</span>，Key 填这里签发的值。</div>
   </div>
   <div class="card">
     <h2>密钥列表</h2>
@@ -599,9 +599,9 @@ function viewSettings(){
     ${hint?`<div class="hint">${hint}</div>`:""}</div>`;
   return `
   <div class="card">
-    <h2>统一模型入口（agnes-auto）</h2>
+    <h2>统一模型入口（auto）</h2>
     <div class="grid g2">
-      ${fld("s_auto_name","对外统一模型名", s.auto_model_name||"agnes-auto","text","客户端只填这个名字，网关自动判定模态")}
+      ${fld("s_auto_name","对外统一模型名", s.auto_model_name||"auto","text","客户端只填这个名字，网关自动判定模态")}
       <div><label>内容判定（关闭则只看端点/参数）</label>
         <select id="s_scan"><option value="1" ${ai.content_scan?"selected":""}>开启</option><option value="0" ${!ai.content_scan?"selected":""}>关闭（最保守）</option></select>
         <div class="hint">开启后才会读「画一张…」这类措辞；agent 请求（带 tools）永远不走内容判定</div></div>
@@ -648,14 +648,14 @@ function viewSettings(){
         <option value="none" ${s.affinity_mode==="none"?"selected":""}>不粘性（纯负载均衡）</option>
       </select><div class="hint">绑定账号拥堵（预计等待 &gt; 3s）或冷却时自动改派并更新绑定</div></div>
       <div><label>站点优先级（401/403 自动换站）</label><select id="s_region">
-        <option value="cn_first" ${s.region_priority!=="com_first"?"selected":""}>国内优先（agnes-ai.cn 优先，不通则切国际）</option>
-        <option value="com_first" ${s.region_priority==="com_first"?"selected":""}>国际优先（agnes-ai.com 优先，不通则切国内）</option>
+        <option value="cn_first" ${s.region_priority!=="com_first"?"selected":""}>国内优先（api.example.cn 优先，不通则切国际）</option>
+        <option value="com_first" ${s.region_priority==="com_first"?"selected":""}>国际优先（api.example.com 优先，不通则切国内）</option>
       </select><div class="hint">API Key 被 401/403 拒绝时自动切到另一站点重试，成功后持久化该账号的 base_url</div></div>
       ${fld("s_tier","生图默认档位", s.default_image_tier||"1k","text")}
       ${fld("s_retry","最大重试次数", s.retry_max??3,"number","生图/视频提交不参与 5xx 重试，避免重复扣费")}
       ${fld("s_rbase","退避基数（毫秒）", s.retry_base_backoff_ms??500)}
       ${fld("s_rmax","退避上限（毫秒）", s.retry_max_backoff_ms??8000)}
-      ${fld("s_probe","探测模型", s.probe_model||"agnes-2.5-flash","text","账号测试按钮用的最小文本模型")}
+      ${fld("s_probe","探测模型", s.probe_model||"default-model","text","账号测试按钮用的最小文本模型")}
       ${fld("s_ttl","粘性绑定 TTL（小时）", s.session_ttl_hours??72)}
     </div>
     <div style="margin-top:12px"><button class="primary" id="btnSaveSettings">保存设置</button></div>
@@ -791,7 +791,7 @@ function viewAbout(){
       <button class="sm" id="btnChk">检查更新</button>
       <button class="sm primary" id="btnApply">立即更新</button>
       <a class="muted" style="font-size:12px" target="_blank" rel="noopener noreferrer"
-         href="https://github.com/my788525/agnes-hub-go/releases">查看全部版本 ↗</a>
+         href="https://github.com/my788525/baipiao-hub/releases">查看全部版本 ↗</a>
     </div>
   </div>
   <div class="card">

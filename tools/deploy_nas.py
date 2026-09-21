@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把 agnes-hub-go 手工部署到飞牛 fnOS，并做前台联调验证。
+"""把 baipiao-hub 手工部署到飞牛 fnOS，并做前台联调验证。
 
 ⚠️ 为什么是「前台验证」而不是「后台常驻」：
    飞牛会拦截 SSH 会话里的后台进程 —— `nohup ... &` / `setsid` / `&` 一律立即退出，
@@ -100,8 +100,8 @@ def main():
 
     password = load_password()
     binaries = {
-        "agnes-hub-go": os.path.join(ROOT, "agnes-hub-go-linux-amd64"),
-        "agnes-hub-go-arm64": os.path.join(ROOT, "agnes-hub-go-linux-arm64"),
+        "baipiao-hub": os.path.join(ROOT, "baipiao-hub-linux-amd64"),
+        "baipiao-hub-arm64": os.path.join(ROOT, "baipiao-hub-linux-arm64"),
     }
     for name, path in binaries.items():
         if not os.path.exists(path):
@@ -148,9 +148,9 @@ def main():
     print("      ✓ 上传完成")
 
     print("\n[4/5] 校验二进制格式 ...")
-    print("      " + nas.sudo("file %s/app/agnes-hub-go" % APP_DIR).strip())
+    print("      " + nas.sudo("file %s/app/baipiao-hub" % APP_DIR).strip())
     print("      " + nas.sudo(
-        "grep -aq '1.0.0-go' %s/app/agnes-hub-go && echo '版本串 1.0.0-go 已嵌入' "
+        "grep -aq '1.0.0-go' %s/app/baipiao-hub && echo '版本串 1.0.0-go 已嵌入' "
         "|| echo '警告：未找到版本串'" % APP_DIR).strip())
 
     print("\n[5/5] 前台启动联调（10 秒后自动结束）")
@@ -159,7 +159,7 @@ def main():
     chan = nas.client.get_transport().open_session()
     chan.get_pty(width=200, height=50)
     chan.set_combine_stderr(True)
-    chan.exec_command("%s/app/agnes-hub-go -host 0.0.0.0 -port %s -data %s" %
+    chan.exec_command("%s/app/baipiao-hub -host 0.0.0.0 -port %s -data %s" %
                       (APP_DIR, args.port, DATA_DIR))
     banner, start = "", time.time()
     while not chan.exit_status_ready() and time.time() - start < 10:
@@ -187,7 +187,7 @@ def main():
     print("\n" + "=" * 62)
     print(" 前台联调结束。要常驻请用应用中心安装 .fpk：")
     print("   python tools/build_fpk.py")
-    print("   sudo appcenter-cli install-fpk dist/agnes-hub-go-1.0.1.fpk")
+    print("   sudo appcenter-cli install-fpk dist/baipiao-hub-1.0.1.fpk")
     print("=" * 62)
 
 

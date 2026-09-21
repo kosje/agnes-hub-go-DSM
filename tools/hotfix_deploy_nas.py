@@ -92,9 +92,9 @@ def main():
     ap.add_argument("--port", default="4142")
     args = ap.parse_args()
 
-    bin_amd64 = os.path.join(ROOT, "dist", "agnes-hub-go-linux-amd64")
-    bin_arm64 = os.path.join(ROOT, "dist", "agnes-hub-go-linux-arm64")
-    fpk = os.path.join(ROOT, "dist", "agnes-hub-go-1.0.5.fpk")
+    bin_amd64 = os.path.join(ROOT, "dist", "baipiao-hub-linux-amd64")
+    bin_arm64 = os.path.join(ROOT, "dist", "baipiao-hub-linux-arm64")
+    fpk = os.path.join(ROOT, "dist", "baipiao-hub-1.0.5.fpk")
     for f in (bin_amd64, bin_arm64, fpk):
         if not os.path.exists(f):
             sys.exit("[ERROR] 缺少 %s" % f)
@@ -113,7 +113,7 @@ def main():
     loc = nas.sudo("ls -d /var/apps/%s 2>/dev/null; "
                    "for v in /vol1/@appcenter /vol1/@appdata /vol2/@appcenter; do ls -d $v/%s 2>/dev/null; done" % (APP_ID, APP_ID))
     show("应用目录：", loc)
-    ver = nas.sudo("for f in /var/apps/%s/agnes-hub-go* /vol1/@appcenter/%s/agneshub-go/agneshub-go; do "
+    ver = nas.sudo("for f in /var/apps/%s/baipiao-hub* /vol1/@appcenter/%s/agneshub-go/agneshub-go; do "
                    "[ -f \"$f\" ] && echo \"$f\" && grep -ao '1\\.0\\.[0-9]*' \"$f\" | head -1; done" % (APP_ID, APP_ID))
     show("当前二进制/版本串：", ver)
 
@@ -123,26 +123,26 @@ def main():
     show("备份：", bak)
 
     print("\n[4/6] 停服 ...")
-    stop = nas.sudo("appcenter-cli stop %s; pkill -9 -f agnes-hub-go; sleep 1; pgrep -af agnes-hub-go || echo 已全部停止" % APP_ID)
+    stop = nas.sudo("appcenter-cli stop %s; pkill -9 -f baipiao-hub; sleep 1; pgrep -af baipiao-hub || echo 已全部停止" % APP_ID)
     show("停服：", stop)
 
     print("\n[5/6] 上传并覆盖 ...")
-    nas.put(bin_amd64, "/tmp/agnes-hub-go-linux-amd64")
-    nas.put(bin_arm64, "/tmp/agnes-hub-go-linux-arm64")
-    nas.put(fpk, "/tmp/agnes-hub-go-1.0.5.fpk")
+    nas.put(bin_amd64, "/tmp/baipiao-hub-linux-amd64")
+    nas.put(bin_arm64, "/tmp/baipiao-hub-linux-arm64")
+    nas.put(fpk, "/tmp/baipiao-hub-1.0.5.fpk")
     print("      上传完成（/tmp 下 3 个文件）")
     cp = nas.sudo("UNAME_M=$(uname -m); echo 架构=$UNAME_M; "
-                  "SRC=/tmp/agnes-hub-go-linux-amd64; [ \"$UNAME_M\" = \"aarch64\" ] && SRC=/tmp/agnes-hub-go-linux-arm64; "
+                  "SRC=/tmp/baipiao-hub-linux-amd64; [ \"$UNAME_M\" = \"aarch64\" ] && SRC=/tmp/baipiao-hub-linux-arm64; "
                   "D=/var/apps/%s; [ -d $D ] || D=$(ls -d /vol1/@appcenter/%s 2>/dev/null); "
                   "echo 目标目录=$D; ls -la $D | head; "
                   "for c in $D/agneshub-go $D/app/agneshub-go $D/bin/agneshub-go; do [ -f $c ] && echo 候选=$c; done" % (APP_ID, APP_ID))
     show("目录探测：", cp)
-    cp2 = nas.sudo("UNAME_M=$(uname -m); SRC=/tmp/agnes-hub-go-linux-amd64; [ \"$UNAME_M\" = \"aarch64\" ] && SRC=/tmp/agnes-hub-go-linux-arm64; "
+    cp2 = nas.sudo("UNAME_M=$(uname -m); SRC=/tmp/baipiao-hub-linux-amd64; [ \"$UNAME_M\" = \"aarch64\" ] && SRC=/tmp/baipiao-hub-linux-arm64; "
                    "D=/var/apps/%s; BINF=$(for c in $D/agneshub-go $D/app/agneshub-go $D/bin/agneshub-go; do [ -f $c ] && echo $c && break; done); "
                    "echo 覆盖 $BINF; cp -fv $SRC $BINF && chmod +x $BINF && grep -ao '1\\.0\\.5' $BINF | head -1" % APP_ID)
     show("覆盖：", cp2)
     # 顺带更新 fpk 包（供下次 install-fpk / 桌面快捷方式引用）
-    cp3 = nas.sudo("for v in /vol1/@appcenter/%s; do F=$v/agnes-hub-go-1.0.5.fpk; [ -f $F ] && cp -fv /tmp/agnes-hub-go-1.0.5.fpk $F; done; "
+    cp3 = nas.sudo("for v in /vol1/@appcenter/%s; do F=$v/baipiao-hub-1.0.5.fpk; [ -f $F ] && cp -fv /tmp/baipiao-hub-1.0.5.fpk $F; done; "
                    "find /vol1/@appcenter/%s -name '*.fpk' 2>/dev/null | head" % (APP_ID, APP_ID))
     show("fpk 更新：", cp3)
 

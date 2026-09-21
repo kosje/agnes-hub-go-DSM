@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""构建 agnes-hub-go 的飞牛 fnOS fpk 安装包。
+"""构建 baipiao-hub 的飞牛 fnOS fpk 安装包。
 
 为什么手写 tarfile 而不用 fnpack：
     本机 fnpack.exe 在 MSYS 环境下 `build` 必然失败
@@ -16,8 +16,8 @@
       ├── config/               privilege + resource（缺失会被应用中心拒绝）
       ├── wizard/install        无交互安装向导（空数组即可）
       └── app.tgz               内层 tar.gz，只放 app/ 双架构二进制
-          ├── app/agnes-hub-go
-          └── app/agnes-hub-go-arm64
+          ├── app/baipiao-hub
+          └── app/baipiao-hub-arm64
 
 关键坑：cmd/config/wizard 必须放在**外层** tar；塞进 app.tgz 会导致
 应用中心找不到 cmd/main 而安装失败。fnOS 不要求独立的 manifest.checksum 文件。
@@ -40,7 +40,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
 
-APP_ID = "agnes-hub"
+APP_ID = "baipiao-hub"
 SERVICE_PORT = 4142
 
 
@@ -65,7 +65,7 @@ VERSION = _version_from_main_go()
 # 这里直接取 VERSION，单一来源。
 VERSION_TAG = VERSION
 # 由 VERSION 推导，避免两处手改不同步导致产物名和 manifest 版本对不上。
-FPK_NAME = "agnes-hub-go-%s.fpk" % VERSION
+FPK_NAME = "baipiao-hub-%s.fpk" % VERSION
 APP_DIR = os.path.join(FPK_DIR, "app")
 CMD_DIR = os.path.join(FPK_DIR, "cmd")
 WIZARD_DIR = os.path.join(FPK_DIR, "wizard")
@@ -105,8 +105,8 @@ PORT="${AGNES_HUB_PORT:-%PORT%}"
 # 定位二进制：兼容 $APP_DIR/$APP_ID/app/、$APP_DIR/app/ 以及历史残留路径
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64|amd64) BIN_NAME="agnes-hub-go" ;;
-  aarch64|arm64) BIN_NAME="agnes-hub-go-arm64" ;;
+  x86_64|amd64) BIN_NAME="baipiao-hub" ;;
+  aarch64|arm64) BIN_NAME="baipiao-hub-arm64" ;;
   *) echo "unsupported arch: $ARCH" > "$TRIM_TEMP_LOGFILE"; exit 1 ;;
 esac
 
@@ -200,11 +200,11 @@ UPGRADE_INIT = '''#!/bin/bash
 APP_ID="agnes-hub"
 
 # 1. 安全停服：按 exe 路径精确匹配，避免杀掉钩子脚本自身
-for pid in $(pgrep -f "agnes-hub-go" 2>/dev/null); do
+for pid in $(pgrep -f "baipiao-hub" 2>/dev/null); do
   [ "$pid" = "$$" ] && continue
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
   case "$exe" in
-    */agnes-hub-go) kill "$pid" 2>/dev/null || true ;;
+    */baipiao-hub) kill "$pid" 2>/dev/null || true ;;
   esac
 done
 sleep 1
@@ -230,7 +230,7 @@ BASES=""
 [ -n "${TRIM_PKGROOT:-}" ] && BASES="$BASES $TRIM_PKGROOT"
 for base in $BASES; do
   [ -d "$base" ] || continue
-  for cand in "$base/$APP_ID/app/agnes-hub-go" "$base/$APP_ID/app/agnes-hub-go-arm64" "$base/$APP_ID/agnes-hub-go" "$base/$APP_ID/agnes-hub-go-arm64" "$base/app/agnes-hub-go" "$base/app/agnes-hub-go-arm64" "$base/agnes-hub-go" "$base/agnes-hub-go-arm64"; do
+  for cand in "$base/$APP_ID/app/baipiao-hub" "$base/$APP_ID/app/baipiao-hub-arm64" "$base/$APP_ID/baipiao-hub" "$base/$APP_ID/baipiao-hub-arm64" "$base/app/baipiao-hub" "$base/app/baipiao-hub-arm64" "$base/baipiao-hub" "$base/baipiao-hub-arm64"; do
     [ -f "$cand" ] || continue
     grep -aq "%VERSION_TAG%" "$cand" 2>/dev/null || rm -f "$cand" 2>/dev/null || true
   done
@@ -265,7 +265,7 @@ BASES=""
 [ -n "${TRIM_PKGROOT:-}" ] && BASES="$BASES $TRIM_PKGROOT"
 for base in $BASES; do
   [ -d "$base" ] || continue
-  for cand in "$base/$APP_ID/app/agnes-hub-go" "$base/$APP_ID/app/agnes-hub-go-arm64" "$base/$APP_ID/agnes-hub-go" "$base/$APP_ID/agnes-hub-go-arm64" "$base/app/agnes-hub-go" "$base/app/agnes-hub-go-arm64" "$base/agnes-hub-go" "$base/agnes-hub-go-arm64"; do
+  for cand in "$base/$APP_ID/app/baipiao-hub" "$base/$APP_ID/app/baipiao-hub-arm64" "$base/$APP_ID/baipiao-hub" "$base/$APP_ID/baipiao-hub-arm64" "$base/app/baipiao-hub" "$base/app/baipiao-hub-arm64" "$base/baipiao-hub" "$base/baipiao-hub-arm64"; do
     [ -f "$cand" ] || continue
     grep -aq "%VERSION_TAG%" "$cand" 2>/dev/null || rm -f "$cand" 2>/dev/null || true
   done
@@ -280,11 +280,11 @@ UNINSTALL_INIT = '''#!/bin/bash
 APP_ID="agnes-hub"
 
 # 1. 停服
-for pid in $(pgrep -f "agnes-hub-go" 2>/dev/null); do
+for pid in $(pgrep -f "baipiao-hub" 2>/dev/null); do
   [ "$pid" = "$$" ] && continue
   exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
   case "$exe" in
-    */agnes-hub-go) kill "$pid" 2>/dev/null || true ;;
+    */baipiao-hub) kill "$pid" 2>/dev/null || true ;;
   esac
 done
 sleep 1
@@ -345,8 +345,8 @@ def prepare():
         os.makedirs(d, exist_ok=True)
 
     # 1. 二进制
-    for src, dst in (("agnes-hub-go-linux-amd64", "agnes-hub-go"),
-                     ("agnes-hub-go-linux-arm64", "agnes-hub-go-arm64")):
+    for src, dst in (("baipiao-hub-linux-amd64", "baipiao-hub"),
+                     ("baipiao-hub-linux-arm64", "baipiao-hub-arm64")):
         s = os.path.join(ROOT, src)
         if not os.path.exists(s):
             sys.exit("[ERROR] 缺少交叉编译产物 %s，请先执行 build_linux.sh 或 go build" % src)
@@ -361,13 +361,13 @@ def prepare():
                  "uninstall_callback"):
         _write(os.path.join(CMD_DIR, name), TRIVIAL)
     _write(os.path.join(CMD_DIR, "config_init"),
-           "#!/bin/bash\npkill -f 'agnes-hub-go' 2>/dev/null || true\nexit 0\n")
+           "#!/bin/bash\npkill -f 'baipiao-hub' 2>/dev/null || true\nexit 0\n")
 
     # 3. wizard（必须是非空数组，且 items 不能为空——fnOS 会报 "wizard items is empty"）
     # 注意：必须有 password 类型字段，否则校验失败（code 10150）
     # 参考 M365/Copilot2API 和 jdbeanbot 的 wizard/install 格式
     wizard_content = json.dumps([{
-        "stepTitle": "Agnes Hub 配置",
+        "stepTitle": "白嫖 Hub 配置",
         "items": [
             {
                 "type": "password",
@@ -410,7 +410,7 @@ def prepare():
         ("platform", "x86"),
         ("arch", "x86_64"),
         ("maintainer", "my788525"),
-        ("maintainer_url", "https://github.com/my788525/agnes-hub-go"),
+        ("maintainer_url", "https://github.com/my788525/baipiao-hub"),
         ("os_min_version", "0.9.0"),
         ("desktop_uidir", "ui"),
         ("desktop_applaunchname", "agnes-hub.main"),
@@ -512,8 +512,8 @@ def build_inner():
         tar.addfile(ti)
 
         # 二进制放在 app/ 下
-        for src_name, dst_name in (("agnes-hub-go-linux-amd64", "agnes-hub-go"),
-                                    ("agnes-hub-go-linux-arm64", "agnes-hub-go-arm64")):
+        for src_name, dst_name in (("baipiao-hub-linux-amd64", "baipiao-hub"),
+                                    ("baipiao-hub-linux-arm64", "baipiao-hub-arm64")):
             src = os.path.join(ROOT, src_name)
             if not os.path.exists(src):
                 sys.exit("[ERROR] 缺少交叉编译产物 %s，请先执行 build_linux.sh 或 go build" % src_name)
