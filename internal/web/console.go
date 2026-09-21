@@ -3,10 +3,13 @@ package web
 import (
 	"context"
 	_ "embed"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,8 +28,11 @@ var chatHTML []byte
 //go:embed static/chat.main.js
 var chatMainJS []byte
 
-const cookieName = "agnes_hub_session"
-const chatPasswordCookie = "agnes_chat_password"
+//go:embed static/logo.png
+var logoPNG []byte
+
+const cookieName = "baipiao_hub_session"
+const chatPasswordCookie = "baipiao_chat_password"
 
 func (s *Server) consoleRoutes() {
 	m := s.mux
@@ -35,6 +41,13 @@ func (s *Server) consoleRoutes() {
 		w.Header().Set("Content-Length", fmt.Sprint(len(consoleHTML)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(consoleHTML)
+	})
+	m.HandleFunc("GET /logo.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Length", fmt.Sprint(len(logoPNG)))
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(logoPNG)
 	})
 
 	m.HandleFunc("POST /api/login", s.apiLogin)
@@ -63,6 +76,14 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/bindings/clear", s.apiClearBindings)
 	m.HandleFunc("GET /api/video-jobs", s.apiVideoJobs)
 	m.HandleFunc("GET /api/image-jobs", s.apiImageJobs)
+	m.HandleFunc("DELETE /api/video-jobs/{id}", s.apiDeleteVideoJob)
+	m.HandleFunc("DELETE /api/image-jobs/{id}", s.apiDeleteImageJob)
+	m.HandleFunc("POST /api/video-jobs/clear", s.apiClearVideoJobs)
+	m.HandleFunc("POST /api/image-jobs/clear", s.apiClearImageJobs)
+	m.HandleFunc("GET /api/chat-logs", s.apiChatLogs)
+	m.HandleFunc("POST /api/chat-logs", s.apiCreateChatLog)
+	m.HandleFunc("DELETE /api/chat-logs/{id}", s.apiDeleteChatLog)
+	m.HandleFunc("POST /api/chat-logs/clear", s.apiClearChatLogs)
 
 	m.HandleFunc("GET /api/settings", s.apiGetSettings)
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
@@ -79,8 +100,19 @@ func (s *Server) consoleRoutes() {
 
 	// 网页端：聊天 / 生图 / 生视频（免第三方 AI Coding 积分）
 	m.HandleFunc("GET /chat", s.handleChat)
+	m.HandleFunc("GET /chat.main.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", fmt.Sprint(len(chatMainJS)))
+		_, _ = w.Write(chatMainJS)
+	})
 	m.HandleFunc("POST /api/chat/login", s.apiChatLogin)
 	m.HandleFunc("GET /api/chat/session", s.apiChatSession)
+	m.HandleFunc("GET /api/models", s.apiChatModels)
+	// Chat 代理端点：免下游密钥，自动走账号池 + RPM 限制
+	m.HandleFunc("POST /api/chat/v1/chat/completions", s.handleChatProxy)
+	m.HandleFunc("POST /api/chat/v1/images/generations", s.handleChatMediaProxy)
+	m.HandleFunc("POST /api/chat/v1/videos", s.handleChatMediaProxy)
+	m.HandleFunc("GET /api/chat/v1/videos/{job_id}", s.handleChatMediaProxy)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +137,11 @@ func (s *Server) chatAuthed(r *http.Request) bool {
 	// 未设置密码则允许访问
 	settings := s.Store.SettingsSnapshot()
 	return settings.ChatPasswordHash == ""
+}
+
+// authedOrChat 同时接受管理员会话或 Chat 密码会话（图片/视频库接口在两种入口下都要可用）。
+func (s *Server) authedOrChat(r *http.Request) bool {
+	return s.authed(r) || s.chatAuthed(r)
 }
 
 func (s *Server) deny(w http.ResponseWriter) {
@@ -206,6 +243,17 @@ func (s *Server) apiChatSession(w http.ResponseWriter, r *http.Request) {
 	}, nil)
 }
 
+// apiChatModels 返回聊天页（对话/生图/生视频）可用的模型列表。
+func (s *Server) apiChatModels(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	models := pool.KnownModelNamesByModality(settings.ModelAliases)
+	writeJSON(w, 200, map[string]any{"models": models}, nil)
+}
+
 // ---------------------------------------------------------------------------
 // 账号池
 // ---------------------------------------------------------------------------
@@ -248,6 +296,8 @@ func (s *Server) apiListAccounts(w http.ResponseWriter, r *http.Request) {
 			"penalty_remaining_ms": s.Hub.PenaltyRemaining(a.ID).Milliseconds(),
 			"inflight":             s.Hub.Inflight(a.ID),
 			"stats":                a.Stats,
+			"consecutive_failures": a.ConsecutiveFailures,
+			"default_model":        a.DefaultModel,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
@@ -356,6 +406,7 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		setStr("group", &a.Group)
 		setStr("base_url", &a.BaseURL)
 		setStr("access_type", &a.AccessType)
+		setStr("default_model", &a.DefaultModel)
 		setBool("enabled", &a.Enabled)
 		if v, ok := body["api_key"]; ok && strings.TrimSpace(asStr(v)) != "" {
 			a.APIKey, changed = strings.TrimSpace(asStr(v)), true
@@ -436,7 +487,7 @@ func (s *Server) apiTestAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
-	client := relay.BuildClient()
+	client := s.Client
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
@@ -804,7 +855,7 @@ func (s *Server) apiClearBindings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	if !s.authedOrChat(r) {
 		s.deny(w)
 		return
 	}
@@ -812,11 +863,147 @@ func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiImageJobs(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
+	if !s.authedOrChat(r) {
 		s.deny(w)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"jobs": s.Store.ImageJobsSnapshot()}, nil)
+}
+
+// apiDeleteImageJob 删除单条图片记录。
+func (s *Server) apiDeleteImageJob(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "missing id"})
+		return
+	}
+	if !s.Store.DeleteImageJob(id) {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "image job not found"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// apiClearImageJobs 清空全部图片记录。
+func (s *Server) apiClearImageJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	s.Store.ClearImageJobs()
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// apiDeleteVideoJob 删除单条视频记录。
+func (s *Server) apiDeleteVideoJob(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "missing id"})
+		return
+	}
+	if !s.Store.DeleteVideoJob(id) {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "video job not found"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// apiClearVideoJobs 清空全部视频记录。
+func (s *Server) apiClearVideoJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	s.Store.ClearVideoJobs()
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// ---- 聊天记录 ----
+
+func (s *Server) apiChatLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"logs": s.Store.ChatLogsSnapshot()}, nil)
+}
+
+func (s *Server) apiCreateChatLog(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	var body struct {
+		Model  string `json:"model"`
+		Prompt string `json:"prompt"`
+		Reply  string `json:"reply"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "invalid body"})
+		return
+	}
+	if body.Prompt == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "prompt required"})
+		return
+	}
+	if body.Status == "" {
+		body.Status = "completed"
+	}
+	id := "cl_" + randHex(12)
+	log := &config.ChatLog{
+		ID:        id,
+		Model:     body.Model,
+		Prompt:    body.Prompt,
+		Reply:     body.Reply,
+		Status:    body.Status,
+		CreatedAt: float64(time.Now().Unix()),
+	}
+	s.Store.AddChatLog(log)
+	writeJSON(w, 200, map[string]any{"id": id, "ok": true}, nil)
+}
+
+func (s *Server) apiDeleteChatLog(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request", Message: "missing id"})
+		return
+	}
+	if !s.Store.DeleteChatLog(id) {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "chat log not found"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+func (s *Server) apiClearChatLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	s.Store.ClearChatLogs()
+	writeJSON(w, 200, map[string]any{"ok": true}, nil)
+}
+
+// randHex 生成 n 字节的十六进制随机串，用于聊天记录等实体的唯一 ID。
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -908,9 +1095,13 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("queue_max_size", &st.QueueMaxSize)
 	i("keepalive_interval_ms", &st.KeepaliveMS)
 	s2("affinity_mode", &st.AffinityMode)
+	s2("region_priority", &st.RegionPriority)
+	i("request_timeout_ms", &st.RequestTimeoutMS)
 	s2("default_image_tier", &st.DefaultImageTier)
 	s2("optimization_mode", &st.OptimizationMode)
 	i("image_record_retention_days", &st.ImageRecordRetention)
+	i("image_max_capacity", &st.ImageMaxCapacity)
+	i("video_max_capacity", &st.VideoMaxCapacity)
 
 	// chat_password is handled separately in apiSetSettings to avoid accessing s here
 	i("retry_max", &st.RetryMax)
@@ -1161,7 +1352,7 @@ func (s *Server) probeRates(ctx context.Context, account *config.Account, modali
 	rates []float64, perRate int) ([]map[string]any, error) {
 
 	settings := s.Store.SettingsSnapshot()
-	client := relay.BuildClient()
+	client := s.Client
 	var results []map[string]any
 
 	for _, rpm := range rates {
@@ -1446,4 +1637,333 @@ func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 		s.Updater.RequestRestart()
 	}
 	writeJSON(w, 200, result, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Chat 代理端点（免下游密钥，自动走账号池）
+// ---------------------------------------------------------------------------
+
+// handleChatProxy 代理文本对话请求到账号池，无需下游 API Key。
+func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
+	body, _, e := readBody(r)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	requested := strings.TrimSpace(asStr(body["model"]))
+	wantsStream := truthy(body["stream"])
+
+	var decision intent.Result
+	if intent.IsAutoModel(requested) || requested == "" {
+		decision = intent.Decide("/v1/chat/completions", body, requested,
+			autoIntentConfig(settings), s.rules, settings.ModelAliases,
+			pool.ModalityOfModel, "")
+	} else {
+		decision = intent.Result{
+			Modality:       pool.ModalityOfModel(requested, settings.ModelAliases),
+			Source:         "model",
+			Score:          1,
+			Reason:         fmt.Sprintf("模型名 %s 已明确模态", requested),
+			ModelRequested: requested,
+			Prompt:         intent.ExtractPrompt(body),
+		}
+		if decision.Modality == "" {
+			decision.Modality = intent.Text
+		}
+	}
+
+	// 非文本模态（图片/视频意图）转发到媒体代理
+	if decision.Modality != intent.Text {
+		s.handleChatMediaProxy(w, r)
+		return
+	}
+
+	// 文本路径：走账号池，无需下游密钥
+	poolClass := "text"
+	if !intent.IsAutoModel(requested) {
+		poolClass = pool.Classify(requested, body, settings.ModelAliases, settings.DefaultImageTier)
+	}
+
+	model, modelErr := s.resolveAutoModel(settings, intent.Text)
+	if modelErr != nil {
+		writeErr(w, modelErr)
+		return
+	}
+	decision.ModelUsed = model
+
+	bodyFor := func(a *config.Account) ([]byte, string) {
+		if intent.IsAutoModel(requested) || requested == "" {
+			manifest := pool.ManifestOf(a, settings)
+			chosen := intent.ChooseModel(manifest.Text, autoIntentConfig(settings).PreferredModels["text"])
+			if chosen == "" {
+				chosen = pool.FallbackModel["text"]
+			}
+			clone := make(map[string]any, len(body))
+			for k, v := range body {
+				clone[k] = v
+			}
+			clone["model"] = chosen
+			buf, _ := json.Marshal(clone)
+			return buf, chosen
+		}
+		resolved := pool.ResolveModel(requested, settings.ModelAliases)
+		clone := cloneBody(body)
+		clone["model"] = resolved
+		buf, _ := json.Marshal(clone)
+		return buf, resolved
+	}
+
+	sessionKey := s.Hub.SessionKey(headerMap(r), "")
+	opts := relay.Options{
+		SessionKey: sessionKey, PoolClass: poolClass,
+		RequiredModel: model, Method: http.MethodPost, Path: "/v1/chat/completions",
+		BodyFor: bodyFor, Idempotent: true,
+	}
+
+	ctx := r.Context()
+	if !wantsStream {
+		result, err := relay.Do(ctx, s.Hub, s.Client, opts)
+		if err != nil {
+			writeErr(w, relayError(err))
+			return
+		}
+		raw := result.ReadAll()
+		headers := passthroughHeaders(result.Header)
+		for k, v := range decision.Headers() {
+			headers[k] = v
+		}
+		headers["X-Agnes-Hub-Model"] = result.ModelUsed
+		if result.Account != nil {
+			headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
+			headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+		}
+		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+		if result.Status >= 400 {
+			writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+			return
+		}
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		return
+	}
+
+	// 流式路径
+	type outcome struct {
+		result *relay.Result
+		err    error
+	}
+	ch := make(chan outcome, 1)
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		result, err := relay.Do(ctx2, s.Hub, s.Client, opts)
+		ch <- outcome{result: result, err: err}
+	}()
+
+	select {
+		case out := <-ch:
+			s.finishChatStream(w, out.result, out.err, decision, opts)
+			return
+	case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
+	}
+
+	// 心跳路径
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	for k, v := range decision.Headers() {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	for {
+		select {
+		case out := <-ch:
+			if out.err != nil {
+				writeSSEComment(w, flusher, "error: "+out.err.Error())
+				return
+			}
+			raw := out.result.ReadAll()
+			if out.result.Status >= 400 {
+				writeSSEComment(w, flusher, "error: HTTP "+strconv.Itoa(out.result.Status))
+				return
+			}
+			// 转发上游流
+			_ = json.NewEncoder(&flushSSE{w: w, f: flusher}).Encode(decodeOrRaw(raw))
+			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, out.result.Stream)
+			out.result.Close()
+			return
+		case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
+			writeSSEComment(w, flusher, "baipiao-hub chat proxy keepalive")
+		case <-ctx2.Done():
+			return
+		}
+	}
+}
+
+// flushSSE 是一个 io.Writer，将 JSON 编码为 SSE data: 帧。
+type flushSSE struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (f *flushSSE) Write(p []byte) (int, error) {
+	_, err := f.w.Write([]byte("data: "))
+	if err != nil {
+		return 0, err
+	}
+	n, err := f.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	_, err = f.w.Write([]byte("\n\n"))
+	if f.f != nil {
+		f.f.Flush()
+	}
+	return n, err
+}
+
+// finishChatStream 处理流式结果并写入响应。
+func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, err error,
+	decision intent.Result, opts relay.Options) {
+	if err != nil {
+		writeErr(w, relayError(err))
+		return
+	}
+	raw := result.ReadAll()
+	headers := passthroughHeaders(result.Header)
+	for k, v := range decision.Headers() {
+		headers[k] = v
+	}
+	headers["X-Agnes-Hub-Model"] = result.ModelUsed
+	if result.Account != nil {
+		headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
+		headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+	}
+	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+	if result.Status >= 400 {
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		return
+	}
+	// stream=true 时，上游返回的 raw 本身就是 SSE 帧序列；直接原样写回并声明 event-stream。
+	headers["Content-Type"] = "text/event-stream"
+	for k, v := range headers {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(result.Status)
+	_, _ = w.Write(raw)
+}
+
+// handleChatMediaProxy 代理图片/视频请求到账号池，无需下游 API Key。
+func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
+	body, _, e := readBody(r)
+	if e != nil {
+		writeErr(w, e)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	requested := strings.TrimSpace(asStr(body["model"]))
+
+	var modality string
+	path := r.URL.Path
+	switch {
+	case strings.HasSuffix(path, "images/generations"):
+		modality = intent.Image
+	case strings.HasSuffix(path, "videos"), strings.Contains(path, "videos/"):
+		modality = intent.Video
+	default:
+		modality = intent.Text
+	}
+
+	decision := intent.Decide(path, body, firstNonEmpty(requested, settings.AutoModelName),
+		autoIntentConfig(settings), s.rules, settings.ModelAliases, pool.ModalityOfModel, modality)
+
+	poolClass := ""
+	switch decision.Modality {
+	case intent.Image:
+		poolClass = pool.PoolForModality(intent.Image, body, settings.DefaultImageTier)
+	case intent.Video:
+		poolClass = "video"
+	default:
+		poolClass = "text"
+	}
+
+	model, modelErr := s.pickMediaModel(settings, decision, decision.Modality)
+	if modelErr != nil {
+		writeErr(w, modelErr)
+		return
+	}
+	decision.ModelUsed = model
+
+	cfg := autoIntentConfig(settings)
+	var upstreamBody map[string]any
+	var bodyFor func(*config.Account) ([]byte, string)
+
+	if decision.Modality == intent.Image {
+		upstreamBody = intent.BuildImageBody(decision, model, cfg, body)
+		decision.DroppedFields = intent.DroppedFields(body, intent.ImageFieldWhitelist)
+		bodyFor = s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Image, model)
+	} else if decision.Modality == intent.Video {
+		upstreamBody = intent.BuildVideoBody(decision, model, cfg, body)
+		decision.DroppedFields = intent.DroppedFields(body, intent.VideoFieldWhitelist)
+		bodyFor = s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Video, model)
+	} else {
+		// 兜底：作为文本处理
+		bodyFor = func(a *config.Account) ([]byte, string) {
+			if intent.IsAutoModel(requested) || requested == "" {
+				manifest := pool.ManifestOf(a, settings)
+				chosen := intent.ChooseModel(manifest.Text, autoIntentConfig(settings).PreferredModels["text"])
+				if chosen == "" {
+					chosen = pool.FallbackModel["text"]
+				}
+				clone := make(map[string]any, len(body))
+				for k, v := range body {
+					clone[k] = v
+				}
+				clone["model"] = chosen
+				buf, _ := json.Marshal(clone)
+				return buf, chosen
+			}
+			resolved := pool.ResolveModel(requested, settings.ModelAliases)
+			clone := cloneBody(body)
+			clone["model"] = resolved
+			buf, _ := json.Marshal(clone)
+			return buf, resolved
+		}
+	}
+
+	sessionKey := s.Hub.SessionKey(headerMap(r), "")
+	isIdempotent := strings.HasPrefix(path, "GET /v1/videos/") || strings.Contains(path, "videos/")
+	opts := relay.Options{
+		SessionKey: sessionKey, PoolClass: poolClass,
+		RequiredModel: model, Method: http.MethodPost, Path: path,
+		BodyFor: bodyFor, Idempotent: isIdempotent,
+	}
+
+	result, err := relay.Do(r.Context(), s.Hub, s.Client, opts)
+	if err != nil {
+		writeErr(w, relayError(err))
+		return
+	}
+	raw := result.ReadAll()
+	decision.ModelUsed = result.ModelUsed
+	headers := passthroughHeaders(result.Header)
+	for k, v := range decision.Headers() {
+		headers[k] = v
+	}
+	headers["X-Agnes-Hub-Model"] = result.ModelUsed
+	if result.Account != nil {
+		headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
+		headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+	}
+	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+	if result.Status >= 400 {
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		return
+	}
+	writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 }

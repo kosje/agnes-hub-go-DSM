@@ -1,4 +1,4 @@
-// Package intent 实现 agnes-auto 的意图判定与请求/响应适配。
+// Package intent 实现多平台自动意图判定与请求/响应适配。
 //
 // 为什么必须由网关做这件事
 // ------------------------
@@ -42,7 +42,7 @@ const (
 var Modalities = []string{Text, Image, Video}
 
 // AutoModelNames 客户端可用的统一模型名（等价）。
-var AutoModelNames = []string{"agnes-auto", "agnes-auto-all", "agnes_auto", "auto"}
+var AutoModelNames = []string{"auto", "auto-all"}
 
 // SourceLabels 判定来源的中文说明（只进日志与响应体，绝不进响应头）。
 var SourceLabels = map[string]string{
@@ -174,13 +174,13 @@ func IsAutoModel(name string) bool {
 	}
 	// 内置 auto 名称集合
 	autoNames := map[string]bool{
-		"agnes-auto": true, "agnes-auto-all": true, "agnes_auto": true, "auto": true,
+		"auto": true, "auto-all": true,
 	}
 	if autoNames[low] {
 		return true
 	}
-	// agnes-auto 前缀匹配
-	if strings.HasPrefix(low, "agnes-auto") {
+	// auto 前缀匹配
+	if strings.HasPrefix(low, "auto") {
 		return true
 	}
 	// 已知上游模型名集合（与 pool.TextModels/ImageModels/VideoModels 同步）
@@ -807,7 +807,7 @@ func SSEFromChat(envelope map[string]any) [][]byte {
 	last["choices"] = []any{map[string]any{"index": 0,
 		"delta": map[string]any{}, "finish_reason": "stop"}}
 	if v, ok := envelope["agnes_hub"]; ok {
-		last["agnes_hub"] = v
+		last["baipiao_hub"] = v
 	}
 	if v, ok := envelope["data"]; ok {
 		last["data"] = v

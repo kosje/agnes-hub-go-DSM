@@ -63,7 +63,7 @@ var ModalityByPool = map[string]string{
 
 // FallbackModel 每个模态的兜底模型（仅在账号清单与偏好都为空时使用）。
 var FallbackModel = map[string]string{
-	"text":  "agnes-2.5-flash",
+	"text":  "agnes-3.0-flash",
 	"image": "agnes-image-2.5-flash",
 	"video": "agnes-video-2.5-flash",
 }
@@ -250,5 +250,50 @@ func KnownModelNames(aliases map[string]string) []string {
 		out = append(out, m)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// KnownModelNamesByModality 按模态返回已知的模型名（含别名）。
+func KnownModelNamesByModality(aliases map[string]string) map[string][]string {
+	out := map[string][]string{"text": {}, "image": {}, "video": {}}
+	seen := map[string]bool{}
+	add := func(name, modality string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := modality + "|" + name
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out[modality] = append(out[modality], name)
+	}
+
+	// 标准模型（Agnes 原生模型）
+	for m := range TextModels {
+		add(m, "text")
+	}
+	for m := range ImageModels {
+		add(m, "image")
+	}
+	for m := range VideoModels {
+		add(m, "video")
+	}
+
+	// 用户自定义别名（控制台 model_aliases 里配置的）
+	for alias, target := range aliases {
+		if mod := ModalityOfModel(target, aliases); mod != "" {
+			add(alias, mod)
+		}
+	}
+
+	// 注意：不返回 BuiltinAliases（gpt-4o/claude/dall-e-3/gpt-image-1 等），
+	// 这些跨厂商兼容别名仅用于 /v1/models 和外部客户端兼容，
+	// 聊天 UI 只展示用户实际接入的 Agnes 模型与用户自定义别名。
+
+	for k := range out {
+		sort.Strings(out[k])
+	}
 	return out
 }

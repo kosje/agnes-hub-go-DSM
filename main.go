@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.2"
+var version = "1.0.9"
 
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -151,7 +151,7 @@ func main() {
 	fmt.Printf("  数据目录  %s\n", *dataDir)
 	fmt.Printf("  可用账号  %d\n", enabled)
 	if settings.MustChangePassword {
-		fmt.Println("  初始密码  admin123   ← 请到控制台立即修改")
+		fmt.Println("  请使用安装向导设置的管理员密码登录控制台；若未设置，可通过重新安装向导填写新密码覆盖。")
 	}
 	if *host == "0.0.0.0" || *host == "" || *host == "::" {
 		fmt.Println("  网络监听  IPv4(0.0.0.0) + IPv6(::) 双栈")
@@ -193,7 +193,7 @@ func main() {
 		cancel()
 		wg.Wait()
 	}
-	fmt.Println("agnes-hub-go 已停止。")
+	fmt.Println("baiPiao-hub 已停止。")
 }
 
 // buildListeners 按平台拆分到 listener_linux.go / listener_other.go：

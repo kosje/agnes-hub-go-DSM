@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>agnes-hub 控制台</title>
+<title>baiPiao-hub 控制台</title>
 <style>
   :root{
     --bg:#f6f7f9; --panel:#ffffff; --line:#e4e7ec; --ink:#1c2430; --muted:#65717f;
@@ -64,6 +64,29 @@
   .login{max-width:380px;margin:8vh auto}
   .hint{font-size:12px;color:var(--muted);margin-top:6px}
   details summary{cursor:pointer;color:var(--brand);font-size:13px}
+
+/* ============ 移动端适配 ============ */
+@media (max-width:768px){
+  body{font-size:15px}
+  h1{font-size:16px}
+  .spread{flex-direction:column;align-items:stretch;gap:8px}
+  .spread > div:last-child{display:flex;flex-wrap:wrap;gap:6px}
+  .kpi .v{font-size:20px}
+  .g4{grid-template-columns:repeat(2,1fr)}
+  .g2{grid-template-columns:1fr}
+  .tabs{gap:4px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tabs button{white-space:nowrap;padding:5px 11px;font-size:13px}
+  .scroll{max-height:400px}
+  table{font-size:13px}
+  th,td{padding:6px 8px}
+  td .row{gap:4px;flex-wrap:wrap}
+  button.sm{padding:4px 8px;font-size:11px}
+  .card{padding:12px;margin-bottom:10px}
+}
+@media (min-width:769px){
+  .tabs{overflow-x:visible}
+}
 </style>
 </head>
 <body>
@@ -99,11 +122,11 @@ function renderLogin(mustChange){
   document.getElementById("app").innerHTML = `
   <div class="login">
     <div class="card">
-      <h1>agnes-hub 控制台</h1>
-      <p class="muted">Agnes AI 多账号聚合中转 · RPM 排队限流网关</p>
+      <h1>baiPiao-hub 控制台</h1>
+      <p class="muted">白嫖 Hub 聚合网关 · RPM 排队限流</p>
       <div id="toast" class="hide"></div>
       <label>管理员密码</label>
-      <input id="pw" type="password" placeholder="初始密码 admin123" autocomplete="current-password">
+      <input id="pw" type="password" placeholder="请输入管理员密码" autocomplete="current-password">
       <div class="row" style="margin-top:12px">
         <button class="primary" id="btnLogin">登录</button>
         ${mustChange?`<span class="pill warn">首次登录请改密</span>`:""}
@@ -134,10 +157,11 @@ function renderShell(){
   <div style="max-width:1240px;margin:0 auto;padding:20px">
     <div class="spread" style="margin-bottom:14px">
       <div>
-        <h1>agnes-hub 控制台</h1>
+        <h1>baiPiao-hub 控制台</h1>
         <div class="muted" id="subline">加载中…</div>
       </div>
       <div class="row">
+        <a class="sm primary" href="/chat" target="_blank" rel="noopener" style="text-decoration:none">💬 对话 UI</a>
         <button class="sm" id="btnRefresh">刷新</button>
         <button class="sm" id="btnPw">修改密码</button>
         <button class="sm danger" id="btnLogout">退出</button>
@@ -157,7 +181,7 @@ function renderShell(){
   if(state.session?.must_change_password){
     const el = document.getElementById("mustChange");
     el.className = "banner warn";
-    el.innerHTML = `当前仍在使用初始密码 <b>admin123</b>，请立即修改。<button class="sm primary" style="margin-left:8px" onclick="changePassword()">去修改</button>`;
+    el.innerHTML = `为保障安全，请立即设置一个新管理员密码。<button class="sm primary" style="margin-left:8px" onclick="changePassword()">去修改</button>`;
   }
 }
 async function changePassword(){
@@ -169,6 +193,43 @@ async function changePassword(){
 }
 
 /* ---------------- 总览 ---------------- */
+function arrivalCard(s){
+  const a = s.arrival;
+  if(!a || !Array.isArray(a.per_second) || a.per_second.length===0) return "";
+  const maxVal = Math.max(1, ...a.per_second);
+  // 迷你直方图（60 格，绿 = 节拍内，橙 = 超节拍）
+  const intervalSec = a.text_interval_ms ? a.text_interval_ms/1000 : 3.0;
+  const bars = a.per_second.map((v,i)=>{
+    const h = Math.round(v/maxVal*100)||0;
+    const over = intervalSec>0 && v > intervalSec;
+    const color = over ? "var(--warn, #f59e0b)" : "var(--good, #22c55e)";
+    return `<div title="${i}s 前 · ${v} req" style="height:28px;align-items:flex-end;display:flex">
+      <div style="width:100%;height:${Math.max(2,h)}%;background:${v>0?color:"#333"};border-radius:1px;min-height:${v>0?2:0}px"></div></div>`;
+  }).join("");
+  const ratio = a.ratio||0;
+  const ratioColor = ratio>=1?"var(--good,#22c55e)":"var(--warn,#f59e0b)";
+  const ratioLabel = ratio>=1?"到达密度 ≥ 节拍，多账号已被吃到":
+    ratio>=0.5?"到达密度接近节拍，账号数基本用满":
+    "到达密度低于节拍，账号数不是瓶颈（宿主在串行）";
+  return `
+  <div class="card" style="margin-bottom:14px">
+    <h2>到达密度 vs 文本池节拍 <span class="muted" style="font-size:12px">（多账号吞吐判定）</span></h2>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+      <div style="flex:1;min-width:240px">
+        <div style="display:flex;gap:2px;align-items:flex-end;height:28px;margin-bottom:4px">${bars}</div>
+        <div class="muted" style="font-size:11px">最近 60 秒到达时间线（绿 = 节拍内 · 橙 = 超节拍）</div>
+      </div>
+      <div style="min-width:180px">
+        <div style="font-size:24px;font-weight:600;color:${ratioColor}">${num(a.active_60s)}<span style="font-size:13px;color:inherit;font-weight:400"> / 60s</span></div>
+        <div class="muted" style="font-size:12px">均值 ${a.avg_per_sec} req/s · text ${a.text_rpm||"—"} RPM · 节拍 ${a.text_interval_ms||"—"}ms</div>
+        <div class="muted" style="font-size:12px;margin-top:6px;padding:6px 10px;background:rgba(0,0,0,.04);border-radius:6px">
+          <span style="color:${ratioColor};font-weight:600">比值 ${ratio}</span>：${ratioLabel}
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
 function viewOverview(){
   const s = state.stats || {}, m = s.metrics || {};
   const uls = m.upstream_429 || 0;
@@ -196,7 +257,8 @@ function viewOverview(){
       <td><b>${esc(a.name)}</b>${a.group?` <span class="pill">${esc(a.group)}</span>`:""}
         <div class="muted" style="font-size:11px">${esc(a.access_type)}</div></td>
       <td>${a.enabled?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}
-        ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却 ${Math.round(a.penalty_remaining_ms/1000)}s</span>`:""}</td>
+        ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却 ${Math.round(a.penalty_remaining_ms/1000)}s</span>`:""}
+        ${a.consecutive_failures && a.stats?.errors ? `<span class="pill warn" title="连续失败 ${a.consecutive_failures}">连续失败 ${a.consecutive_failures}</span>` : ''}</td>
       <td style="min-width:210px">${bars||'<span class="muted">无可用池</span>'}${declared}</td>
       <td class="mono">${num(a.stats?.requests)} / 错误 ${num(a.stats?.errors)} / 限流 ${num(a.stats?.rate_limited)}</td>
     </tr>`;
@@ -213,6 +275,7 @@ function viewOverview(){
     <div class="kpi"><div class="k">熔断 / 复活</div><div class="v">${num(m.breaker_opened)} / ${num(m.breaker_revived)}</div></div>
     <div class="kpi"><div class="k">账号 / 密钥</div><div class="v">${num((s.accounts||[]).length)} / ${num(s.keys)}</div></div>
   </div>
+  ${arrivalCard(s)}
   <div class="card">
     <h2>账号负载</h2>
     <div class="scroll"><table>
@@ -228,7 +291,7 @@ function manifestEditor(id, manifest){
   return MODALITIES.map(mod=>`
     <div>
       <label>${mod} 模型（逗号分隔；<b>留空 = 明示不支持该模态</b>）</label>
-      <input id="${id}_${mod}" value="${esc((m[mod]||[]).join(", "))}" placeholder="例如 agnes-2.5-flash, agnes-2.0-flash">
+      <input id="${id}_${mod}" value="${esc((m[mod]||[]).join(", "))}" placeholder="例如 default-model, default-model">
     </div>`).join("");
 }
 function viewAccounts(){
@@ -265,12 +328,12 @@ function viewAccounts(){
     <div class="card">
       <h2>添加账号</h2>
       <div class="grid">
-        <div><label>名称</label><input id="aName" placeholder="Agnes-中国站-1"></div>
+        <div><label>名称</label><input id="aName" placeholder="白嫖-1"></div>
         <div><label>API Key</label><input id="aKey" placeholder="sk-..."></div>
-        <div><label>Base URL</label><input id="aBase" placeholder="https://api.agnes-ai.cn/v1"></div>
+        <div><label>Base URL</label><input id="aBase" placeholder="https://api.api.example.cn/v1"></div>
         <div class="row">
           <div style="flex:1"><label>账号类型</label>
-            <select id="aType">${["free","enterprise","tokenplan"].map(t=>`<option>${t}</option>`).join("")}</select></div>
+            <select id="aType">${["free","enterprise","tokenplan","amd"].map(t=>`<option>${t}</option>`).join("")}</select></div>
           <div style="flex:1"><label>分组（可选）</label><input id="aGroup" placeholder="cn-free"></div>
           <div style="flex:1"><label>单账号并发</label><input id="aConc" type="number" value="8" min="1"></div>
         </div>
@@ -282,8 +345,8 @@ function viewAccounts(){
     <div class="card">
       <h2>批量导入</h2>
       <label>每行一个账号：<span class="mono">名称,key[,base_url[,access_type[,group]]]</span>，以 # 开头的行会被忽略</label>
-      <textarea id="bulkText" placeholder="Agnes-1,sk-xxxx,https://api.agnes-ai.cn/v1,free,cn
-Agnes-2,sk-yyyy,https://api.agnes-ai.cn/v1,free,cn"></textarea>
+      <textarea id="bulkText" placeholder="白嫖-1,sk-xxxx,https://api.example.cn/v1,free,cn
+白嫖-2,sk-yyyy,https://api.example.cn/v1,free,cn"></textarea>
       <div class="row" style="margin-top:10px">
         <button class="primary" id="btnBulk">批量导入</button>
         <span class="muted">逐行校验，失败的行会单独回报原因</span>
@@ -319,6 +382,7 @@ function bindAccountEvents(){
         name:document.getElementById("aName").value, api_key:document.getElementById("aKey").value,
         base_url:document.getElementById("aBase").value, access_type:document.getElementById("aType").value,
         group:document.getElementById("aGroup").value, max_concurrency:Number(document.getElementById("aConc").value)||8,
+        default_model:document.getElementById("aDefaultModel").value,
         model_manifest:manifest
       })});
       toast("账号已添加","good"); await refresh();
@@ -406,7 +470,7 @@ function viewKeys(){
       <div style="flex:1"><label>总额度（0=不限）</label><input id="kTotal" type="number" value="0"></div>
       <div style="align-self:flex-end"><button class="primary" id="btnAddKey">签发</button></div>
     </div>
-    <div class="hint">客户端把 Base URL 指向 <span class="mono">http://127.0.0.1:4142/v1</span>，模型填 <span class="mono">agnes-auto</span>，Key 填这里签发的值。</div>
+    <div class="hint">客户端把 Base URL 指向 <span class="mono">http://127.0.0.1:4142/v1</span>，模型填 <span class="mono">auto</span>，Key 填这里签发的值。</div>
   </div>
   <div class="card">
     <h2>密钥列表</h2>
@@ -535,9 +599,9 @@ function viewSettings(){
     ${hint?`<div class="hint">${hint}</div>`:""}</div>`;
   return `
   <div class="card">
-    <h2>统一模型入口（agnes-auto）</h2>
+    <h2>统一模型入口（auto）</h2>
     <div class="grid g2">
-      ${fld("s_auto_name","对外统一模型名", s.auto_model_name||"agnes-auto","text","客户端只填这个名字，网关自动判定模态")}
+      ${fld("s_auto_name","对外统一模型名", s.auto_model_name||"auto","text","客户端只填这个名字，网关自动判定模态")}
       <div><label>内容判定（关闭则只看端点/参数）</label>
         <select id="s_scan"><option value="1" ${ai.content_scan?"selected":""}>开启</option><option value="0" ${!ai.content_scan?"selected":""}>关闭（最保守）</option></select>
         <div class="hint">开启后才会读「画一张…」这类措辞；agent 请求（带 tools）永远不走内容判定</div></div>
@@ -571,6 +635,7 @@ function viewSettings(){
       ${fld("s_imconc","图片并发上限", s.image_concurrency??4)}
       ${fld("s_vconc","视频在任务上限", s.video_max_inflight??2,"number","独立于 RPM 的任务级限制：只做 RPM 不做任务数会出现「RPM 没超但视频一直失败」")}
       ${fld("s_brev","熔断自动复活（秒）", s.breaker_revive_sec??1800,"number","401/403/402 熔断后到这个时间自动复活低速试探")}
+      ${fld("s_rqtimeout","请求超时（毫秒）", s.request_timeout_ms??30000,"number","单次上游请求最长等待时间，防 hang 死连接")}
     </div>
   </div>
   <div class="card">
@@ -582,14 +647,39 @@ function viewSettings(){
         <option value="session" ${s.affinity_mode==="session"?"selected":""}>仅按会话头</option>
         <option value="none" ${s.affinity_mode==="none"?"selected":""}>不粘性（纯负载均衡）</option>
       </select><div class="hint">绑定账号拥堵（预计等待 &gt; 3s）或冷却时自动改派并更新绑定</div></div>
+      <div><label>站点优先级（401/403 自动换站）</label><select id="s_region">
+        <option value="cn_first" ${s.region_priority!=="com_first"?"selected":""}>国内优先（api.example.cn 优先，不通则切国际）</option>
+        <option value="com_first" ${s.region_priority==="com_first"?"selected":""}>国际优先（api.example.com 优先，不通则切国内）</option>
+      </select><div class="hint">API Key 被 401/403 拒绝时自动切到另一站点重试，成功后持久化该账号的 base_url</div></div>
       ${fld("s_tier","生图默认档位", s.default_image_tier||"1k","text")}
       ${fld("s_retry","最大重试次数", s.retry_max??3,"number","生图/视频提交不参与 5xx 重试，避免重复扣费")}
       ${fld("s_rbase","退避基数（毫秒）", s.retry_base_backoff_ms??500)}
       ${fld("s_rmax","退避上限（毫秒）", s.retry_max_backoff_ms??8000)}
-      ${fld("s_probe","探测模型", s.probe_model||"agnes-2.5-flash","text","账号测试按钮用的最小文本模型")}
+      ${fld("s_probe","探测模型", s.probe_model||"default-model","text","账号测试按钮用的最小文本模型")}
       ${fld("s_ttl","粘性绑定 TTL（小时）", s.session_ttl_hours??72)}
     </div>
     <div style="margin-top:12px"><button class="primary" id="btnSaveSettings">保存设置</button></div>
+  </div>
+  <div class="card">
+    <h2>优化模式与记录</h2>
+    <div class="grid g2">
+      <div><label>优化模式</label><select id="s_opt_mode">
+        <option value="serial" ${s.optimization_mode==="serial"?"selected":""}>串行 (Serial)</option>
+        <option value="concurrent_batch" ${s.optimization_mode==="concurrent_batch"?"selected":""}>并发批处理 (Concurrent Batch)</option>
+        <option value="concurrent_parallel" ${s.optimization_mode==="concurrent_parallel"?"selected":""}>并发并行 (Concurrent Parallel)</option>
+      </select><div class="hint">concurrent_batch: 多账号并发处理批次请求; concurrent_parallel: 完全并行处理</div></div>
+      ${fld("s_img_ret","图片记录保留天数", s.image_record_retention_days||30,"number","超过天数后自动清理历史记录")}
+      ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+      ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+    </div>
+  </div>
+  <div class="card">
+    <h2>Chat 密码设置</h2>
+    <div class="grid g2">
+      <div><label>Chat 访问密码 (留空=无需密码)</label><input id="s_chat_pw" type="password" placeholder="输入新密码或留空禁用"></div>
+      <div><label>确认密码</label><input id="s_chat_pw_confirm" type="password" placeholder="再次输入密码"></div>
+    </div>
+    <div class="hint" style="margin-top:8px">设置后，访问 /chat 页面需要输入密码。清空密码则无需验证即可访问。</div>
   </div>
   <div class="card">
     <h2>迁移</h2>
@@ -618,9 +708,11 @@ function bindSettingsEvents(){
       queue_max_size:Number(g("s_qsize")), keepalive_interval_ms:Number(g("s_keep")),
       image_concurrency:Number(g("s_imconc")), video_max_inflight:Number(g("s_vconc")),
       breaker_revive_sec:Number(g("s_brev")), affinity_mode:g("s_affinity"),
-      default_image_tier:g("s_tier"), retry_max:Number(g("s_retry")),
+      region_priority:g("s_region"), default_image_tier:g("s_tier"), retry_max:Number(g("s_retry")),
       retry_base_backoff_ms:Number(g("s_rbase")), retry_max_backoff_ms:Number(g("s_rmax")),
-      probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl"))
+      probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
+      optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
+      image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap"))
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
@@ -699,7 +791,7 @@ function viewAbout(){
       <button class="sm" id="btnChk">检查更新</button>
       <button class="sm primary" id="btnApply">立即更新</button>
       <a class="muted" style="font-size:12px" target="_blank" rel="noopener noreferrer"
-         href="https://github.com/my788525/agnes-hub-go/releases">查看全部版本 ↗</a>
+         href="https://github.com/my788525/baipiao-hub/releases">查看全部版本 ↗</a>
     </div>
   </div>
   <div class="card">

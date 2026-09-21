@@ -42,14 +42,29 @@ var RPMTable = map[string]map[string]float64{
 // PoolClasses 是全部限流桶。顺序即控制台展示顺序。
 var PoolClasses = []string{"text", "image_1k", "image_2k", "image_3k", "image_4k", "video"}
 
-// AccessTypes 官方三档账号类型。
-var AccessTypes = []string{"free", "enterprise", "tokenplan"}
+// AccessTypes 支持的账号类型。
+var AccessTypes = []string{"free", "enterprise", "tokenplan", "amd"}
 
 // DefaultBaseURL / CNBaseURL 官方两个站点。
 const (
 	DefaultBaseURL = "https://apihub.agnes-ai.com/v1"
 	CNBaseURL      = "https://api.agnes-ai.cn/v1"
 )
+
+// IsCNHost 判断 base_url 是否属于中国站（agnes-ai.cn）。
+func IsCNHost(baseURL string) bool {
+	return strings.Contains(strings.ToLower(baseURL), "agnes-ai.cn")
+}
+
+// stringInSlice 检查字符串是否在切片中。
+func StringInSlice(s string, list []string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
 
 // ---------------------------------------------------------------------------
 // 数据模型
@@ -110,22 +125,27 @@ type AccountStats struct {
 
 // Account 是一个上游账号。运行期状态全部放在 hub 里，这里只留需要落盘的字段。
 type Account struct {
-	ID              string             `json:"id"`
-	Name            string             `json:"name"`
-	APIKey          string             `json:"api_key"`
-	BaseURL         string             `json:"base_url"`
-	AccessType      string             `json:"access_type"`
-	Enabled         bool               `json:"enabled"`
-	Group           string             `json:"group,omitempty"`
-	ClassesEnabled  []string           `json:"classes_enabled"`
-	ModelManifest   ModelManifest      `json:"model_manifest"`
-	RPMOverrides    map[string]float64 `json:"rpm_overrides"`
-	MaxConcurrency  int                `json:"max_concurrency"`
-	LearnedFactor   float64            `json:"learned_factor"`
-	PoolFactors     map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
-	LastRateLimited float64            `json:"last_rate_limited_at"`
-	CreatedAt       float64            `json:"created_at"`
-	Stats           AccountStats       `json:"stats"`
+	ID                  string             `json:"id"`
+	Name                string             `json:"name"`
+	APIKey              string             `json:"api_key"`
+	BaseURL             string             `json:"base_url"`
+	AccessType          string             `json:"access_type"`
+	Enabled             bool               `json:"enabled"`
+	Group               string             `json:"group,omitempty"`
+	ClassesEnabled      []string           `json:"classes_enabled"`
+	ModelManifest       ModelManifest      `json:"model_manifest"`
+	RPMOverrides        map[string]float64 `json:"rpm_overrides"`
+	MaxConcurrency      int                `json:"max_concurrency"`
+	LearnedFactor       float64            `json:"learned_factor"`
+	PoolFactors         map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
+	LastRateLimited     float64            `json:"last_rate_limited_at"`
+	CreatedAt           float64            `json:"created_at"`
+	Stats               AccountStats       `json:"stats"`
+	// DefaultModel 是该账号的「兜底模型」：当下游传入的模型不在本账号 Manifest 时，
+	// 网关会用这个模型名发请求。留空则退回全局 auto 选择。
+	DefaultModel        string             `json:"default_model,omitempty"`
+	// ConsecutiveFailures 连续失败计数（跨会话保留），用于长期健康追踪。
+	ConsecutiveFailures int                `json:"consecutive_failures"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -179,6 +199,16 @@ type ImageJob struct {
 	RequestID string  `json:"request_id"`
 }
 
+// ChatLog 是聊天对话记录（用户问题 + 助手回复），持久化于 chat_logs.json。
+type ChatLog struct {
+	ID        string  `json:"id"`
+	Model     string  `json:"model"`
+	Prompt    string  `json:"prompt"`
+	Reply     string  `json:"reply"`
+	Status    string  `json:"status"`
+	CreatedAt float64 `json:"created_at"`
+}
+
 // AutoIntentSettings 是 agnes-auto 的判定与适配配置。
 type AutoIntentSettings struct {
 	ContentScan      bool                `json:"content_scan"`
@@ -208,6 +238,9 @@ type Settings struct {
 	KeepaliveMS          int                `json:"keepalive_interval_ms"`
 	AffinityMode         string             `json:"affinity_mode"`
 	DefaultImageTier     string             `json:"default_image_tier"`
+	// RegionPriority 站点优先级：cn_first（国内优先）或 com_first（国际优先）。
+	// 401/403 凭据被拒时自动切换到另一站点的 BaseURL 重试同一账号。
+	RegionPriority       string             `json:"region_priority,omitempty"`
 	ModelAliases         map[string]string  `json:"model_aliases"`
 	AutoModelName        string             `json:"auto_model_name"`
 	AutoIntent           AutoIntentSettings `json:"auto_intent"`
@@ -226,6 +259,9 @@ type Settings struct {
 	ProbeModel           string             `json:"probe_model"`
 	OptimizationMode     string             `json:"optimization_mode"`
 	ImageRecordRetention int                `json:"image_record_retention_days"`
+	ImageMaxCapacity     int                `json:"image_max_capacity"`
+	VideoMaxCapacity     int                `json:"video_max_capacity"`
+	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
 }
@@ -257,13 +293,13 @@ func DefaultSettings() Settings {
 			VideoInputField:  "image",
 			VideoWaitSec:     0,
 			PreferredModels: map[string][]string{
-				"text":  {"agnes-2.5-flash", "agnes-2.0-flash"},
+				"text":  {"agnes-3.0-flash", "agnes-2.5-flash", "agnes-2.0-flash"},
 				"image": {"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
 				"video": {"agnes-video-2.5-flash", "agnes-video-v2.0"},
 			},
 		},
 		ModelManifestDefault: ModelManifest{
-			Text:  []string{"agnes-2.5-flash", "agnes-2.0-flash", "agnes-3.0-flash"},
+			Text:  []string{"agnes-3.0-flash", "agnes-2.5-flash", "agnes-2.0-flash"},
 			Image: []string{"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
 			Video: []string{"agnes-video-2.5-flash", "agnes-video-2.5", "agnes-video-v2.0"},
 		},
@@ -281,6 +317,10 @@ func DefaultSettings() Settings {
 		ProbeModel:          "agnes-2.5-flash",
 		OptimizationMode:    "concurrent_batch",
 		ImageRecordRetention: 30,
+		ImageMaxCapacity:    500,
+		VideoMaxCapacity:    200,
+		RegionPriority:      "cn_first",
+		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
 	}
 }
 
@@ -298,6 +338,7 @@ type Store struct {
 	Bindings  map[string]Binding
 	Jobs      map[string]*VideoJob
 	ImageJobs map[string]*ImageJob
+	ChatLogs  map[string]*ChatLog
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -307,6 +348,7 @@ func NewStore(dir string) (*Store, error) {
 		Settings: DefaultSettings(),
 		Bindings: map[string]Binding{},
 		Jobs:     map[string]*VideoJob{},
+		ChatLogs: map[string]*ChatLog{},
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -314,7 +356,18 @@ func NewStore(dir string) (*Store, error) {
 	if err := s.load(); err != nil {
 		return nil, err
 	}
-	if s.Settings.AdminPasswordHash == "" {
+	// 处理安装向导传入的初始/覆盖密码（AGNES_ADMIN_PASSWORD 由 cmd/main 在填写了
+	// wizard_admin_password 时注入）。只要该变量非空，就覆盖当前管理员密码。
+	if adminPW := os.Getenv("AGNES_ADMIN_PASSWORD"); adminPW != "" {
+		salt := randHex(8)
+		s.Settings.AdminPasswordSalt = salt
+		s.Settings.AdminPasswordHash = HashPassword(adminPW, salt)
+		s.Settings.MustChangePassword = true
+		if err := s.saveSettingsLocked(); err != nil {
+			return nil, err
+		}
+	} else if s.Settings.AdminPasswordHash == "" {
+		// 无向导密码且无现有密码：回退到内部默认（不在任何界面展示）
 		salt := randHex(8)
 		s.Settings.AdminPasswordSalt = salt
 		s.Settings.AdminPasswordHash = HashPassword("admin123", salt)
@@ -355,6 +408,10 @@ func (s *Store) load() error {
 	}
 	s.ImageJobs = map[string]*ImageJob{}
 	if err := readJSON(s.path("image_jobs.json"), &s.ImageJobs); err != nil {
+		return err
+	}
+	s.ChatLogs = map[string]*ChatLog{}
+	if err := readJSON(s.path("chat_logs.json"), &s.ChatLogs); err != nil {
 		return err
 	}
 	for _, a := range s.Accounts {
@@ -451,6 +508,12 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.ImageRecordRetention <= 0 {
 		v.ImageRecordRetention = d.ImageRecordRetention
+	}
+	if v.ImageMaxCapacity <= 0 {
+		v.ImageMaxCapacity = d.ImageMaxCapacity
+	}
+	if v.VideoMaxCapacity <= 0 {
+		v.VideoMaxCapacity = d.VideoMaxCapacity
 	}
 }
 
@@ -654,6 +717,39 @@ func (s *Store) MutateAccount(id string, fn func(*Account) bool) bool {
 			if fn(a) {
 				_ = s.saveAccountsLocked()
 			}
+			return true
+		}
+	}
+	return false
+}
+
+// TouchStatsDirty 在写锁内改账号统计但**不**落盘，仅由调度器 30s 维护循环批量 flush。
+// 用途：429 风暴 / 高频成功路径避免每次请求都同步写 accounts.json。
+func (s *Store) TouchStatsDirty(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			return // 数据已在内存，落盘交给定期 flush（见 hub.flushFactors）
+		}
+	}
+}
+
+// FlushAccounts 把内存中所有账号的状态写一次 accounts.json。
+// 用于维护循环的批量落盘（替代热路径里的同步写盘）。
+func (s *Store) FlushAccounts() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.saveAccountsLocked()
+}
+
+// MutateAccountNoSave 在写锁内改账号但不落盘（由调用方负责标 dirty / 定时落盘）。
+func (s *Store) MutateAccountNoSave(id string, fn func(*Account) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.Accounts {
+		if a.ID == id {
+			fn(a)
 			return true
 		}
 	}
@@ -955,6 +1051,43 @@ func (s *Store) PutJob(job *VideoJob) {
 		s.Jobs = map[string]*VideoJob{}
 	}
 	s.Jobs[job.JobID] = job
+	s.evictVideoJobsLocked()
+	_ = s.saveJobsLocked()
+}
+
+// evictVideoJobsLocked 在持锁状态下按容量上限淘汰最旧记录（调用前必须已加写锁）。
+func (s *Store) evictVideoJobsLocked() {
+	cap := s.Settings.VideoMaxCapacity
+	if cap <= 0 || len(s.Jobs) <= cap {
+		return
+	}
+	ids := make([]*VideoJob, 0, len(s.Jobs))
+	for _, j := range s.Jobs {
+		ids = append(ids, j)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].CreatedAt < ids[j].CreatedAt })
+	for i := 0; i < len(ids)-cap; i++ {
+		delete(s.Jobs, ids[i].JobID)
+	}
+}
+
+// DeleteVideoJob 删除单条视频记录。
+func (s *Store) DeleteVideoJob(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.Jobs[id]; !ok {
+		return false
+	}
+	delete(s.Jobs, id)
+	_ = s.saveJobsLocked()
+	return true
+}
+
+// ClearVideoJobs 清空全部视频记录。
+func (s *Store) ClearVideoJobs() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Jobs = map[string]*VideoJob{}
 	_ = s.saveJobsLocked()
 }
 
@@ -998,7 +1131,7 @@ func (s *Store) JobsSnapshot() []*VideoJob {
 
 // ---- 图片任务 ----
 
-// PutImageJob 记录图片任务。
+// PutImageJob 记录图片任务，并在超过容量上限时淘汰最旧记录。
 func (s *Store) PutImageJob(job *ImageJob) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1006,6 +1139,44 @@ func (s *Store) PutImageJob(job *ImageJob) {
 		s.ImageJobs = map[string]*ImageJob{}
 	}
 	s.ImageJobs[job.JobID] = job
+	s.evictImageJobsLocked()
+	_ = s.saveImageJobsLocked()
+}
+
+// evictImageJobsLocked 在持锁状态下按容量上限淘汰最旧记录（调用前必须已加写锁）。
+func (s *Store) evictImageJobsLocked() {
+	cap := s.Settings.ImageMaxCapacity
+	if cap <= 0 || len(s.ImageJobs) <= cap {
+		return
+	}
+	// 按创建时间升序排序，删掉最旧的若干条
+	ids := make([]*ImageJob, 0, len(s.ImageJobs))
+	for _, j := range s.ImageJobs {
+		ids = append(ids, j)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i].CreatedAt < ids[j].CreatedAt })
+	for i := 0; i < len(ids)-cap; i++ {
+		delete(s.ImageJobs, ids[i].JobID)
+	}
+}
+
+// DeleteImageJob 删除单条图片记录。
+func (s *Store) DeleteImageJob(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.ImageJobs[id]; !ok {
+		return false
+	}
+	delete(s.ImageJobs, id)
+	_ = s.saveImageJobsLocked()
+	return true
+}
+
+// ClearImageJobs 清空全部图片记录。
+func (s *Store) ClearImageJobs() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ImageJobs = map[string]*ImageJob{}
 	_ = s.saveImageJobsLocked()
 }
 
@@ -1035,6 +1206,66 @@ func (s *Store) ImageJobsSnapshot() []*ImageJob {
 }
 
 func (s *Store) saveImageJobsLocked() error { return writeJSON(s.path("image_jobs.json"), s.ImageJobs) }
+
+// ---- 聊天记录 ----
+
+// AddChatLog 追加一条聊天对话记录并落盘。
+func (s *Store) AddChatLog(log *ChatLog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ChatLogs == nil {
+		s.ChatLogs = map[string]*ChatLog{}
+	}
+	s.ChatLogs[log.ID] = log
+	_ = s.saveChatLogsLocked()
+}
+
+// DeleteChatLog 删除单条聊天记录。
+func (s *Store) DeleteChatLog(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.ChatLogs[id]; !ok {
+		return false
+	}
+	delete(s.ChatLogs, id)
+	_ = s.saveChatLogsLocked()
+	return true
+}
+
+// ClearChatLogs 清空全部聊天记录。
+func (s *Store) ClearChatLogs() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ChatLogs = map[string]*ChatLog{}
+	_ = s.saveChatLogsLocked()
+}
+
+// ChatLogByID 取单条聊天记录。
+func (s *Store) ChatLogByID(id string) (*ChatLog, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	j, ok := s.ChatLogs[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *j
+	return &cp, true
+}
+
+// ChatLogsSnapshot 返回全部聊天记录（按创建时间倒序）。
+func (s *Store) ChatLogsSnapshot() []*ChatLog {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*ChatLog, 0, len(s.ChatLogs))
+	for _, j := range s.ChatLogs {
+		cp := *j
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+func (s *Store) saveChatLogsLocked() error { return writeJSON(s.path("chat_logs.json"), s.ChatLogs) }
 
 // ---- 用量日志 ----
 
@@ -1136,7 +1367,7 @@ func (s *Store) SetChatPassword(password string) error {
 func (s *Store) SessionToken() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	sum := sha256.Sum256([]byte(s.Settings.AdminPasswordSalt + ":" + s.Settings.AdminPasswordHash + ":agnes-hub"))
+	sum := sha256.Sum256([]byte(s.Settings.AdminPasswordSalt + ":" + s.Settings.AdminPasswordHash + ":baiPiao-hub"))
 	return hex.EncodeToString(sum[:])
 }
 
