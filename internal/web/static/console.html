@@ -104,14 +104,15 @@
 <script>
 const POOLS = ["text","image_1k","image_2k","image_3k","image_4k","video"];
 const MODALITIES = ["text","image","video"];
-const TYPES = ["free","enterprise","tokenplan","amd","openrouter"];
+const TYPES = ["free","enterprise","tokenplan","amd","openrouter","aistudio"];
 // 各 access_type 的默认 Base URL（与后端 DefaultBaseURLByType 对应）。
 const DEFAULT_BASE_BY_TYPE = {
   free: "https://apihub.agnes-ai.com/v1",
   enterprise: "https://apihub.agnes-ai.com/v1",
   tokenplan: "https://apihub.agnes-ai.com/v1",
   amd: "https://developer.amd.com.cn/radeon/api/v1",
-  openrouter: "https://openrouter.ai/api/v1"
+  openrouter: "https://openrouter.ai/api/v1",
+  aistudio: "http://127.0.0.1:2048/v1"
 };
 const state = { tab:"overview", session:null, stats:null, accounts:null, keys:[], logs:[], settings:null, jobs:[], bindings:[] };
 

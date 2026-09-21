@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>白嫖 Hub · AI Studio (Mag1cFall) 接入与 Windows 实测指南</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#171a21; --card2:#1d212b; --line:#2a2f3a;
+    --txt:#e6e9ef; --mut:#9aa3b2; --accent:#4f8cff; --green:#36c98d; --amber:#f0b429; --red:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.65}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 20px 64px}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--mut);margin:0 0 24px;font-size:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:16px 0}
+  .card h2{font-size:17px;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .pill{display:inline-block;font-size:12px;padding:2px 9px;border-radius:999px;border:1px solid var(--line);color:var(--mut);margin-right:6px}
+  .pill.green{color:var(--green);border-color:#1f6b4f;background:#0f2a20}
+  .pill.amber{color:var(--amber);border-color:#6b541a;background:#2a220f}
+  .pill.blue{color:var(--accent);border-color:#274a82;background:#0f1d33}
+  code{background:var(--card2);padding:1px 6px;border-radius:5px;font-size:13px;color:#ffd9a0}
+  pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow:auto;font-size:13px}
+  pre code{background:none;padding:0;color:#d7e2f4}
+  ul{margin:8px 0;padding-left:20px}
+  li{margin:4px 0}
+  .warn{border-left:3px solid var(--amber);background:#1f1a0c;padding:10px 14px;border-radius:0 8px 8px 0;margin:10px 0}
+  .good{border-left:3px solid var(--green);background:#0e211a;padding:10px 14px;border-radius:0 8px 8px 0;margin:10px 0}
+  .step{display:flex;gap:10px;align-items:flex-start;margin:10px 0}
+  .num{flex:0 0 24px;height:24px;width:24px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left}
+  th{background:var(--card2);color:var(--mut)}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>白嫖 Hub · 接入 AI Studio（Mag1cFall/AIStudio2API）</h1>
+  <p class="sub">版本 1.0.12 · Windows 端实测指南 · 飞牛端待本机验证后再做</p>
+
+  <div class="card">
+    <h2>架构结论 <span class="pill blue">必读</span></h2>
+    <p>Mag1cFall/AIStudio2API 本质是 <b>浏览器自动化代理</b>：靠 Camoufox（Firefox 分支）承载 Google 的 WAA 反自动化运行时，把 AI Studio 网页协议转成 OpenAI 兼容 API。它<b>必须作为独立进程（sidecar）常驻</b>，<b>不能编译进</b>白嫖 Hub 的 Go 进程。</p>
+    <p>因此集成方式是 <b>sidecar 模式</b>：白嫖 Hub 把它的 OpenAI 端点当作一个上游（与 openrouter 同模式）。白嫖 Hub 负责统一入口、RPM 限流、粘性会话、账号优先级；Mag1cFall 负责真正和 Google 对话。</p>
+    <div class="good">已用 mock sidecar 在 Windows 端做端到端冒烟测试：客户端 → 白嫖 Hub（Windows exe）→ aistudio 账号 → 转发到 sidecar <code>POST /v1/chat/completions</code>（带 <code>Authorization: Bearer</code>）→ 回传 OpenAI 格式完成体，链路 <b>FORWARD_OK</b>。</div>
+  </div>
+
+  <div class="card">
+    <h2>① 准备 Mag1cFall sidecar（Windows）</h2>
+    <div class="step"><div class="num">1</div><div>下载单文件 Go 二进制 <code>aistudio2api.exe</code>（Releases 页）放到一个目录，例如 <code>D:\ai\aistudio2api\</code>。</div></div>
+    <div class="step"><div class="num">2</div><div>安装 Camoufox 浏览器运行时（Mag1cFall 的文档里给了一键下载/安装命令；首次需它拉取 Firefox 系运行库）。</div></div>
+    <div class="step"><div class="num">3</div><div>准备 <code>.env</code>（与 exe 同目录）：<pre><code>LISTEN_ADDR=127.0.0.1:2048
+PROXY_API_KEY=你自定义的sidecar密钥
+AISTUDIO_AUTH_STATES=auth
+# 可选：HTTPS_PROXY / HTTP_PROXY 让 Camoufox 走代理</code></pre></div></div>
+    <div class="step"><div class="num">4</div><div>首次登录 Google 账号（一次性）：运行 <code>./aistudio2api setup --login</code>，会弹 Camoufox 窗口，登录后认证材料存到 <code>auth/&lt;邮箱&gt;/storage-state.json</code>。之后日常只需双击 exe 即可，无需再登录。</div></div>
+    <div class="step"><div class="num">5</div><div>启动：直接运行 <code>aistudio2api.exe</code>。确认它监听 <code>http://127.0.0.1:2048/v1/chat/completions</code>。可用 <code>curl http://127.0.0.1:2048/v1/models</code> 验证返回模型列表。</div></div>
+    <div class="warn">Mag1cFall 默认端口是 <code>2048</code>；若你改了 <code>LISTEN_ADDR</code>，下面白嫖 Hub 里填的 base_url 要同步改。</div>
+  </div>
+
+  <div class="card">
+    <h2>② 在白嫖 Hub 加 aistudio 账号</h2>
+    <p>打开白嫖 Hub 控制台 <code>http://127.0.0.1:4142/console</code> → 账号 → 添加，填写：</p>
+    <table>
+      <tr><th>字段</th><th>值</th><th>说明</th></tr>
+      <tr><td>名称</td><td><code>AIStudio-01</code></td><td>随意</td></tr>
+      <tr><td>Key</td><td><code>你自定义的sidecar密钥</code></td><td>必须等于 Mag1cFall 的 <code>PROXY_API_KEY</code></td></tr>
+      <tr><td>类型</td><td><code>aistudio</code></td><td>新增的上游类型；选了它 base_url 自动填 <code>http://127.0.0.1:2048/v1</code></td></tr>
+      <tr><td>Base URL</td><td><code>http://127.0.0.1:2048/v1</code></td><td>默认已填，sidecar 在本机/同机时无需改</td></tr>
+      <tr><td>模型清单（text）</td><td><code>gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash, gemini-3.1-pro-preview, gemini-3-flash-preview, gemini-2.5-flash, gemini-2.5-pro</code></td><td>务必和 Mag1cFall <code>GET /v1/models</code> 返回的真实模型名一致；不一致会路由不到</td></tr>
+      <tr><td>RPM</td><td>默认 20（text）</td><td>保守上限，实测可上调</td></tr>
+    </table>
+    <div class="good">留空模型清单时，白嫖 Hub 会套用 aistudio 专用默认清单（已内置上述 Gemini 模型），不会再误套 agnes 默认清单。</div>
+  </div>
+
+  <div class="card">
+    <h2>③ 客户端指向白嫖 Hub</h2>
+    <p>任何 OpenAI 兼容客户端，Base URL 填 <code>http://127.0.0.1:4142/v1</code>，模型填上面声明的 Gemini 名（如 <code>gemini-3.8-flash</code>），Key 填白嫖 Hub 签发的下游密钥。</p>
+    <pre><code># 直接打网关验证
+curl http://127.0.0.1:4142/v1/chat/completions \
+  -H "Authorization: Bearer &lt;白嫖Hub下游Key&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'</code></pre>
+    <p>请求流：客户端 → 白嫖 Hub（按模型选 aistudio 账号、限流、粘性）→ Mag1cFall sidecar → Google AI Studio。</p>
+  </div>
+
+  <div class="card">
+    <h2>已知约束 <span class="pill amber">注意</span></h2>
+    <ul>
+      <li><b>Camoufox 必须常驻</b>：sidecar 进程挂了，aistudio 账号全部不可达。这是以后上飞牛的最大门槛（容器内要能跑 Firefox 系运行时）。</li>
+      <li><b>至少一次 Google 登录</b>：<code>storage-state.json</code> 过期/失效后需在 Mag1cFall 里重新登录。</li>
+      <li><b>内存</b>：每账号 ~700MB+（Camoufox Worker）。</li>
+      <li><b>WAA 脆弱性</b>：受 Google 反自动化保护，协议可能随时被改，所有同类方案通用风险。</li>
+      <li><b>模型名要对齐</b>：白嫖 Hub 的账号模型清单必须和 Mag1cFall <code>/v1/models</code> 完全一致，否则路由不到该账号。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>排错速查</h2>
+    <table>
+      <tr><th>现象</th><th>可能原因</th><th>处理</th></tr>
+      <tr><td>401 / API Key 无效</td><td>白嫖 Hub 账号 Key ≠ Mag1cFall PROXY_API_KEY</td><td>两边改成同一个值</td></tr>
+      <tr><td>无可用账号 / 路由不到</td><td>模型名不在该账号清单里</td><td>核对 Mag1cFall <code>/v1/models</code>，更新账号模型清单</td></tr>
+      <tr><td>连接拒绝 2048</td><td>sidecar 没起 / 端口不对</td><td>确认 <code>aistudio2api.exe</code> 在跑，LISTEN_ADDR 与 base_url 一致</td></tr>
+      <tr><td>返回 Google 登录页 / 空响应</td><td>Camoufox 登录态失效</td><td>重新 <code>setup --login</code></td></tr>
+    </table>
+  </div>
+</div>
+</body>
+</html>

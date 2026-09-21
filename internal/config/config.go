@@ -47,13 +47,19 @@ var RPMTable = map[string]map[string]float64{
 	"openrouter": {
 		"text": 20, "image_1k": 5, "image_2k": 2, "image_3k": 1, "image_4k": 1, "video": 1,
 	},
+	// aistudio = Mag1cFall/AIStudio2API 浏览器自动化 sidecar（Camoufox + Google WAA 运行时）。
+	// 对外暴露 OpenAI 兼容端点（默认 http://127.0.0.1:2048/v1）。实际速率受 Google 账号配额
+	// 与 sidecar 自带多账号轮询约束；这里给保守上限，用户可按实测用 rpm_overrides 上调。
+	"aistudio": {
+		"text": 20, "image_1k": 5, "image_2k": 2, "image_3k": 1, "image_4k": 1, "video": 1,
+	},
 }
 
 // PoolClasses 是全部限流桶。顺序即控制台展示顺序。
 var PoolClasses = []string{"text", "image_1k", "image_2k", "image_3k", "image_4k", "video"}
 
 // AccessTypes 支持的账号类型。
-var AccessTypes = []string{"free", "enterprise", "tokenplan", "amd", "openrouter"}
+var AccessTypes = []string{"free", "enterprise", "tokenplan", "amd", "openrouter", "aistudio"}
 
 // DefaultBaseURL / CNBaseURL 官方两个站点。
 const (
@@ -69,6 +75,32 @@ var DefaultBaseURLByType = map[string]string{
 	"tokenplan":  "https://apihub.agnes-ai.com/v1",
 	"amd":        "https://developer.amd.com.cn/radeon/api/v1",
 	"openrouter": "https://openrouter.ai/api/v1",
+	// aistudio = 本地/同机运行的 Mag1cFall/AIStudio2API sidecar（Camoufox + Google WAA）。
+	"aistudio": "http://127.0.0.1:2048/v1",
+}
+
+// DefaultManifestByType 各 access_type 的默认模型清单（仅当账号自身未声明时套用）。
+// 作用：避免 aistudio/openrouter 这类聚合上游在被加账号时留空、误套用全局 agnes 默认清单。
+// 模型名取自 Mag1cFall/AIStudio2API 文档中实际暴露的 Gemini 命名；若你的 sidecar 暴露的模型名
+// 不同，请在控制台账号的「模型清单」里按 Mag1cFall GET /v1/models 的结果改为实际名称。
+var DefaultManifestByType = map[string]ModelManifest{
+	"aistudio": {
+		Text: []string{
+			"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+			"gemini-3.1-pro-preview", "gemini-3-flash-preview",
+			"gemini-2.5-flash", "gemini-2.5-pro",
+		},
+		Image: []string{"gemini-3-pro-image", "gemini-3.1-flash-image", "gemini-2.5-flash-image"},
+		Video: []string{},
+	},
+}
+
+// DefaultManifestForType 返回某类型的默认模型清单；未知类型回退全局默认。
+func DefaultManifestForType(accessType string, s Settings) ModelManifest {
+	if m, ok := DefaultManifestByType[accessType]; ok {
+		return m
+	}
+	return s.ModelManifestDefault
 }
 
 // DefaultBaseURLForType 返回某类型的默认 Base URL（未知类型回退官方默认）。
@@ -579,14 +611,15 @@ func normalizeAccount(a *Account, s Settings) {
 	if a.BaseURL == "" {
 		a.BaseURL = DefaultBaseURL
 	}
+	dm := DefaultManifestForType(a.AccessType, s)
 	if a.ModelManifest.Text == nil {
-		a.ModelManifest.Text = append([]string(nil), s.ModelManifestDefault.Text...)
+		a.ModelManifest.Text = append([]string(nil), dm.Text...)
 	}
 	if a.ModelManifest.Image == nil {
-		a.ModelManifest.Image = append([]string(nil), s.ModelManifestDefault.Image...)
+		a.ModelManifest.Image = append([]string(nil), dm.Image...)
 	}
 	if a.ModelManifest.Video == nil {
-		a.ModelManifest.Video = append([]string(nil), s.ModelManifestDefault.Video...)
+		a.ModelManifest.Video = append([]string(nil), dm.Video...)
 	}
 }
 
