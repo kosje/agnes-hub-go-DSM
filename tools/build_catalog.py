@@ -52,10 +52,10 @@ PRIMARY_ARCH = "x86_64"
 
 # 套件中心里显示的变更说明（HTML）。发新版时改这里。
 CHANGELOG = (
-    "修复图标与桌面集成。<br>"
-    "· 套件图标去掉黑底，改为透明背景<br>"
-    "· 256 图标改用双线性放大，消除方块台阶<br>"
-    "· 新增 DSM 桌面图标，可从桌面直接打开控制台"
+    "修复图标观感与桌面集成。<br>"
+    "· 图标补上圆角方形底色，在浅色界面上清晰可辨（原来透明化后白色元素会消失）<br>"
+    "· 补全 DSM 7 的 dsmapppage / dsmapplaunchname 字段，并配齐 8 种尺寸的桌面图标<br>"
+    "· 恢复套件中心的「打开」按钮"
 )
 
 CATALOG_FIELDS_NOTE = "SynoCommunity/spkrepo 的 build_entry_data 与 sspks 的字段清单"
