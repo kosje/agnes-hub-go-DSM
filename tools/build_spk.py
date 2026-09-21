@@ -66,6 +66,9 @@ SERVICE_PORT = 4142
 DSM_APP_NAME = "SYNO.SDS.agneshub.Application"
 # 桌面图标点开后的落地路径（管理控制台）
 DSM_APP_URL = "/console"
+# 桌面图标要成套给：DSM 会在桌面、开始菜单、任务栏等不同位置按尺寸取用。
+# 参考的真实套件（synoedit / wol-spk）都提供这一组。
+DSM_ICON_SIZES = (16, 24, 32, 48, 64, 72, 128, 256)
 OS_MIN_VER = "7.0-40000"
 MAINTAINER = "kosje"
 MAINTAINER_URL = "https://github.com/kosje/agnes-hub-go-DSM"
@@ -471,6 +474,52 @@ def _key_out_black(w, h, px, threshold=16):
     return out
 
 
+# App 图标底色：取自 logo 自身的深蓝色系（最饱和像素是 rgb(46,84,162)）。
+# 上游 logo 是「浅紫渐变圆 + 白色元素」，本来就是配黑底设计的，直接透明化后在
+# DSM 的浅色界面上白色元素会完全消失。补一层圆角方底既保住对比，又符合 App
+# 图标的常见形态。
+ICON_BG_TOP = (62, 92, 170)
+ICON_BG_BOTTOM = (28, 40, 88)
+ICON_CORNER_RADIUS = 0.22
+
+
+def _app_icon(w, h, px):
+    """把透明底的 logo 合成到圆角方形底色上，产出可直接使用的 App 图标。
+
+    只在「源图无 alpha、靠键控去背」时调用：那种情况下 logo 的原设计对比度
+    依赖黑底，透明化后在浅色界面上不可辨。
+    """
+    rad = max(1, int(min(w, h) * ICON_CORNER_RADIUS))
+    out = bytearray(w * h * 4)
+    for y in range(h):
+        # 竖直渐变
+        t = y / max(1, h - 1)
+        br = int(round(ICON_BG_TOP[0] + (ICON_BG_BOTTOM[0] - ICON_BG_TOP[0]) * t))
+        bg = int(round(ICON_BG_TOP[1] + (ICON_BG_BOTTOM[1] - ICON_BG_TOP[1]) * t))
+        bb = int(round(ICON_BG_TOP[2] + (ICON_BG_BOTTOM[2] - ICON_BG_TOP[2]) * t))
+        for x in range(w):
+            # 圆角：四个角各取一个圆心做距离判断
+            cx = cy = None
+            if x < rad and y < rad:
+                cx, cy = rad, rad
+            elif x >= w - rad and y < rad:
+                cx, cy = w - rad - 1, rad
+            elif x < rad and y >= h - rad:
+                cx, cy = rad, h - rad - 1
+            elif x >= w - rad and y >= h - rad:
+                cx, cy = w - rad - 1, h - rad - 1
+            if cx is not None and (x - cx) ** 2 + (y - cy) ** 2 > rad * rad:
+                continue
+
+            i = (y * w + x) * 4
+            a = px[i + 3] / 255.0
+            out[i] = int(round(px[i] * a + br * (1 - a)))
+            out[i + 1] = int(round(px[i + 1] * a + bg * (1 - a)))
+            out[i + 2] = int(round(px[i + 2] * a + bb * (1 - a)))
+            out[i + 3] = 255
+    return out
+
+
 def make_icon_set(src_png, targets):
     """从图标源文件生成任意尺寸的方形图标。
 
@@ -501,6 +550,9 @@ def make_icon_set(src_png, targets):
             scaled = _bilinear_resize(side, side, crop, size, size)
         else:
             scaled = _box_resize(side, side, crop, size, size)
+        if keyed:
+            # 源图无 alpha、靠键控去背 —— 必须补底，否则在浅色界面上不可辨
+            scaled = _app_icon(size, size, scaled)
         _png_encode_rgba(dst, size, size, scaled)
     return w, h, side
 
@@ -615,8 +667,13 @@ def build_info(arch, spk_ver, checksum, extractsize_kb):
         # DSM 桌面图标：dsmuidir 指向包内的 ui/ 目录，dsmappname 是应用 ID
         # （必须与 ui/config 里的键一致）。reloadui 让安装后桌面自动刷新，
         # 不用手动注销重登就能看到图标。
+        # dsmapppage / dsmapplaunchname 是 DSM 7 新增字段（spksrc 里以
+        # version_ge 7.0 为条件输出），漏掉会导致桌面图标注册不上。
+        # 取值对齐真实可用的 synoedit：三个字段都用同一个应用 ID。
         'dsmuidir="ui"',
         'dsmappname="%s"' % DSM_APP_NAME,
+        'dsmapppage="%s"' % DSM_APP_NAME,
+        'dsmapplaunchname="%s"' % DSM_APP_NAME,
         'reloadui="yes"',
         # 4142 是固定端口（客户端配置依赖它），端口冲突时让服务自己启动失败
         # 并写日志，好过安装阶段直接被拒。
@@ -675,14 +732,17 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
     # 5. DSM 桌面图标（ui/）
     #    只有 INFO 里的 dsmuidir/dsmappname 还不够，必须有 ui/config 把这个
     #    「应用」定义出来 —— 否则套件只出现在套件中心，DSM 桌面上不会有图标。
+    #    图标要成套给：参考的真实套件（synoedit / wol-spk）都提供 16/24/32/48/
+    #    64/72/256 多种尺寸，config 里用 images/icon_{0}.png 让 DSM 按需取。
     ui_images = os.path.join(d, "ui", "images")
     os.makedirs(ui_images, exist_ok=True)
-    make_icon_set(icon_src, [(256, os.path.join(ui_images, "icon_256.png"))])
+    make_icon_set(icon_src, [(n, os.path.join(ui_images, "icon_%d.png" % n))
+                             for n in DSM_ICON_SIZES])
     with open(os.path.join(d, "ui", "config"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({".url": {DSM_APP_NAME: {
             "title": "Agnes Hub",
             "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关",
-            "icon": "images/icon_256.png",
+            "icon": "images/icon_{0}.png",
             "type": "url",
             "protocol": "http",
             "port": str(SERVICE_PORT),
@@ -729,9 +789,11 @@ def validate_spk(path):
         "scripts/preinst", "scripts/postinst", "scripts/preuninst",
         "scripts/postuninst", "scripts/preupgrade", "scripts/postupgrade",
         "conf/privilege", "PACKAGE_ICON.PNG", "PACKAGE_ICON_256.PNG",
-        # DSM 桌面图标：缺了不会导致安装失败，但桌面上不会有图标
-        "ui/config", "ui/images/icon_256.png",
+        "ui/config",
     }
+    # DSM 桌面图标：缺了不会导致安装失败，但桌面上不会有图标。
+    # 图标要成套齐全，DSM 会按场景取不同尺寸。
+    required |= {"ui/images/icon_%d.png" % n for n in DSM_ICON_SIZES}
     # r: 明确只接受未压缩 tar，避免 r:* 又把错误的 gzip 外层悄悄放过。
     with tarfile.open(path, mode="r:") as outer:
         members = {m.name: m for m in outer.getmembers()}
