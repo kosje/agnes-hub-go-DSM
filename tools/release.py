@@ -85,18 +85,20 @@ def build_zip(exe, bat, readme, out):
     print(f"  zip  {out} ({os.path.getsize(out)} bytes)")
 
 
-def build_fpk(version: str):
+def build_fpk(version: str) -> str:
     """调用 build_fpk.py 生成 fpk。
 
     build_fpk.py 的版本号已改为从 main.go 单一来源读取（_version_from_main_go），
-    无需再临时 sed 替换 VERSION/VERSION_TAG。
+    无需再临时 sed 替换 VERSION/VERSION_TAG。产出文件名现为 baipiao-hub-{version}.fpk。
+    返回 fpk 的完整路径，供上层组装 Release 资源列表。
     """
     bf = os.path.join(ROOT, "tools", "build_fpk.py")
     subprocess.run([sys.executable, bf], cwd=ROOT, check=True)
-    fpk = os.path.join(DIST, f"agnes-hub-go-{version}.fpk")
+    fpk = os.path.join(DIST, f"baipiao-hub-{version}.fpk")
     if not os.path.exists(fpk):
         sys.exit(f"[FATAL] 未生成 {fpk}")
     print(f"  fpk  {fpk} ({os.path.getsize(fpk)} bytes)")
+    return fpk
 
 
 def git_push_tag(version: str):
@@ -133,12 +135,19 @@ def github_release(version: str, assets):
         print(f"  [del] 旧 release v{version} (id={rel_id})")
 
     body = (
-        f"## Agnes Hub v{version}\n\n"
-        "- 到达密度 vs 节拍观测指标（控制台）\n"
-        "- 意图判定 LRU 缓存（热路径 O(1)）\n"
-        "- 429 路径批量落盘（消除同步磁盘 I/O）\n"
-        "- HTTP 客户端单例化（全应用共享连接池）\n\n"
-        f"下载 `agnes-hub-go-{version}.fpk`（飞牛）/ `agnes-hub-go-windows-{version}.zip`（Windows 绿色版）。\n"
+        f"## 白嫖 Hub (Agnes Hub) v{version}\n\n"
+        "多账号聚合中转网关，支持 agnes / AMD（developer.amd.com.cn/radeon）/ NVIDIA / M365 / OpenRouter 等渠道统一调度与 RPM 限流排队。\n\n"
+        "### 本版主要变更\n"
+        "- 控制台账号编辑改为完整弹窗（可改名称 / Key / BaseURL / 类型 / 分组 / 并发 / 优先级 / 兜底模型 / 各模态清单 / 各池 RPM）\n"
+        "- 新增「账号调用优先级」与「按账号 RPM 覆盖」（不再统一套用 agnes 的 20rpm）；调度按优先级、区域、预计等待排序\n"
+        "- `/api/models` 与 `/chat` 合并各账号声明模型，AMD / OpenRouter 等非 agnes 渠道的真实模型可直接在下拉选择并测试连通性\n"
+        "- 修复 AMD 经网关返回空体（上游响应体被提前关闭）的问题\n"
+        "- 修复软粘性会话绑定不校验请求模型、会把 agnes 请求错发给 AMD 账号的缺陷\n\n"
+        "### 下载\n"
+        f"- `baipiao-hub-{version}.fpk` — 飞牛 fnOS 安装包（应用中心安装，应用名「白嫖 Hub」，内部 appname 保持 agnes-hub 以保留已装应用数据）\n"
+        f"- `agnes-hub-go-windows-{version}.zip` — Windows 绿色版（含 exe + 启动脚本 + README）\n"
+        f"- `baipiao-hub-linux-amd64` / `baipiao-hub-linux-arm64` — Linux 二进制（x86_64 / aarch64）\n"
+        f"- `agnes-hub-go.exe` — Windows 裸可执行文件\n"
     )
     r = requests.post(f"https://api.github.com/repos/{REPO}/releases", headers=h,
                       proxies=proxies, json={"tag_name": f"v{version}", "name": f"v{version}",
@@ -178,8 +187,10 @@ def main():
     go_env = {"GOROOT": GOROOT, "GOPATH": GOPATH, "GOPROXY": GOPROXY, "GOFLAGS": "-mod=mod"}
 
     # 1. 交叉编译
-    linux_amd64 = os.path.join(ROOT, "agnes-hub-go-linux-amd64")
-    linux_arm64 = os.path.join(ROOT, "agnes-hub-go-linux-arm64")
+    #    注意：build_fpk.py 的 prepare() 要求 ROOT 下存在 baipiao-hub-linux-amd64 /
+    #    baipiao-hub-linux-arm64（与 fnOS 内部二进制同名），故此处产出名必须与之一致。
+    linux_amd64 = os.path.join(ROOT, "baipiao-hub-linux-amd64")
+    linux_arm64 = os.path.join(ROOT, "baipiao-hub-linux-arm64")
     win_exe = os.path.join(ROOT, "agnes-hub-go.exe")
     go_build(go_env, "linux", "amd64", linux_amd64)
     go_build(go_env, "linux", "arm64", linux_arm64)
@@ -197,8 +208,7 @@ def main():
     build_zip(win_exe, bat, readme, win_zip)
 
     # 4. fpk
-    build_fpk(version)
-    fpk = os.path.join(DIST, f"agnes-hub-go-{version}.fpk")
+    fpk = build_fpk(version)
 
     if args.no_push:
         print("[done --no-push] 本地产物完成，未推 tag/Release")
@@ -207,9 +217,9 @@ def main():
     # 5. tag + GitHub Release
     git_push_tag(version)
     assets = [
-        (fpk, f"agnes-hub-go-{version}.fpk", "application/octet-stream"),
-        (linux_amd64, "agnes-hub-go-linux-amd64", "application/octet-stream"),
-        (linux_arm64, "agnes-hub-go-linux-arm64", "application/octet-stream"),
+        (fpk, f"baipiao-hub-{version}.fpk", "application/octet-stream"),
+        (linux_amd64, "baipiao-hub-linux-amd64", "application/octet-stream"),
+        (linux_arm64, "baipiao-hub-linux-arm64", "application/octet-stream"),
         (win_zip, f"agnes-hub-go-windows-{version}.zip", "application/zip"),
         (win_exe, "agnes-hub-go.exe", "application/octet-stream"),
     ]

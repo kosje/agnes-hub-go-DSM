@@ -415,7 +415,7 @@ def prepare():
         ("platform", "x86"),
         ("arch", "x86_64"),
         ("maintainer", "my788525"),
-        ("maintainer_url", "https://github.com/my788525/baipiao-hub"),
+        ("maintainer_url", "https://github.com/my788525/agnes-hub-go"),
         ("os_min_version", "0.9.0"),
         ("desktop_uidir", "ui"),
         ("desktop_applaunchname", "agnes-hub.main"),
