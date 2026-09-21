@@ -283,8 +283,11 @@ def _png_decode_rgba(path):
         body = d[off + 8:off + 8 + ln]
         if typ == b"IHDR":
             w, h, bd, ct, comp, filt, inter = struct.unpack(">IIBBBBB", body)
-            if bd != 8 or ct != 6 or inter != 0:
-                sys.exit("[ERROR] %s 只支持 8 位 RGBA 非隔行 PNG（当前 bitdepth=%d colortype=%d interlace=%d）"
+            # ct=6 是 RGBA，ct=2 是 RGB（无 alpha）。上游换 logo 后用的是 RGB，
+            # 所以两种都收，RGB 在解完滤波后补一条不透明 alpha 通道。
+            if bd != 8 or ct not in (2, 6) or inter != 0:
+                sys.exit("[ERROR] %s 只支持 8 位 RGB / RGBA 非隔行 PNG"
+                         "（当前 bitdepth=%d colortype=%d interlace=%d）"
                          % (path, bd, ct, inter))
         elif typ == b"IDAT":
             idat += body
@@ -293,7 +296,8 @@ def _png_decode_rgba(path):
         off += 12 + ln
 
     raw = zlib.decompress(idat)
-    stride = w * 4
+    bpp = 4 if ct == 6 else 3          # 每像素字节数：RGBA=4，RGB=3
+    stride = w * bpp
     px = bytearray(w * h * 4)
     prev = bytearray(stride)
     pos = 0
@@ -303,25 +307,33 @@ def _png_decode_rgba(path):
         line = bytearray(raw[pos:pos + stride])
         pos += stride
         if ft == 1:
-            for i in range(4, stride):
-                line[i] = (line[i] + line[i - 4]) & 0xFF
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 0xFF
         elif ft == 2:
             for i in range(stride):
                 line[i] = (line[i] + prev[i]) & 0xFF
         elif ft == 3:
             for i in range(stride):
-                a = line[i - 4] if i >= 4 else 0
+                a = line[i - bpp] if i >= bpp else 0
                 line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xFF
         elif ft == 4:
             for i in range(stride):
-                a = line[i - 4] if i >= 4 else 0
+                a = line[i - bpp] if i >= bpp else 0
                 b = prev[i]
-                c = prev[i - 4] if i >= 4 else 0
+                c = prev[i - bpp] if i >= bpp else 0
                 p = a + b - c
                 pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
                 pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
                 line[i] = (line[i] + pr) & 0xFF
-        px[y * stride:(y + 1) * stride] = line
+        if bpp == 4:
+            px[y * w * 4:(y + 1) * w * 4] = line
+        else:
+            # RGB -> RGBA，alpha 补不透明
+            row = bytearray(w * 4)
+            for x in range(w):
+                row[x * 4:x * 4 + 3] = line[x * 3:x * 3 + 3]
+                row[x * 4 + 3] = 0xFF
+            px[y * w * 4:(y + 1) * w * 4] = row
         prev = line
     return w, h, px
 
