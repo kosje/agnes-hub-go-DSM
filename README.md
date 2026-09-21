@@ -465,9 +465,9 @@ python tools/build_catalog.py         # 生成群晖套件源 docs/catalog.json
 # 1. 交叉编译（源码零改动，Go 自带交叉编译，不需要 CGO）
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
 
-# 2. 打包（当前产出 dist/agnes-hub-x86_64-1.0.2-0002.spk）
+# 2. 打包（产出 dist/agnes-hub-x86_64-<版本>-<构建号>.spk）
 python tools/build_spk.py
-SPK_BUILD=3 python tools/build_spk.py    # 下次发布换构建号；群晖要求每次递增
+SPK_BUILD=2 python tools/build_spk.py    # 同一功能版本重发时递增构建号
 
 # 3. 生成套件源（产出 docs/catalog.json，并把 SPK 复制到 docs/ 一起发布）
 python tools/build_catalog.py
@@ -508,7 +508,7 @@ skylaked、v1000 等。
 生成，用 GitHub Pages 托管。加一次源，之后有新版本套件中心会直接提示更新：
 
 ```bash
-python tools/build_catalog.py --tag v1.0.2-0002   # 产出 docs/catalog.json + 图标 + 落地页
+python tools/build_catalog.py --tag v<版本>   # 产出 docs/catalog.json + 图标 + 落地页
 git add docs && git commit -m "chore: 更新套件源" && git push
 ```
 
@@ -572,7 +572,8 @@ git add docs && git commit -m "chore: 更新套件源" && git push
   所以 `build_spk.py` 按 CPU 架构产出独立的包（默认只出 x86_64），并在 INFO
   中列出兼容该二进制的具体 DSM 平台代号。
 - **`INFO` 的值必须带双引号**（`package="agnes-hub"`），且 `version` 必须是
-  「功能号-构建号」（`1.0.2-0001`）。构建号每次发布要递增，否则套件中心认为版本没变、不提示升级。
+  「功能号-构建号」（如 `1.0.9-0001`）。版本号必须严格递增，否则套件中心认为版本没变、
+  不提示升级。换功能版本时构建号从 0001 重新起算（`1.0.9-0001` > `1.0.2-0002` 成立）。
 - **`thirdparty="yes"` 不能漏**。DSM 靠它判定这是第三方套件、走「信任层级」那套流程；
   缺了它 DSM 会把包当成群晖官方包、要求有效的官方签名，安装直接被拒。
 - **生命周期脚本是固定文件名**：`scripts/start-stop-status` 加六个钩子
