@@ -40,7 +40,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.environ.get("FPK_OUT_DIR") or os.path.join(ROOT, "dist")
 FPK_DIR = os.path.join(ROOT, "fpk-bundle")
 
-APP_ID = "baipiao-hub"
+APP_ID = "agnes-hub"
 SERVICE_PORT = 4142
 
 
@@ -318,6 +318,11 @@ exit 0
 TRIVIAL = "#!/bin/bash\nexit 0\n"
 
 CHANGELOG = (
+    "1.0.11：控制台账号编辑改为完整弹窗（可改名称/Key/BaseURL/类型/分组/并发/优先级/兜底模型/各模态清单/各池 RPM）；"
+    "新增「账号调用优先级」与「按账号 RPM 覆盖」（不再统一套用 agnes 20rpm），调度按优先级、区域、预计等待排序；"
+    "/api/models 与 /chat 拉模型清单合并各账号声明模型（AMD/OpenRouter 等非 agnes 渠道真实模型可直接在对话/生图/生视频下拉选择并测试连通性）；"
+    "账号测试改用该账号自身声明模型探测；修复 AMD 经网关返回空体（上游响应体被提前关闭）的问题；修复软粘性会话绑定不校验请求模型、会把 agnes 请求错发给 AMD 账号的缺陷。"
+    "1.0.10：新增 AMD（developer.amd.com.cn/radeon）与 OpenRouter 模型接口、Prometheus /metrics 监控、熔断冷却延长、兜底模型、修复添加 AMD 时 null .value 报错。"
     "1.0.5：控制台新增「到达密度 vs 文本池节拍」观测指标（判定多账号是否真正被吃到）；"
     "意图判定 LRU 缓存（热路径 O(1)，规则变更静默失效）；"
     "429 路径改批量落盘（消除同步磁盘 I/O 拖慢换号重试）；"
@@ -403,8 +408,8 @@ def prepare():
     field_pairs = [
         ("appname", APP_ID),
         ("version", VERSION),
-        ("display_name", "Agnes Hub"),
-        ("desc", "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生/生图/生视频；"
+        ("display_name", "白嫖 Hub"),
+        ("desc", "白嫖 Hub：免费 API 资源聚合中转网关，支持 agnes / AMD / NVIDIA / M365 / OpenRouter 等多渠道账号统一调度与 RPM 限流排队；统一模型 agnes-auto 自动判定文生/生图/生视频；"
                   "FIFO 严格节拍、软粘性溢出、二维自适应校准、熔断自动复活。内置 /chat 网页对话 UI（对话记录持久化、agnes-3.0-flash 默认模型）；飞牛端安装后生成桌面快捷方式，点击打开控制台。"),
         ("source", "thirdparty"),
         ("platform", "x86"),
@@ -495,7 +500,7 @@ def build_inner():
 
     实测 fnOS 会把 app.tgz 内容解压到 /var/apps/<app_id>/ 并再套一层 <app_id>/，
     因此内部路径要这样排布（参考 1.0.0 实际产物）：
-    - 二进制放在 app/ 下        → 最终 <app_id>/app/<bin>，cmd/main 的 $APP_DIR/app/$BIN_NAME 命中
+    - 二进制放在 app/ 下        、 最终 <app_id>/app/<bin>，cmd/main 的 $APP_DIR/app/$BIN_NAME 命中
     - cmd/、wizard/、config/、ui/ 平铺在 app.tgz 顶层
       （ui/ 由 fnOS 套 <app_id>/ 后变成 <app_id>/ui，桌面快捷方式据此读取）
     """
@@ -571,7 +576,7 @@ def build_outer(app_data, md5):
         with tarfile.open(fileobj=fout, mode="w:gz", compresslevel=9,
                           format=tarfile.GNU_FORMAT) as outer:
             # 顺序对齐已知可装的 fnOS fpk（M365-Copilot2API-FNOS）：
-            # manifest → cmd → config → wizard → icons → app.tgz
+            # manifest 、 cmd 、 config 、 wizard 、 icons 、 app.tgz
             # （不单独带 manifest.checksum 文件；完整性由 manifest 内的 checksum= 字段保证）
             # manifest 内每条 key 都右填满 22 字符，对齐 " = " 分隔列。
             _add_file(outer, os.path.join(FPK_DIR, "manifest"), "manifest")

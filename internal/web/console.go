@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -244,13 +245,49 @@ func (s *Server) apiChatSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiChatModels 返回聊天页（对话/生图/生视频）可用的模型列表。
+//
+// 除了内置的 agnes 模型与用户别名，还把每个已启用账号在其清单里声明的模型合并进来，
+// 这样 chat 下拉框才能列出 AMD / OpenRouter 等非 agnes 渠道的真实模型，便于直接测试连通性。
 func (s *Server) apiChatModels(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
 		s.deny(w)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
-	models := pool.KnownModelNamesByModality(settings.ModelAliases)
+	base := pool.KnownModelNamesByModality(settings.ModelAliases)
+	models := map[string][]string{"text": {}, "image": {}, "video": {}}
+	seen := map[string]map[string]bool{"text": {}, "image": {}, "video": {}}
+	add := func(mod, name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[mod][name] {
+			return
+		}
+		seen[mod][name] = true
+		models[mod] = append(models[mod], name)
+	}
+	for _, mod := range []string{"text", "image", "video"} {
+		for _, m := range base[mod] {
+			add(mod, m)
+		}
+	}
+	for _, a := range s.Store.AccountsSnapshot() {
+		if !a.Enabled || strings.TrimSpace(a.APIKey) == "" {
+			continue
+		}
+		mf := pool.ManifestOf(a, settings)
+		for _, m := range mf.Text {
+			add("text", m)
+		}
+		for _, m := range mf.Image {
+			add("image", m)
+		}
+		for _, m := range mf.Video {
+			add("video", m)
+		}
+	}
+	for _, mod := range []string{"text", "image", "video"} {
+		sort.Strings(models[mod])
+	}
 	writeJSON(w, 200, map[string]any{"models": models}, nil)
 }
 
@@ -298,6 +335,8 @@ func (s *Server) apiListAccounts(w http.ResponseWriter, r *http.Request) {
 			"stats":                a.Stats,
 			"consecutive_failures": a.ConsecutiveFailures,
 			"default_model":        a.DefaultModel,
+			"priority":             a.Priority,
+			"rpm_overrides":        a.RPMOverrides,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
@@ -342,11 +381,19 @@ func (s *Server) apiCreateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	account := s.Store.AddAccount(asStr(body["name"]), apiKey,
 		asStr(body["access_type"]), asStr(body["base_url"]), manifest)
+	if v, ok := body["priority"]; ok {
+		if n := asInt(v); n > 0 {
+			s.Store.MutateAccount(account.ID, func(a *config.Account) bool { a.Priority = n; return true })
+		}
+	}
 	if group := strings.TrimSpace(asStr(body["group"])); group != "" {
 		s.Store.MutateAccount(account.ID, func(a *config.Account) bool { a.Group = group; return true })
 	}
 	if v := asInt(body["max_concurrency"]); v > 0 {
 		s.Store.MutateAccount(account.ID, func(a *config.Account) bool { a.MaxConcurrency = v; return true })
+	}
+	if dm := strings.TrimSpace(asStr(body["default_model"])); dm != "" {
+		s.Store.MutateAccount(account.ID, func(a *config.Account) bool { a.DefaultModel = dm; return true })
 	}
 	if overrides, ok := body["rpm_overrides"].(map[string]any); ok {
 		s.Store.MutateAccount(account.ID, func(a *config.Account) bool {
@@ -408,6 +455,13 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		setStr("access_type", &a.AccessType)
 		setStr("default_model", &a.DefaultModel)
 		setBool("enabled", &a.Enabled)
+		if v, ok := body["priority"]; ok {
+			n := asInt(v)
+			if n < 0 {
+				n = 0
+			}
+			a.Priority, changed = n, true
+		}
 		if v, ok := body["api_key"]; ok && strings.TrimSpace(asStr(v)) != "" {
 			a.APIKey, changed = strings.TrimSpace(asStr(v)), true
 		}
@@ -518,9 +572,15 @@ func (s *Server) apiTestAccount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2) 用一个最小文本请求验证 Key / 网络 / 模型权限
+	// 2) 用一个最小文本请求验证 Key / 网络 / 模型权限。
+	//    探测模型优先用该账号自己声明的文本模型（AMD / OpenRouter 等渠道没有官方 ProbeModel），
+	//    拿不到再退回全局 ProbeModel。
+	probeModel := settings.ProbeModel
+	if ms := pool.ManifestOf(account, settings).Text; len(ms) > 0 {
+		probeModel = ms[0]
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"model":      settings.ProbeModel,
+		"model":      probeModel,
 		"messages":   []map[string]any{{"role": "user", "content": "ping"}},
 		"max_tokens": 4, "stream": false,
 	})
@@ -564,7 +624,7 @@ func (s *Server) apiTestAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"ok": status > 0 && status < 400, "status": status,
 		"latency_ms":  time.Since(started).Milliseconds(),
-		"probe_model": settings.ProbeModel,
+		"probe_model": probeModel,
 		"models":      models,
 		"drift":       planned,
 		"hint":        hintForStatus(status),
@@ -634,13 +694,13 @@ func (s *Server) apiBulkImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		name, apiKey := parts[0], parts[1]
-		baseURL := config.DefaultBaseURL
-		if len(parts) > 2 && parts[2] != "" {
-			baseURL = parts[2]
-		}
 		accessType := "free"
 		if len(parts) > 3 && parts[3] != "" {
 			accessType = parts[3]
+		}
+		baseURL := config.DefaultBaseURLForType(accessType)
+		if len(parts) > 2 && parts[2] != "" {
+			baseURL = parts[2]
 		}
 		group := ""
 		if len(parts) > 4 {
@@ -1691,6 +1751,14 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decision.ModelUsed = model
+	// 显式指定了具体模型（如 AMD 的 MiniCPM5-2B、OpenRouter 的某模型）时，
+	// RequiredModel 必须用「用户请求的模型」而不是 auto 解析出的兜底模型，
+	// 否则调度器会去找声明了兜底模型的账号，把请求错发给不认识该模型的渠道。
+	requiredModel := model
+	if !intent.IsAutoModel(requested) && requested != "" {
+		requiredModel = requested
+		decision.ModelUsed = requested
+	}
 
 	bodyFor := func(a *config.Account) ([]byte, string) {
 		if intent.IsAutoModel(requested) || requested == "" {
@@ -1717,7 +1785,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 	sessionKey := s.Hub.SessionKey(headerMap(r), "")
 	opts := relay.Options{
 		SessionKey: sessionKey, PoolClass: poolClass,
-		RequiredModel: model, Method: http.MethodPost, Path: "/v1/chat/completions",
+		RequiredModel: requiredModel, Method: http.MethodPost, Path: "/v1/chat/completions",
 		BodyFor: bodyFor, Idempotent: true,
 	}
 

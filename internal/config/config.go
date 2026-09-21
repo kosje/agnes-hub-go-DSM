@@ -37,19 +37,47 @@ var RPMTable = map[string]map[string]float64{
 	"tokenplan": {
 		"text": 1000, "image_1k": 100, "image_2k": 80, "image_3k": 1, "image_4k": 1, "video": 5,
 	},
+	// amd = AMD Radeon Cloud 免费 API（developer.amd.com.cn/radeon/api/v1）。
+	// 官方未公开精确 RPM，这里用保守值 20，用户可按实测用 rpm_overrides 上调。
+	"amd": {
+		"text": 20, "image_1k": 1, "image_2k": 1, "image_3k": 1, "image_4k": 1, "video": 1,
+	},
+	// openrouter = OpenRouter 聚合网关（openrouter.ai/api/v1）。OpenAI 兼容，单 key 可路由海量模型。
+	// 免费档速率随信用额度浮动，这里用保守值 20，用户可按实测用 rpm_overrides 上调。
+	"openrouter": {
+		"text": 20, "image_1k": 5, "image_2k": 2, "image_3k": 1, "image_4k": 1, "video": 1,
+	},
 }
 
 // PoolClasses 是全部限流桶。顺序即控制台展示顺序。
 var PoolClasses = []string{"text", "image_1k", "image_2k", "image_3k", "image_4k", "video"}
 
 // AccessTypes 支持的账号类型。
-var AccessTypes = []string{"free", "enterprise", "tokenplan", "amd"}
+var AccessTypes = []string{"free", "enterprise", "tokenplan", "amd", "openrouter"}
 
 // DefaultBaseURL / CNBaseURL 官方两个站点。
 const (
 	DefaultBaseURL = "https://apihub.agnes-ai.com/v1"
 	CNBaseURL      = "https://api.agnes-ai.cn/v1"
 )
+
+// DefaultBaseURLByType 各 access_type 的官方默认 Base URL。
+// 添加账号时若未填 base_url，则按类型自动套用这里的值。
+var DefaultBaseURLByType = map[string]string{
+	"free":       "https://apihub.agnes-ai.com/v1",
+	"enterprise": "https://apihub.agnes-ai.com/v1",
+	"tokenplan":  "https://apihub.agnes-ai.com/v1",
+	"amd":        "https://developer.amd.com.cn/radeon/api/v1",
+	"openrouter": "https://openrouter.ai/api/v1",
+}
+
+// DefaultBaseURLForType 返回某类型的默认 Base URL（未知类型回退官方默认）。
+func DefaultBaseURLForType(accessType string) string {
+	if u, ok := DefaultBaseURLByType[accessType]; ok && u != "" {
+		return u
+	}
+	return DefaultBaseURL
+}
 
 // IsCNHost 判断 base_url 是否属于中国站（agnes-ai.cn）。
 func IsCNHost(baseURL string) bool {
@@ -146,6 +174,9 @@ type Account struct {
 	DefaultModel        string             `json:"default_model,omitempty"`
 	// ConsecutiveFailures 连续失败计数（跨会话保留），用于长期健康追踪。
 	ConsecutiveFailures int                `json:"consecutive_failures"`
+	// Priority 调用优先级（数字越大越优先）。同优先级内按「首选区域 → 预计等待 → 在途」排序。
+	// 默认 0。用于手动把某些账号顶到前面（例如更稳的渠道、或想优先吃满的账号）。
+	Priority            int                `json:"priority"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -794,7 +825,7 @@ func (s *Store) AddAccount(name, apiKey, accessType, baseURL string, manifest *M
 		accessType = "free"
 	}
 	if strings.TrimSpace(baseURL) == "" {
-		baseURL = DefaultBaseURL
+		baseURL = DefaultBaseURLForType(accessType)
 	}
 	a := &Account{
 		ID:             NewID("acc"),
