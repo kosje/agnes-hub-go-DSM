@@ -37,11 +37,15 @@ type Server struct {
 	Updater *updater.Updater
 	// Version 由 main 注入，供 /healthz 与自更新接口显示，避免写死在多处。
 	Version string
+	// intentCache 缓存 auto 路径的意图判定（body 哈希 + 规则指纹 → 结论）。
+	// 仅 handleTextish 命中 auto 模型时读写；显式模型名、媒体端点均不走。
+	intentCache *intent.Cache
 }
 
 // New 构造服务。
 func New(store *config.Store, h *hub.Hub, client *http.Client) *Server {
-	s := &Server{Store: store, Hub: h, Client: client, mux: http.NewServeMux(), rules: intent.DefaultRules()}
+	s := &Server{Store: store, Hub: h, Client: client, mux: http.NewServeMux(), rules: intent.DefaultRules(),
+		intentCache: intent.NewCache(0, 0)}
 	s.routes()
 	return s
 }
@@ -62,6 +66,7 @@ func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /healthz", s.handleHealth)
 	m.HandleFunc("GET /v1/models", s.handleModels)
+	m.HandleFunc("GET /metrics", s.handleMetrics)
 
 	m.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		s.handleTextish(w, r, "/v1/chat/completions")
@@ -258,6 +263,9 @@ func (s *Server) resolveAutoModel(settings config.Settings, modality string) (st
 //
 // 这是异构账号池能真正协力的关键：账号 A 有 image-2.5，账号 B 只有 image-2.1 时，
 // 每个账号都拿到自己清单里最合适的那个模型，而不是被一把全局模型名卡住。
+//
+// P3 增强：如果下游传入的模型名不在本账号 Manifest 中，则使用账号级别的 DefaultModel
+// 作为兜底，而非退回全局选择。这样下游可以用任意别名映射到各账号的默认模型。
 func (s *Server) bodyForAccount(base map[string]any, poolClass, modality string, settings config.Settings) func(*config.Account) ([]byte, string) {
 	pref := intent.PreferredModels(autoIntentConfig(settings), modality)
 	return func(a *config.Account) ([]byte, string) {
@@ -266,6 +274,12 @@ func (s *Server) bodyForAccount(base map[string]any, poolClass, modality string,
 		if model == "" {
 			if fb := pool.FallbackModel[modality]; fb != "" {
 				model = fb
+			}
+		}
+		// 如果选出的模型不在本账号 Manifest 中，用账号级默认模型兜底
+		if model != "" && !config.StringInSlice(model, declared) {
+			if a.DefaultModel != "" && config.StringInSlice(a.DefaultModel, declared) {
+				model = a.DefaultModel
 			}
 		}
 		clone := make(map[string]any, len(base))
@@ -344,8 +358,167 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Prometheus metrics
+// ---------------------------------------------------------------------------
+
+// handleMetrics 返回 Prometheus 格式的网关指标。
+//
+// 设计要点：
+//   - agenes-hub 本身不是长期运行的监控目标，指标用于人工排障与短期观察。
+//     因此用原生文本格式而非 JSON，Prometheus 可直接 scrap。
+//   - 只暴露最重要的计数器和 gauge：请求量、成功/错误、队列、熔断状态、
+//     每账号的冷却剩余时间、到达密度等。
+//   - 不使用 prometheus.Client 依赖（保持零外部依赖），自己拼行。
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	h := s.Hub
+	m := h.Metrics
+	startedAt := h.Metrics.StartedAt.Unix()
+	settings := h.Settings()
+
+	now := time.Now()
+	// 每账号 gauge：冷却剩余秒数、连续失败数
+	type acctGauge struct {
+		id                   string
+		name                 string
+		enabled              bool
+		penaltyRemainingSec  float64
+		consecutiveFailures  int
+	}
+	var gauges []acctGauge
+	for _, a := range s.Store.AccountsSnapshot() {
+		gauges = append(gauges, acctGauge{
+			id:                    a.ID,
+			name:                  a.Name,
+			enabled:               a.Enabled,
+			penaltyRemainingSec:   h.PenaltyRemaining(a.ID).Seconds(),
+			consecutiveFailures:   a.ConsecutiveFailures,
+		})
+	}
+
+	// 计算总 RPM（所有账号 text 池之和）
+	totalTextRPM := 0.0
+	for _, a := range s.Store.AccountsSnapshot() {
+		if !a.Enabled || strings.TrimSpace(a.APIKey) == "" {
+			continue
+		}
+		totalTextRPM += h.EffectiveRPM(a, "text")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# HELP baiPiao_hub_requests_total Total requests served\n")
+	sb.WriteString("# TYPE baiPiao_hub_requests_total counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_requests_total %d\n", m.RequestsTotal.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_requests_ok Successful requests\n")
+	sb.WriteString("# TYPE baiPiao_hub_requests_ok counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_requests_ok %d\n", m.RequestsOK.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_requests_error Failed requests\n")
+	sb.WriteString("# TYPE baiPiao_hub_requests_error counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_requests_error %d\n", m.RequestsError.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_upstream_429 Upstream 429s received\n")
+	sb.WriteString("# TYPE baiPiao_hub_upstream_429 counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_upstream_429 %d\n", m.Upstream429.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_queued_total Requests that had to wait in queue\n")
+	sb.WriteString("# TYPE baiPiao_hub_queued_total counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_queued_total %d\n", m.QueuedTotal.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_queue_timeout Requests that timed out waiting\n")
+	sb.WriteString("# TYPE baiPiao_hub_queue_timeout counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_queue_timeout %d\n", m.QueueTimeout.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_queue_overflow Requests dropped because queue full\n")
+	sb.WriteString("# TYPE baiPiao_hub_queue_overflow counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_queue_overflow %d\n", m.QueueOverflow.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_spillovers Soft-affinity spillovers\n")
+	sb.WriteString("# TYPE baiPiao_hub_spillovers counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_spillovers %d\n", m.Spillovers.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_breaker_opened Breakers opened (401/403/402)\n")
+	sb.WriteString("# TYPE baiPiao_hub_breaker_opened counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_breaker_opened %d\n", m.BreakerOpened.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_breaker_revived Breakers revived after cooldown\n")
+	sb.WriteString("# TYPE baiPiao_hub_breaker_revived counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_breaker_revived %d\n", m.BreakerRevived.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_wait_ms_total Total wait time in milliseconds\n")
+	sb.WriteString("# TYPE baiPiao_hub_wait_ms_total counter\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_wait_ms_total %d\n", m.WaitMS.Load()))
+
+	sb.WriteString("# HELP baiPiao_hub_uptime_seconds Seconds since startup\n")
+	sb.WriteString("# TYPE baiPiao_hub_uptime_seconds gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_uptime_seconds %.0f\n", now.Sub(h.Metrics.StartedAt).Seconds()))
+
+	sb.WriteString("# HELP baiPiao_hub_started_at_seconds Unix timestamp when hub started\n")
+	sb.WriteString("# TYPE baiPiao_hub_started_at_seconds gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_started_at_seconds %.0f\n", float64(startedAt)))
+
+	sb.WriteString("# HELP baiPiao_hub_total_text_rpm Current effective text RPM sum across all accounts\n")
+	sb.WriteString("# TYPE baiPiao_hub_total_text_rpm gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_total_text_rpm %.2f\n", totalTextRPM))
+
+	sb.WriteString("# HELP baiPiao_hub_account_penalty_remaining_sec Seconds until account unblocked\n")
+	sb.WriteString("# TYPE baiPiao_hub_account_penalty_remaining_sec gauge\n")
+	sb.WriteString("# LABELS account_id,account_name,enabled\n")
+	for _, g := range gauges {
+		enabledLabel := "0"
+		if g.enabled {
+			enabledLabel = "1"
+		}
+		sb.WriteString(fmt.Sprintf("baiPiao_hub_account_penalty_remaining_sec{account_id=\"%s\",account_name=\"%s\",enabled=\"%s\"} %.2f\n",
+			g.id, g.name, enabledLabel, g.penaltyRemainingSec))
+	}
+
+	sb.WriteString("# HELP baiPiao_hub_account_consecutive_failures Consecutive error count per account\n")
+	sb.WriteString("# TYPE baiPiao_hub_account_consecutive_failures gauge\n")
+	sb.WriteString("# LABELS account_id,account_name\n")
+	for _, g := range gauges {
+		sb.WriteString(fmt.Sprintf("baiPiao_hub_account_consecutive_failures{account_id=\"%s\",account_name=\"%s\"} %d\n",
+			g.id, g.name, g.consecutiveFailures))
+	}
+
+	sb.WriteString("# HELP baiPiao_hub_request_timeout_ms Configured request timeout\n")
+	sb.WriteString("# TYPE baiPiao_hub_request_timeout_ms gauge\n")
+	sb.WriteString(fmt.Sprintf("baiPiao_hub_request_timeout_ms %d\n", settings.RequestTimeoutMS))
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(sb.String()))
+}
+
+// ---------------------------------------------------------------------------
 // 文本类端点（chat / responses / messages）—— 含 agnes-auto 判定
 // ---------------------------------------------------------------------------
+
+// decideCached 走 LRU 缓存的意图判定（仅 handleTextish 的 auto 路径用）。
+//
+// 命中条件（全部满足才用缓存）：
+//   - 规则集未变（指纹在 Key() 里，变了自动 miss，无需手动清）
+//   - body + requestedModel 哈希命中
+//   - 未超过 TTL（10 分钟）
+//
+// 命中时 Source 标记为 "cache"，Reason 写 "命中意图判定缓存"，
+// 下游观测端能直接区分「缓存判定」与「现场判定」。
+func (s *Server) decideCached(path string, body map[string]any, requested string, settings config.Settings) intent.Result {
+	icfg := autoIntentConfig(settings)
+	key := s.intentCache.Key(body, s.rules, icfg.MinConfidence, icfg.ContentScan, requested)
+	if cached := s.intentCache.Get(key); cached != nil {
+		out := *cached
+		if out.Source != "cache" {
+			out.Source = "cache"
+			out.Reason = "命中意图判定缓存"
+		}
+		return out
+	}
+	res := intent.Decide(path, body, requested, icfg, s.rules,
+		settings.ModelAliases, pool.ModalityOfModel, "")
+	s.intentCache.Put(key, res)
+	return res
+}
 
 func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path string) {
 	item, e := s.downstreamKey(r)
@@ -364,8 +537,7 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 
 	var decision intent.Result
 	if intent.IsAutoModel(requested) || requested == "" {
-		decision = intent.Decide(path, body, requested, autoIntentConfig(settings), s.rules,
-			settings.ModelAliases, pool.ModalityOfModel, "")
+		decision = s.decideCached(path, body, requested, settings)
 	} else {
 		decision = intent.Result{
 			Modality:       pool.ModalityOfModel(requested, settings.ModelAliases),
@@ -1005,7 +1177,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		case out := <-ch:
 			if out.err != nil {
 				writeSSEFrame(w, flusher, map[string]any{
-					"error": map[string]any{"message": out.err.Error(), "type": "agnes_hub_queue"}})
+					"error": map[string]any{"message": out.err.Error(), "type": "baipiao_hub_queue"}})
 				return
 			}
 			result := out.result
@@ -1021,7 +1193,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 				return
 			}
 			s.Store.ChargeKey(item.Key)
-			writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub account=%s wait_ms=%d attempts=%d model=%s",
+			writeSSEComment(w, flusher, fmt.Sprintf("baiPiao-hub account=%s wait_ms=%d attempts=%d model=%s",
 				safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
 			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
 			result.Close()

@@ -355,7 +355,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context) (*GitHubRelease, error
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "agnes-hub-go/"+u.Version())
+	req.Header.Set("User-Agent", "baiPiao-hub/"+u.Version())
 
 	resp, err := u.client.Do(req)
 	if err != nil {

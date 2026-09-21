@@ -95,7 +95,7 @@ func ClientHeaders(a *config.Account, extra map[string]string, anthropic bool) h
 	h.Set("Authorization", "Bearer "+a.APIKey)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
-	h.Set("User-Agent", "agnes-hub-go/1.0")
+	h.Set("User-Agent", "baiPiao-hub/1.0")
 	if anthropic {
 		// 官方文档：/v1/messages 走 Anthropic 兼容通道、以 x-api-key 鉴权。
 		// 同时带上两种鉴权头以兼容。
@@ -213,6 +213,8 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 	exclude := map[string]bool{}
 	var totalWait int64
 	var last *Result
+	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
+	h.Arrivals.Add()
 
 	for attempt := 0; attempt <= retryMax; attempt++ {
 		picked, err := h.Pick(opts.SessionKey, opts.PoolClass, opts.Pinned, opts.RequiredModel, exclude)
@@ -282,7 +284,17 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	opts Options, body []byte, modelUsed string, totalWaitMS int64, attemptNo int) (*Result, bool, error) {
 
 	url := UpstreamURL(account, opts.Path)
-	req, err := http.NewRequestWithContext(ctx, opts.Method, url, bytes.NewReader(body))
+
+	// P0: 请求超时保护。为本次请求创建带超时的子 context，防止上游 hang 住耗尽连接池。
+	s := h.Settings()
+	timeoutMS := s.RequestTimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = 30000 // 默认 30s
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, false, err
 	}
@@ -310,12 +322,24 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
 		}, true, nil
 	}
+	defer resp.Body.Close() // P1 修复：确保 body 关闭（原代码只在错误路径 close，成功路径依赖调用方）
 
 	status := resp.StatusCode
 
-	if AuthFailStatus[status] {
+	if status == 402 {
+		// 402 Payment Required：额度耗尽，不熔断（等待复活即可），但记录错误不重试
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
+		<-sem
+		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
+		h.Metrics.RequestsError.Add(1)
+		return &Result{
+			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+		}, false, nil // 402 不重试
+	}
+
+	if AuthFailStatus[status] { // 401 / 403
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		<-sem
 		h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
 		return &Result{
