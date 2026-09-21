@@ -214,19 +214,18 @@ func PoolForModality(modality string, body map[string]any, defaultTier string) s
 // ManifestOf 读取账号声明的清单；缺失（nil）时用默认清单补齐。
 // 注意：**非 nil 的空切片会被保留**，表示「明示不支持该模态」。
 func ManifestOf(a *config.Account, s config.Settings) config.ModelManifest {
-	dm := config.DefaultManifestForType(a.AccessType, s)
 	if a.ModelManifest.Text == nil && a.ModelManifest.Image == nil && a.ModelManifest.Video == nil {
-		return dm.Clone()
+		return s.ModelManifestDefault.Clone()
 	}
 	out := a.ModelManifest.Clone()
 	if out.Text == nil {
-		out.Text = append([]string(nil), dm.Text...)
+		out.Text = append([]string(nil), s.ModelManifestDefault.Text...)
 	}
 	if out.Image == nil {
-		out.Image = append([]string(nil), dm.Image...)
+		out.Image = append([]string(nil), s.ModelManifestDefault.Image...)
 	}
 	if out.Video == nil {
-		out.Video = append([]string(nil), dm.Video...)
+		out.Video = append([]string(nil), s.ModelManifestDefault.Video...)
 	}
 	return out
 }
