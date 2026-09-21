@@ -52,10 +52,12 @@ PRIMARY_ARCH = "x86_64"
 
 # 套件中心里显示的变更说明（HTML）。发新版时改这里。
 CHANGELOG = (
-    "修复群晖套件中心无法安装的问题。<br>"
-    "· SPK 外层改为 DSM 要求的未压缩 tar 格式<br>"
-    "· INFO arch 改为 DSM 实际平台代号，支持 apollolake、geminilake、v1000 等 x86_64 机型<br>"
-    "· 增加发布前格式、校验和与可执行权限检查"
+    "同步上游 my788525/agnes-hub-go 至 v1.0.9+amd（26 个提交）。<br>"
+    "· 新增 AMD 免费 API 支持、站点优先级自动切换<br>"
+    "· 新增 Prometheus /metrics、请求超时与 402 分流<br>"
+    "· 新增意图 LRU 缓存、429 批量落盘、HTTP 客户端单例化<br>"
+    "· 控制台重写，聊天页与后台均适配移动端<br>"
+    "· 图标换为方形（64×64 / 256×256）"
 )
 
 CATALOG_FIELDS_NOTE = "SynoCommunity/spkrepo 的 build_entry_data 与 sspks 的字段清单"
