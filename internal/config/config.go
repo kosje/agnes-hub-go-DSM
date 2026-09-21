@@ -56,6 +56,16 @@ func IsCNHost(baseURL string) bool {
 	return strings.Contains(strings.ToLower(baseURL), "agnes-ai.cn")
 }
 
+// stringInSlice 检查字符串是否在切片中。
+func StringInSlice(s string, list []string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // 数据模型
 // ---------------------------------------------------------------------------
@@ -115,22 +125,27 @@ type AccountStats struct {
 
 // Account 是一个上游账号。运行期状态全部放在 hub 里，这里只留需要落盘的字段。
 type Account struct {
-	ID              string             `json:"id"`
-	Name            string             `json:"name"`
-	APIKey          string             `json:"api_key"`
-	BaseURL         string             `json:"base_url"`
-	AccessType      string             `json:"access_type"`
-	Enabled         bool               `json:"enabled"`
-	Group           string             `json:"group,omitempty"`
-	ClassesEnabled  []string           `json:"classes_enabled"`
-	ModelManifest   ModelManifest      `json:"model_manifest"`
-	RPMOverrides    map[string]float64 `json:"rpm_overrides"`
-	MaxConcurrency  int                `json:"max_concurrency"`
-	LearnedFactor   float64            `json:"learned_factor"`
-	PoolFactors     map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
-	LastRateLimited float64            `json:"last_rate_limited_at"`
-	CreatedAt       float64            `json:"created_at"`
-	Stats           AccountStats       `json:"stats"`
+	ID                  string             `json:"id"`
+	Name                string             `json:"name"`
+	APIKey              string             `json:"api_key"`
+	BaseURL             string             `json:"base_url"`
+	AccessType          string             `json:"access_type"`
+	Enabled             bool               `json:"enabled"`
+	Group               string             `json:"group,omitempty"`
+	ClassesEnabled      []string           `json:"classes_enabled"`
+	ModelManifest       ModelManifest      `json:"model_manifest"`
+	RPMOverrides        map[string]float64 `json:"rpm_overrides"`
+	MaxConcurrency      int                `json:"max_concurrency"`
+	LearnedFactor       float64            `json:"learned_factor"`
+	PoolFactors         map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
+	LastRateLimited     float64            `json:"last_rate_limited_at"`
+	CreatedAt           float64            `json:"created_at"`
+	Stats               AccountStats       `json:"stats"`
+	// DefaultModel 是该账号的「兜底模型」：当下游传入的模型不在本账号 Manifest 时，
+	// 网关会用这个模型名发请求。留空则退回全局 auto 选择。
+	DefaultModel        string             `json:"default_model,omitempty"`
+	// ConsecutiveFailures 连续失败计数（跨会话保留），用于长期健康追踪。
+	ConsecutiveFailures int                `json:"consecutive_failures"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -246,6 +261,7 @@ type Settings struct {
 	ImageRecordRetention int                `json:"image_record_retention_days"`
 	ImageMaxCapacity     int                `json:"image_max_capacity"`
 	VideoMaxCapacity     int                `json:"video_max_capacity"`
+	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
 }
@@ -304,6 +320,7 @@ func DefaultSettings() Settings {
 		ImageMaxCapacity:    500,
 		VideoMaxCapacity:    200,
 		RegionPriority:      "cn_first",
+		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
 	}
 }
 

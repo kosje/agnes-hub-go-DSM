@@ -845,14 +845,24 @@ func (h *Hub) OnSuccess(a *config.Account, poolClass string) {
 }
 
 // OnAuthFailure 401/403/402 不可重试：立即熔断并安排自动复活。
+//
+// P2 增强：连续失败超过阈值时延长熔断冷却，让账号有更长的恢复窗口。
 func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 	s := h.Settings()
-	reviveAfter := time.Duration(s.BreakerReviveSec) * time.Second
-	if reviveAfter <= 0 {
-		reviveAfter = 30 * time.Minute
+	baseReviveAfter := time.Duration(s.BreakerReviveSec) * time.Second
+	if baseReviveAfter <= 0 {
+		baseReviveAfter = 30 * time.Minute
+	}
+	// 连续失败超过阈值时，冷却时间指数增长（上限 2 倍）
+	extended := baseReviveAfter
+	if a.ConsecutiveFailures >= 5 {
+		extended = time.Duration(float64(baseReviveAfter) * 1.5)
+	}
+	if a.ConsecutiveFailures >= 10 {
+		extended = time.Duration(float64(baseReviveAfter) * 2.0)
 	}
 	h.mu.Lock()
-	h.reviveAt[a.ID] = time.Now().Add(reviveAfter)
+	h.reviveAt[a.ID] = time.Now().Add(extended)
 	h.mu.Unlock()
 	h.Metrics.BreakerOpened.Add(1)
 
@@ -860,26 +870,28 @@ func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 		acc.Enabled = false
 		acc.Stats.Errors++
 		acc.Stats.LastError = truncate(reason, 200) +
-			fmt.Sprintf("（已熔断，%s 后自动复活低速试探）", reviveAfter)
+			fmt.Sprintf("（已熔断，%s 后自动复活低速试探）", extended)
 		return true
 	})
 	h.Reload()
 }
 
-// NoteError 记录一次性错误（不熔断）。
+// NoteError 记录一次性错误（不熔断），并增加连续失败计数用于长期健康追踪。
 func (h *Hub) NoteError(a *config.Account, reason string) {
 	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Stats.Errors++
 		acc.Stats.LastError = truncate(reason, 200)
+		acc.ConsecutiveFailures++
 		return true
 	})
 }
 
-// NoteSuccess 记一次成功（统计）。
+// NoteSuccess 记一次成功（统计），并重置连续失败计数。
 func (h *Hub) NoteSuccess(a *config.Account) {
 	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Stats.Requests++
 		acc.Stats.LastUsedAt = float64(time.Now().UnixNano()) / 1e9
+		acc.ConsecutiveFailures = 0
 		return true
 	})
 	h.Metrics.RequestsOK.Add(1)

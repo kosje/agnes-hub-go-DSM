@@ -296,6 +296,8 @@ func (s *Server) apiListAccounts(w http.ResponseWriter, r *http.Request) {
 			"penalty_remaining_ms": s.Hub.PenaltyRemaining(a.ID).Milliseconds(),
 			"inflight":             s.Hub.Inflight(a.ID),
 			"stats":                a.Stats,
+			"consecutive_failures": a.ConsecutiveFailures,
+			"default_model":        a.DefaultModel,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
@@ -404,6 +406,7 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		setStr("group", &a.Group)
 		setStr("base_url", &a.BaseURL)
 		setStr("access_type", &a.AccessType)
+		setStr("default_model", &a.DefaultModel)
 		setBool("enabled", &a.Enabled)
 		if v, ok := body["api_key"]; ok && strings.TrimSpace(asStr(v)) != "" {
 			a.APIKey, changed = strings.TrimSpace(asStr(v)), true
@@ -1093,6 +1096,7 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("keepalive_interval_ms", &st.KeepaliveMS)
 	s2("affinity_mode", &st.AffinityMode)
 	s2("region_priority", &st.RegionPriority)
+	i("request_timeout_ms", &st.RequestTimeoutMS)
 	s2("default_image_tier", &st.DefaultImageTier)
 	s2("optimization_mode", &st.OptimizationMode)
 	i("image_record_retention_days", &st.ImageRecordRetention)

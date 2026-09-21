@@ -257,7 +257,8 @@ function viewOverview(){
       <td><b>${esc(a.name)}</b>${a.group?` <span class="pill">${esc(a.group)}</span>`:""}
         <div class="muted" style="font-size:11px">${esc(a.access_type)}</div></td>
       <td>${a.enabled?'<span class="pill ok">启用</span>':'<span class="pill off">停用</span>'}
-        ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却 ${Math.round(a.penalty_remaining_ms/1000)}s</span>`:""}</td>
+        ${a.penalty_remaining_ms>0?`<span class="pill warn">冷却 ${Math.round(a.penalty_remaining_ms/1000)}s</span>`:""}
+        ${a.consecutive_failures?a.stats?.errors?`<span class="pill warn" title="连续失败 ${a.consecutive_failures}">连续失败 ${a.consecutive_failures}</span>`:"":'')}</td>
       <td style="min-width:210px">${bars||'<span class="muted">无可用池</span>'}${declared}</td>
       <td class="mono">${num(a.stats?.requests)} / 错误 ${num(a.stats?.errors)} / 限流 ${num(a.stats?.rate_limited)}</td>
     </tr>`;
@@ -381,6 +382,7 @@ function bindAccountEvents(){
         name:document.getElementById("aName").value, api_key:document.getElementById("aKey").value,
         base_url:document.getElementById("aBase").value, access_type:document.getElementById("aType").value,
         group:document.getElementById("aGroup").value, max_concurrency:Number(document.getElementById("aConc").value)||8,
+        default_model:document.getElementById("aDefaultModel").value,
         model_manifest:manifest
       })});
       toast("账号已添加","good"); await refresh();
@@ -633,6 +635,7 @@ function viewSettings(){
       ${fld("s_imconc","图片并发上限", s.image_concurrency??4)}
       ${fld("s_vconc","视频在任务上限", s.video_max_inflight??2,"number","独立于 RPM 的任务级限制：只做 RPM 不做任务数会出现「RPM 没超但视频一直失败」")}
       ${fld("s_brev","熔断自动复活（秒）", s.breaker_revive_sec??1800,"number","401/403/402 熔断后到这个时间自动复活低速试探")}
+      ${fld("s_rqtimeout","请求超时（毫秒）", s.request_timeout_ms??30000,"number","单次上游请求最长等待时间，防 hang 死连接")}
     </div>
   </div>
   <div class="card">

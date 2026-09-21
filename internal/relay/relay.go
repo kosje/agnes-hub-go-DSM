@@ -284,7 +284,17 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	opts Options, body []byte, modelUsed string, totalWaitMS int64, attemptNo int) (*Result, bool, error) {
 
 	url := UpstreamURL(account, opts.Path)
-	req, err := http.NewRequestWithContext(ctx, opts.Method, url, bytes.NewReader(body))
+
+	// P0: 请求超时保护。为本次请求创建带超时的子 context，防止上游 hang 住耗尽连接池。
+	s := h.Settings()
+	timeoutMS := s.RequestTimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = 30000 // 默认 30s
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, false, err
 	}
@@ -312,12 +322,24 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
 		}, true, nil
 	}
+	defer resp.Body.Close() // P1 修复：确保 body 关闭（原代码只在错误路径 close，成功路径依赖调用方）
 
 	status := resp.StatusCode
 
-	if AuthFailStatus[status] {
+	if status == 402 {
+		// 402 Payment Required：额度耗尽，不熔断（等待复活即可），但记录错误不重试
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
+		<-sem
+		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
+		h.Metrics.RequestsError.Add(1)
+		return &Result{
+			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
+			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+		}, false, nil // 402 不重试
+	}
+
+	if AuthFailStatus[status] { // 401 / 403
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		<-sem
 		h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
 		return &Result{
