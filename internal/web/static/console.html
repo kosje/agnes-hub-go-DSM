@@ -333,7 +333,7 @@ function viewAccounts(){
         <div><label>Base URL</label><input id="aBase" placeholder="https://api.api.example.cn/v1"></div>
         <div class="row">
           <div style="flex:1"><label>账号类型</label>
-            <select id="aType">${["free","enterprise","tokenplan"].map(t=>`<option>${t}</option>`).join("")}</select></div>
+            <select id="aType">${["free","enterprise","tokenplan","amd"].map(t=>`<option>${t}</option>`).join("")}</select></div>
           <div style="flex:1"><label>分组（可选）</label><input id="aGroup" placeholder="cn-free"></div>
           <div style="flex:1"><label>单账号并发</label><input id="aConc" type="number" value="8" min="1"></div>
         </div>

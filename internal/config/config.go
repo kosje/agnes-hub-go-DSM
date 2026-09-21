@@ -42,8 +42,8 @@ var RPMTable = map[string]map[string]float64{
 // PoolClasses 是全部限流桶。顺序即控制台展示顺序。
 var PoolClasses = []string{"text", "image_1k", "image_2k", "image_3k", "image_4k", "video"}
 
-// AccessTypes 官方三档账号类型。
-var AccessTypes = []string{"free", "enterprise", "tokenplan"}
+// AccessTypes 支持的账号类型。
+var AccessTypes = []string{"free", "enterprise", "tokenplan", "amd"}
 
 // DefaultBaseURL / CNBaseURL 官方两个站点。
 const (
