@@ -1092,6 +1092,7 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("queue_max_size", &st.QueueMaxSize)
 	i("keepalive_interval_ms", &st.KeepaliveMS)
 	s2("affinity_mode", &st.AffinityMode)
+	s2("region_priority", &st.RegionPriority)
 	s2("default_image_tier", &st.DefaultImageTier)
 	s2("optimization_mode", &st.OptimizationMode)
 	i("image_record_retention_days", &st.ImageRecordRetention)

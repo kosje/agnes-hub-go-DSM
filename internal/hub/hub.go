@@ -840,6 +840,18 @@ func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 	h.Reload()
 }
 
+// UpdateAccountBaseURL 切换某账号的 base_url（401/403 自动换站后用）。
+// 成功换站后调用，让后续请求直接走已验证的站点，避免重复探测。
+func (h *Hub) UpdateAccountBaseURL(accountID string, newBaseURL string) {
+	h.store.MutateAccount(accountID, func(acc *config.Account) bool {
+		acc.BaseURL = newBaseURL
+		acc.Enabled = true // 换站成功说明账号本身有效，恢复启用
+		acc.Stats.LastError = ""
+		return true
+	})
+	h.Reload()
+}
+
 // NoteError 记录一次性错误（不熔断）。
 func (h *Hub) NoteError(a *config.Account, reason string) {
 	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {

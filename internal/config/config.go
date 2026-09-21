@@ -218,6 +218,9 @@ type Settings struct {
 	KeepaliveMS          int                `json:"keepalive_interval_ms"`
 	AffinityMode         string             `json:"affinity_mode"`
 	DefaultImageTier     string             `json:"default_image_tier"`
+	// RegionPriority 站点优先级：cn_first（国内优先）或 com_first（国际优先）。
+	// 401/403 凭据被拒时自动切换到另一站点的 BaseURL 重试同一账号。
+	RegionPriority       string             `json:"region_priority,omitempty"`
 	ModelAliases         map[string]string  `json:"model_aliases"`
 	AutoModelName        string             `json:"auto_model_name"`
 	AutoIntent           AutoIntentSettings `json:"auto_intent"`
@@ -295,6 +298,7 @@ func DefaultSettings() Settings {
 		ImageRecordRetention: 30,
 		ImageMaxCapacity:    500,
 		VideoMaxCapacity:    200,
+		RegionPriority:      "cn_first",
 	}
 }
 
