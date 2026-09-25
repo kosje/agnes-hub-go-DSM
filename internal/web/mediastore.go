@@ -282,6 +282,42 @@ func (s *Server) saveMediaBytes(k mediaKind, data []byte, mime string) (string, 
 	return k.route + name, true
 }
 
+// surfaceHeader 是网关自家网页表明身份的请求头（见 chat.main.js 的 SURFACE_HEADERS）。
+const surfaceHeader = "X-Agnes-Hub-Surface"
+
+// webSurface 判断这次请求是不是来自网关自己的网页。
+func webSurface(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get(surfaceHeader)), "web")
+}
+
+// callerMediaURL 决定把哪个地址回给调用方。
+//
+// upstream 是上游原始地址，local 是落盘后的本地地址（空 = 没落盘成功，一律退回上游）。
+//
+// 为什么不一律给本地地址 —— 这是踩过的坑：/api/chat/v1/* 同时服务于两种调用方，
+// 而它们对媒体地址的要求正好相反。
+//
+//	网关自己的网页：与网关同源，本地地址一定可达，也正是落盘的意义所在；
+//	外部 AI 客户端：往往在另一个网络位置，甚至跑在 https 页面里。指向 NAS 的
+//	  http 地址经常加载不出来 —— 实测客户端会退化成显示图片的 alt 文本
+//	  （用户看到的就是一串莫名其妙的提示词）。上游产出地址是公网 https，
+//	  实测在客户端里能正常显示。
+//
+// 所以默认按调用方分流；ClientMediaURL=local 可强制一律用本地地址
+// （适用于把网关放到 https 反代后面、客户端也能访问到网关的部署）。
+func (s *Server) callerMediaURL(r *http.Request, settings config.Settings, upstream, local string) string {
+	if local == "" {
+		return upstream
+	}
+	if webSurface(r) || strings.EqualFold(strings.TrimSpace(settings.ClientMediaURL), "local") {
+		return local
+	}
+	return upstream
+}
+
 // publicBaseURL 推导「客户端能访问到的」基地址（形如 http://nas:4142）。
 //
 // 为什么必须给外部客户端绝对地址：网关自己网页里的 /api/chat/images/xxx.png 是
@@ -313,6 +349,45 @@ func publicBaseURL(r *http.Request, settings config.Settings) string {
 		scheme = strings.ToLower(p)
 	}
 	return scheme + "://" + host
+}
+
+// mediaBaseSource 说明当前基地址是哪来的，便于排查代理配置。
+func mediaBaseSource(r *http.Request, settings config.Settings) string {
+	if strings.TrimSpace(settings.PublicBaseURL) != "" {
+		return "显式配置（对外访问地址）"
+	}
+	if r != nil && firstHeaderValue(r.Header.Get("X-Forwarded-Host")) != "" {
+		return "X-Forwarded-Host 推断"
+	}
+	return "请求 Host 推断"
+}
+
+// apiMediaBase 回显「按当前这次请求推算出的媒体基地址」。
+//
+// 专为反向代理部署排查而设：从外网访问时这里应该是外网地址（**含端口**），
+// 从局域网访问时应该是局域网地址。不一致通常意味着两件事之一：
+//  1. 代理没传 X-Forwarded-* —— 网关只能按 Host 推断；
+//  2. 代理把 Host/X-Forwarded-Host 设成了 $host（不带端口），
+//     网关推断出来会少一段端口 —— 这时必须显式填「对外访问地址」。
+func (s *Server) apiMediaBase(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	settings := s.Store.SettingsSnapshot()
+	base := publicBaseURL(r, settings)
+	sample := base + imageKind.route + "0123456789abcdef0123456789abcdef.png"
+	writeJSON(w, 200, map[string]any{
+		"base_url":          base,
+		"source":            mediaBaseSource(r, settings),
+		"sample_image_url":  sample,
+		"client_media_url":  settings.ClientMediaURL,
+		"url_for_client":    s.callerMediaURL(r, settings, "https://上游产出地址/x.png", sample),
+		"host":              r.Host,
+		"x_forwarded_host":  r.Header.Get("X-Forwarded-Host"),
+		"x_forwarded_proto": r.Header.Get("X-Forwarded-Proto"),
+		"tls":               r.TLS != nil,
+	}, nil)
 }
 
 // firstHeaderValue 取逗号分隔头里的第一个值（代理链会追加多个）。
@@ -360,12 +435,18 @@ func (s *Server) localizeVideoURL(ctx context.Context, raw, base string) string 
 
 // localizeImageURLs 对生图结果逐条做本地化，返回新切片。
 //
-// 返回新切片、不改动入参：入参还要按「官方形态」原样回给程序化客户端
-// （那些客户端要的是真实的上游地址，不是我们本地的缓存路径）。
-func (s *Server) localizeImageURLs(ctx context.Context, items []map[string]any, base string) []map[string]any {
+// 每条都会**先落盘**（这是「下载到本地」的落点），再按调用方是谁决定回哪个地址
+// （见 callerMediaURL）。返回新切片、不改动入参：入参还要按「官方形态」原样回给
+// 程序化客户端（那些客户端要的是真实的上游地址，不是我们本地的缓存路径）。
+func (s *Server) localizeImageURLs(r *http.Request, items []map[string]any, settings config.Settings) []map[string]any {
 	if len(items) == 0 {
 		return items
 	}
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
+	base := publicBaseURL(r, settings)
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		clone := make(map[string]any, len(item)+1)
@@ -373,20 +454,22 @@ func (s *Server) localizeImageURLs(ctx context.Context, items []map[string]any, 
 			clone[k] = v
 		}
 		// 只处理字符串型 url：上游偶尔会回 null 或对象，交给下游按原样处理即可。
-		if u, ok := clone["url"].(string); ok {
-			clone["url"] = s.localizeImageURL(ctx, u, base)
-		}
-		// 上游有时只回 b64_json 不回 url。落盘一份本地地址，正文里就不必内联
-		// 那一大串 base64 了（ImageContent 对 b64_json 是直接拼 data URI 的）。
-		if cur, _ := clone["url"].(string); cur == "" {
+		upstream, _ := clone["url"].(string)
+		// 上游有时只回 b64_json 不回 url。先落盘，正文里就不必内联那一大串
+		// base64 了（ImageContent 对 b64_json 是直接拼 data URI 的）。
+		if strings.TrimSpace(upstream) == "" {
 			if b64, ok := clone["b64_json"].(string); ok && strings.TrimSpace(b64) != "" {
 				if data, err := decodeBase64Loose(b64); err == nil {
 					if local, ok := s.saveMediaBytes(imageKind, data, ""); ok {
-						clone["url"] = base + local
+						clone["url"] = s.callerMediaURL(r, settings, upstream, base+local)
 					}
 				}
 			}
+			out = append(out, clone)
+			continue
 		}
+		local := s.localizeImageURL(ctx, upstream, base)
+		clone["url"] = s.callerMediaURL(r, settings, upstream, local)
 		out = append(out, clone)
 	}
 	return out

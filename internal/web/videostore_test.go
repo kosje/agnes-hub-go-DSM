@@ -61,16 +61,21 @@ func TestChatVideoIsDownloadedLocally(t *testing.T) {
 	if got, _ := body["status"].(string); got != "completed" {
 		t.Fatalf("应已完成，实际 %q（%v）", got, body)
 	}
-	u, _ := body["video_url"].(string)
-	if !strings.Contains(u, videoKind.route) {
-		t.Errorf("video_url 应为本地地址 %s，实际 %q（上游是 %s）", videoKind.route, u, upstream)
-	}
-	if !strings.HasSuffix(u, ".mp4") {
-		t.Errorf("应保留 .mp4 扩展名，实际 %q", u)
+	// 外部客户端拿到的是上游地址 —— 实测只有公网 https 的产出地址在客户端里
+	// 显示得出来，指向 NAS 的 http 地址会退化成一段文字。
+	if u, _ := body["video_url"].(string); u != upstream {
+		t.Errorf("客户端应拿到上游地址 %q，实际 %q", upstream, u)
 	}
 
-	// 文件真的落了盘，内容与上游一致
-	name := u[strings.LastIndex(u, "/")+1:]
+	// 但本地副本必须真的落了盘（控制台与聊天记录长期回看靠它）
+	job, ok := h.store.JobByID(jobID)
+	if !ok || !strings.Contains(job.URL, videoKind.route) {
+		t.Fatalf("任务记录里应有本地地址，实际 %+v", job)
+	}
+	if !strings.HasSuffix(job.URL, ".mp4") {
+		t.Errorf("应保留 .mp4 扩展名，实际 %q", job.URL)
+	}
+	name := job.URL[strings.LastIndex(job.URL, "/")+1:]
 	raw, err := os.ReadFile(filepath.Join(h.srv.mediaDir(videoKind), name))
 	if err != nil {
 		t.Fatalf("视频应已落盘，读取失败 %v", err)
@@ -89,13 +94,14 @@ func TestChatVideoRouteServesFile(t *testing.T) {
 		"model": "agnes-auto", "prompt": "夕阳下的海滩",
 	})
 	jobID, _ := submit["job_id"].(string)
-	_, body := h.getJSON("/api/chat/v1/videos/" + jobID)
-	local, _ := body["video_url"].(string)
+	h.getJSON("/api/chat/v1/videos/" + jobID)
+	job, _ := h.store.JobByID(jobID)
+	local := job.URL
 	if !strings.Contains(local, videoKind.route) {
 		t.Fatalf("应先落盘，实际 %q", local)
 	}
 
-	resp, err := http.Get(local) // 现在返回的就是绝对地址
+	resp, err := http.Get(local) // job.URL 存的是本地地址（控制台/聊天页用）
 	if err != nil {
 		t.Fatalf("取本地视频失败：%v", err)
 	}
@@ -122,10 +128,10 @@ func TestVideoRouteSupportsRange(t *testing.T) {
 		"model": "agnes-auto", "prompt": "x",
 	})
 	jobID, _ := submit["job_id"].(string)
-	_, body := h.getJSON("/api/chat/v1/videos/" + jobID)
-	local, _ := body["video_url"].(string)
+	h.getJSON("/api/chat/v1/videos/" + jobID)
+	job, _ := h.store.JobByID(jobID)
 
-	req, _ := http.NewRequest(http.MethodGet, local, nil)
+	req, _ := http.NewRequest(http.MethodGet, job.URL, nil)
 	req.Header.Set("Range", "bytes=0-3")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -253,11 +259,38 @@ func TestVideoJobPersistsLocalURL(t *testing.T) {
 	if !strings.Contains(job.URL, videoKind.route) {
 		t.Errorf("任务记录里应存本地地址，实际 %q", job.URL)
 	}
-	// 再查一次要能直接拿到（不再重复回取）
-	_, again := h.getJSON("/api/chat/v1/videos/" + jobID)
-	if u, _ := again["video_url"].(string); u != job.URL {
-		t.Errorf("二次查询应返回同一地址，实际 %q", u)
+	if job.SourceURL == "" {
+		t.Error("也应记下上游原始地址 —— 外部客户端要的是它")
 	}
+	// 网页再查一次要能直接拿到本地地址（不再重复回取）
+	_, again := h.getJSONWeb("/api/chat/v1/videos/" + jobID)
+	if u, _ := again["video_url"].(string); u != job.URL {
+		t.Errorf("网页端二次查询应返回本地地址 %q，实际 %q", job.URL, u)
+	}
+	// 客户端再查一次要拿到上游地址
+	_, forClient := h.getJSON("/api/chat/v1/videos/" + jobID)
+	if u, _ := forClient["video_url"].(string); u != job.SourceURL {
+		t.Errorf("客户端二次查询应返回上游地址 %q，实际 %q", job.SourceURL, u)
+	}
+}
+
+// getJSONWeb 发一个带「来自网关自家网页」标记的 GET。
+func (h *harness) getJSONWeb(path string) (*http.Response, map[string]any) {
+	h.t.Helper()
+	req, err := http.NewRequest(http.MethodGet, h.ts.URL+path, nil)
+	if err != nil {
+		h.t.Fatalf("构造请求失败：%v", err)
+	}
+	req.Header.Set(surfaceHeader, "web")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("GET %s 失败：%v", path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return resp, out
 }
 
 // getJSON 发 GET 并把响应解析成 map。

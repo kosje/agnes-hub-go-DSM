@@ -855,7 +855,7 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	// 或 stream 的调用方），正文按 Markdown 渲染 —— 图片必须由服务端回取并落盘、
 	// 换成本地地址，否则正文里那行 ![prompt](https://...) 在浏览器里只会显示成裂图。
 	// 注意上面对 imgJob.URL 用的是原始 items，聊天记录里保留上游地址（体积小）。
-	content, images := intent.ImageContent(s.localizeImageURLs(r.Context(), items, publicBaseURL(r, settings)), decision.Prompt.Text)
+	content, images := intent.ImageContent(s.localizeImageURLs(r, items, settings), decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") + " 未被生图端点接受，已忽略。"
 	}
@@ -953,10 +953,12 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	videoURL := ""
 	if cfg := autoIntentConfig(settings); cfg.VideoWaitSec > 0 && videoID != "" {
 		if u := s.waitForVideo(r.Context(), result.Account, job, cfg.VideoWaitSec); u != "" {
-			// 与轮询路径一致：把上游产出取回本地再回给调用方。
-			videoURL = s.localizeVideoURL(r.Context(), u, publicBaseURL(r, settings))
-			job.URL = videoURL
+			// 落盘一份本地副本给控制台/聊天记录用；回给调用方的地址按调用方是谁定
+			// （外部客户端加载不了指向 NAS 的 http 地址，见 callerMediaURL）。
+			job.SourceURL = u
+			job.URL = s.localizeVideoURL(r.Context(), u, publicBaseURL(r, settings))
 			s.Store.PutJob(job)
+			videoURL = s.callerMediaURL(r, settings, u, job.URL)
 		}
 	}
 

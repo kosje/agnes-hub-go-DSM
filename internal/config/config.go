@@ -213,6 +213,12 @@ type VideoJob struct {
 	// URL 是最终可播放的地址。落盘成功时是本地地址（/api/chat/videos/...），
 	// 落盘失败则退回上游地址。老记录里没有这个字段，读到空串即可。
 	URL string `json:"url,omitempty"`
+	// SourceURL 是上游给出的原始产出地址。
+	//
+	// 留着它是为了「按调用方选地址」：外部 AI 客户端加载不了指向 NAS 的 http 地址
+	// （实测会退化成显示 alt 文本），得回上游那个公网 https 地址给它；
+	// 而网关自己的网页与网关同源，用本地副本。两个地址都要存下来才选得出来。
+	SourceURL string `json:"source_url,omitempty"`
 }
 
 // ImageJob 是图片任务映射（下游 request_id → 上游 image_id + 产出 URL + 承载账号）。
@@ -307,6 +313,15 @@ type Settings struct {
 	// （优先 X-Forwarded-Host / X-Forwarded-Proto，其次 Host）。
 	// 走反向代理、或网关监听地址与客户端访问地址不一致时，显式填这里最稳。
 	PublicBaseURL string `json:"public_base_url"`
+	// ClientMediaURL 决定「回给外部客户端」的媒体地址用哪个。
+	//
+	//	空 / "upstream"（默认）：上游产出地址。实测外部客户端只能加载公网 https
+	//	  图片，指向 NAS 的 http 地址会显示不出来，所以这是稳妥的默认值。
+	//	"local"：本机地址（PublicBaseURL/api/chat/...）。适用于把网关放到 https
+	//	  反向代理后面、且客户端确实能访问到网关的部署 —— 这样离线也能看。
+	//
+	// 网关自己的网页不受此项影响，一律用本地地址（与网关同源，一定可达）。
+	ClientMediaURL string `json:"client_media_url"`
 	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`

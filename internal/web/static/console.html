@@ -134,8 +134,10 @@ const state = { tab:"overview", session:null, stats:null, accounts:null, keys:[]
 
 /* ---------------- 基础 ---------------- */
 async function api(path, opts={}){
-  const r = await fetch(path, {credentials:"same-origin",
-    headers:{"Content-Type":"application/json"}, ...opts});
+  // 声明「这次请求来自网关自家网页」——服务端据此决定生成的图片/视频回本地地址
+  // 还是上游地址（外部 AI 客户端加载不了指向 NAS 的 http 地址）。
+  const headers = {"Content-Type":"application/json", "X-Agnes-Hub-Surface":"web", ...(opts.headers||{})};
+  const r = await fetch(path, {credentials:"same-origin", ...opts, headers});
   const text = await r.text();
   let data = null;
   try{ data = text ? JSON.parse(text) : null; }catch(e){ data = {raw:text}; }
@@ -933,7 +935,11 @@ function viewSettings(){
       ${fld("s_probe","探测模型", s.probe_model||"default-model","text","账号测试按钮用的最小文本模型")}
       ${fld("s_ttl","粘性绑定 TTL（小时）", s.session_ttl_hours??72)}
     </div>
-    <div style="margin-top:12px"><button class="primary" id="btnSaveSettings">保存设置</button></div>
+    <div style="margin-top:12px" class="row">
+      <button class="primary" id="btnSaveSettings">保存设置</button>
+      <button id="btnMediaBase" title="按当前这次请求推算出的媒体基地址，用来排查反向代理配置">查看当前生效的媒体地址</button>
+    </div>
+    <div id="mediaBaseBox" style="margin-top:10px"></div>
   </div>
   <div class="card">
     <h2>优化模式与记录</h2>
@@ -947,7 +953,11 @@ function viewSettings(){
       ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录")}
       ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录")}
       ${fld("s_vid_mb","本地视频缓存上限（MB）", s.video_cache_max_mb!=null?s.video_cache_max_mb:2048,"number","落盘的视频产出总占用上限；超出按最旧的先删。0 = 不限制")}
-      ${fld("s_baseurl","对外访问地址", s.public_base_url||"","text","生成的图片/视频在正文里以绝对地址返回，外部 AI 客户端才能加载；留空按请求 Host 自动推断（如 http://nas:4142）")}
+      ${fld("s_baseurl","对外访问地址", s.public_base_url||"","text","生成的图片/视频用绝对地址返回。留空按请求自动推断；但反向代理常把 Host 设成不带端口的形式（NPM 默认 $host），推断出来会少一段端口 —— 那就必须在这里显式填全，如 https://agens.example.com:52325")}
+      <div><label>客户端媒体地址</label><select id="s_cmedia">
+        <option value="upstream" ${(s.client_media_url||"upstream")==="upstream"?"selected":""}>上游地址（默认，最稳）</option>
+        <option value="local" ${s.client_media_url==="local"?"selected":""}>本机地址（需能访问到网关）</option>
+      </select><div class="hint">生成的图片/视频回给<b>外部 AI 客户端</b>时用哪个地址。默认给上游地址 —— 客户端往往在别的网络位置、甚至跑在 https 页面里，指向 NAS 的 http 地址会显示不出来（表现为图片位置出现一串文字）。<b>若你已把网关反代到公网 HTTPS</b>（客户端能访问到它），改成「本机地址」即可离线可看。网关自己的网页不受此项影响，一律用本地副本。</div></div>
       <div class="hint" style="grid-column:1/-1">生成的图片与视频会落盘到数据目录的 <span class="mono">images/</span> 与 <span class="mono">videos/</span>，正文里只放本地地址 —— 浏览器不一定够得到上游 CDN，落盘也便于长期回看。视频按「条数」和「总字节」两个约束一起淘汰，默认 2 GB。</div>
     </div>
   </div>
@@ -971,6 +981,7 @@ function viewSettings(){
 function bindSettingsEvents(){
   const save = document.getElementById("btnSaveSettings");
   if(!save) return;
+  bindMediaBaseCheck();
   save.onclick = async ()=>{
     const g = id=>document.getElementById(id).value;
     const payload = {
@@ -991,7 +1002,8 @@ function bindSettingsEvents(){
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
       image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
-      video_cache_max_mb:Number(g("s_vid_mb")), public_base_url:g("s_baseurl")
+      video_cache_max_mb:Number(g("s_vid_mb")), public_base_url:g("s_baseurl"),
+      client_media_url:g("s_cmedia")
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
@@ -1052,6 +1064,42 @@ function render(){
   else if(state.tab==="logs"){ v.innerHTML = viewLogs(); }
   else if(state.tab==="settings"){ v.innerHTML = viewSettings(); bindSettingsEvents(); }
   else if(state.tab==="about"){ v.innerHTML = viewAbout(); bindAboutEvents(); }
+}
+
+/* ---------------- 媒体地址自检 ----------------
+   反向代理部署最容易踩的坑：代理把 Host/X-Forwarded-Host 设成 $host（不带端口），
+   网关推断出来的基地址就会少一段端口，生成的图片/视频地址在客户端里加载不出来。
+   这个按钮直接把「按当前这次请求推算出的地址」摊开，一眼就能看出对不对。 */
+function bindMediaBaseCheck(){
+  const btn = document.getElementById("btnMediaBase");
+  const box = document.getElementById("mediaBaseBox");
+  if(!btn || !box) return;
+  btn.onclick = async ()=>{
+    btn.disabled = true; btn.textContent = "查询中…";
+    try{
+      const r = await api("/api/media-base");
+      const row = (k,v)=>`<div class="row" style="gap:8px"><span class="muted" style="min-width:120px">${esc(k)}</span><span class="mono" style="font-size:12px;word-break:break-all">${esc(v||"—")}</span></div>`;
+      const forClient = (r.url_for_client||"");
+      const usingLocal = forClient.includes("/api/chat/");
+      box.innerHTML = `<div class="card" style="margin:0">
+        ${row("基地址", r.base_url)}
+        ${row("来源", r.source)}
+        ${row("示例图片地址", r.sample_image_url)}
+        ${row("客户端将收到", forClient)}
+        ${row("客户端媒体地址", r.client_media_url||"upstream（默认）")}
+        <div class="hint">诊断用原始值：Host=${esc(r.host||"—")} · X-Forwarded-Host=${esc(r.x_forwarded_host||"—")} · X-Forwarded-Proto=${esc(r.x_forwarded_proto||"—")} · TLS=${r.tls?"是":"否"}</div>
+        <div class="banner ${usingLocal?"good":"warn"}" style="margin-top:8px">
+          ${usingLocal
+            ? "客户端拿到的是本机地址。请确认这个地址从客户端所在网络能打开（把示例图片地址粘到浏览器试一下）。"
+            : "客户端拿到的是上游产出地址。若希望用本机地址（离线可看），把上面的「客户端媒体地址」改成「本机地址」并保存。"}
+        </div>
+      </div>`;
+    }catch(e){
+      box.innerHTML = `<div class="banner bad">${esc(e.message)}</div>`;
+    }finally{
+      btn.disabled = false; btn.textContent = "查看当前生效的媒体地址";
+    }
+  };
 }
 
 /* ---------------- 系统 / 自更新 ---------------- */
