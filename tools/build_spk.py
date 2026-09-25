@@ -46,6 +46,7 @@ import contextlib
 import gzip
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -97,7 +98,7 @@ PACKAGE_ARCHES = {
 }
 
 # 每次发布 SPK 都必须递增。仍可用 SPK_BUILD 临时覆盖。
-DEFAULT_SPK_BUILD = "2"
+DEFAULT_SPK_BUILD = "1"
 
 DESCRIPTION = (
     "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定"
@@ -239,8 +240,14 @@ esac
 # 安装后建数据目录。群晖在升级时保留 var/，只有卸载才删除整个套件目录。
 POSTINST = '''#!/bin/sh
 PKG_NAME="%APP_ID%"
+PKG_DIR="${SYNOPKG_PKGDEST:-/var/packages/$PKG_NAME/target}"
 VAR_DIR="${SYNOPKG_PKGVAR:-/var/packages/$PKG_NAME/var}"
 mkdir -p "$VAR_DIR/data" 2>/dev/null || true
+
+# 确保 target/ui 与系统 3rdparty 快捷方式软链接建立，保障 DSM 主菜单图标即时出现
+if [ -d "$PKG_DIR/ui" ] && [ -d /usr/syno/synoman/webman/3rdparty ]; then
+  ln -sfn "$PKG_DIR/ui" "/usr/syno/synoman/webman/3rdparty/$PKG_NAME" 2>/dev/null || true
+fi
 exit 0
 '''
 
@@ -474,49 +481,59 @@ def _key_out_black(w, h, px, threshold=16):
     return out
 
 
-# App 图标底色：取自 logo 自身的深蓝色系（最饱和像素是 rgb(46,84,162)）。
+# App 图标底色：取自 logo 自身的深蓝色系（上 rgb(48,70,140) → 下 rgb(20,28,65)）。
 # 上游 logo 是「浅紫渐变圆 + 白色元素」，本来就是配黑底设计的，直接透明化后在
-# DSM 的浅色界面上白色元素会完全消失。补一层圆角方底既保住对比，又符合 App
-# 图标的常见形态。
-ICON_BG_TOP = (62, 92, 170)
-ICON_BG_BOTTOM = (28, 40, 88)
+# DSM 的浅色界面上白色元素会完全消失。补一层微带呼吸内边距和平滑抗锯齿的圆角方底既保住对比，
+# 又完全符合 DSM 桌面 / 套件中心 App 图标规范。
+ICON_BG_TOP = (48, 70, 140)
+ICON_BG_BOTTOM = (20, 28, 65)
 ICON_CORNER_RADIUS = 0.22
 
 
 def _app_icon(w, h, px):
-    """把透明底的 logo 合成到圆角方形底色上，产出可直接使用的 App 图标。
+    """把透明底的 logo 合成到带平滑抗锯齿的圆角方形底色上，产出可直接使用的 App 图标。"""
+    pad = max(1, int(round(min(w, h) * 0.035)))
+    eff_w = w - pad * 2
+    eff_h = h - pad * 2
+    rad = max(1.0, min(eff_w, eff_h) * ICON_CORNER_RADIUS)
 
-    只在「源图无 alpha、靠键控去背」时调用：那种情况下 logo 的原设计对比度
-    依赖黑底，透明化后在浅色界面上不可辨。
-    """
-    rad = max(1, int(min(w, h) * ICON_CORNER_RADIUS))
     out = bytearray(w * h * 4)
     for y in range(h):
-        # 竖直渐变
-        t = y / max(1, h - 1)
-        br = int(round(ICON_BG_TOP[0] + (ICON_BG_BOTTOM[0] - ICON_BG_TOP[0]) * t))
-        bg = int(round(ICON_BG_TOP[1] + (ICON_BG_BOTTOM[1] - ICON_BG_TOP[1]) * t))
-        bb = int(round(ICON_BG_TOP[2] + (ICON_BG_BOTTOM[2] - ICON_BG_TOP[2]) * t))
         for x in range(w):
-            # 圆角：四个角各取一个圆心做距离判断
-            cx = cy = None
-            if x < rad and y < rad:
-                cx, cy = rad, rad
-            elif x >= w - rad and y < rad:
-                cx, cy = w - rad - 1, rad
-            elif x < rad and y >= h - rad:
-                cx, cy = rad, h - rad - 1
-            elif x >= w - rad and y >= h - rad:
-                cx, cy = w - rad - 1, h - rad - 1
-            if cx is not None and (x - cx) ** 2 + (y - cy) ** 2 > rad * rad:
+            if x < pad or x >= w - pad or y < pad or y >= h - pad:
                 continue
+
+            rx = x - pad
+            ry = y - pad
+            t = ry / max(1, eff_h - 1)
+            br = int(round(ICON_BG_TOP[0] + (ICON_BG_BOTTOM[0] - ICON_BG_TOP[0]) * t))
+            bg = int(round(ICON_BG_TOP[1] + (ICON_BG_BOTTOM[1] - ICON_BG_TOP[1]) * t))
+            bb = int(round(ICON_BG_TOP[2] + (ICON_BG_BOTTOM[2] - ICON_BG_TOP[2]) * t))
+
+            cx = cy = None
+            if rx < rad and ry < rad:
+                cx, cy = rad, rad
+            elif rx >= eff_w - rad and ry < rad:
+                cx, cy = eff_w - rad - 1, rad
+            elif rx < rad and ry >= eff_h - rad:
+                cx, cy = rad, eff_h - rad - 1
+            elif rx >= eff_w - rad and ry >= eff_h - rad:
+                cx, cy = eff_w - rad - 1, eff_h - rad - 1
+
+            corner_alpha = 1.0
+            if cx is not None:
+                d = math.hypot(rx - cx, ry - cy)
+                if d > rad + 0.5:
+                    continue
+                elif d > rad - 0.5:
+                    corner_alpha = max(0.0, min(1.0, rad + 0.5 - d))
 
             i = (y * w + x) * 4
             a = px[i + 3] / 255.0
             out[i] = int(round(px[i] * a + br * (1 - a)))
             out[i + 1] = int(round(px[i + 1] * a + bg * (1 - a)))
             out[i + 2] = int(round(px[i + 2] * a + bb * (1 - a)))
-            out[i + 3] = 255
+            out[i + 3] = int(round(255 * corner_alpha))
     return out
 
 
@@ -620,14 +637,17 @@ def _add_dir_recursive(tar, full, arc, exec_prefixes=("scripts/",)):
             _add_file(tar, cfull, carc, mode)
 
 
-def build_package_tgz(binary_path, out_path):
-    """内层 package.tgz：只放本架构的二进制，解压后位于 SYNOPKG_PKGDEST 根下。
+def build_package_tgz(binary_path, ui_dir, out_path):
+    """内层 package.tgz：放本架构的二进制及 DSM UI 目录，解压后位于 SYNOPKG_PKGDEST 根下。
 
-    群晖官方明确要求不要把多平台二进制打进同一个 spk，所以这里只有一份。
+    群晖官方规范要求：dsmuidir="ui" 指向 package.tgz 解压到 target 后的相对目录，
+    DSM 安装服务据此将 target/[dsmuidir] 链接到 /usr/syno/synoman/webman/3rdparty/ 下以显示主菜单图标。
     """
     buf = io.BytesIO()
     with _tar_gz_writer(buf) as tar:
         _add_file(tar, binary_path, "agnes-hub-go", mode=0o755)
+        if os.path.isdir(ui_dir):
+            _add_dir_recursive(tar, ui_dir, "ui")
     data = buf.getvalue()
     with open(out_path, "wb") as f:
         f.write(data)
@@ -700,12 +720,36 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
     for sub in (scripts_dir, conf_dir):
         os.makedirs(sub, exist_ok=True)
 
-    # 1. 内层包
+    # 1. DSM 桌面图标（ui/）
+    #    只有 INFO 里的 dsmuidir/dsmappname 还不够，必须有 ui/config 把这个
+    #    「应用」定义出来 —— 且该目录必须打进 package.tgz（由 dsmuidir="ui" 指定并由 DSM 软链接），
+    #    这样安装后 DSM 桌面和主菜单上才能正常显示图标和快捷方式。
+    #    图标要成套给：参考的真实套件（synoedit / wol-spk）都提供 16/24/32/48/
+    #    64/72/128/256 多种尺寸，config 里用 images/icon_{0}.png 让 DSM 按需取。
+    ui_dir = os.path.join(d, "ui")
+    ui_images = os.path.join(ui_dir, "images")
+    os.makedirs(ui_images, exist_ok=True)
+    make_icon_set(icon_src, [(n, os.path.join(ui_images, "icon_%d.png" % n))
+                             for n in DSM_ICON_SIZES])
+    with open(os.path.join(ui_dir, "config"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({".url": {DSM_APP_NAME: {
+            "title": "Agnes Hub",
+            "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关",
+            "icon": "images/icon_{0}.png",
+            "type": "url",
+            "protocol": "http",
+            "port": str(SERVICE_PORT),
+            "url": DSM_APP_URL,
+            "allUsers": True,
+        }}}, f, ensure_ascii=False, indent=4)
+        f.write("\n")
+
+    # 2. 内层包：包含二进制以及 ui/ 目录
     pkg_tgz = os.path.join(d, "package.tgz")
-    pkg_data = build_package_tgz(binary_src, pkg_tgz)
+    pkg_data = build_package_tgz(binary_src, ui_dir, pkg_tgz)
     md5 = hashlib.md5(pkg_data).hexdigest()
 
-    # 2. 生命周期脚本：六个钩子必须全部存在，缺一个会被判「套件损坏」
+    # 3. 生命周期脚本：六个钩子必须全部存在，缺一个会被判「套件损坏」
     _write(os.path.join(scripts_dir, "start-stop-status"),
            START_STOP_STATUS.replace("%APP_ID%", APP_ID).replace("%PORT%", str(SERVICE_PORT)))
     _write(os.path.join(scripts_dir, "postinst"), POSTINST.replace("%APP_ID%", APP_ID))
@@ -713,7 +757,7 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
     for name in ("preinst", "preuninst", "postuninst", "preupgrade"):
         _write(os.path.join(scripts_dir, name), TRIVIAL)
 
-    # 3. conf：privilege 决定运行身份，缺失会被拒绝安装。
+    # 4. conf：privilege 决定运行身份，缺失会被拒绝安装。
     #    run-as: package = 以套件专用账户运行（非 root）。本服务监听 4142（>1024）、
     #    不需要 chown 系统文件，因此完全不需要 root，符合最小权限。
     with open(os.path.join(conf_dir, "privilege"), "w", encoding="utf-8", newline="\n") as f:
@@ -725,32 +769,9 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
         json.dump({}, f, ensure_ascii=False, indent=2)
         f.write("\n")
 
-    # 4. 图标
+    # 5. 套件图标（外层 PACKAGE_ICON*.PNG）
     make_icons(icon_src, os.path.join(d, "PACKAGE_ICON.PNG"),
                os.path.join(d, "PACKAGE_ICON_256.PNG"))
-
-    # 5. DSM 桌面图标（ui/）
-    #    只有 INFO 里的 dsmuidir/dsmappname 还不够，必须有 ui/config 把这个
-    #    「应用」定义出来 —— 否则套件只出现在套件中心，DSM 桌面上不会有图标。
-    #    图标要成套给：参考的真实套件（synoedit / wol-spk）都提供 16/24/32/48/
-    #    64/72/256 多种尺寸，config 里用 images/icon_{0}.png 让 DSM 按需取。
-    ui_images = os.path.join(d, "ui", "images")
-    os.makedirs(ui_images, exist_ok=True)
-    make_icon_set(icon_src, [(n, os.path.join(ui_images, "icon_%d.png" % n))
-                             for n in DSM_ICON_SIZES])
-    with open(os.path.join(d, "ui", "config"), "w", encoding="utf-8", newline="\n") as f:
-        json.dump({".url": {DSM_APP_NAME: {
-            "title": "Agnes Hub",
-            "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关",
-            "icon": "images/icon_{0}.png",
-            "type": "url",
-            "protocol": "http",
-            "port": str(SERVICE_PORT),
-            "url": DSM_APP_URL,
-            "allUsers": True,
-            "grantPrivilege": "local",
-        }}}, f, ensure_ascii=False, indent=4)
-        f.write("\n")
 
     # 6. INFO
     extractsize_kb = (os.path.getsize(binary_src) + 1023) // 1024
@@ -820,6 +841,11 @@ def validate_spk(path):
                 raise ValueError("%s 不可执行" % script)
 
         with tarfile.open(fileobj=io.BytesIO(package_data), mode="r:gz") as inner:
+            inner_members = {m.name for m in inner.getmembers()}
+            if "agnes-hub-go" not in inner_members:
+                raise ValueError("package.tgz 缺少 agnes-hub-go 二进制")
+            if "ui/config" not in inner_members:
+                raise ValueError("package.tgz 缺少 ui/config，DSM 将无法在主菜单显示快捷方式")
             binary = inner.getmember("agnes-hub-go")
             if binary.mode & 0o111 == 0:
                 raise ValueError("package.tgz 中的 agnes-hub-go 不可执行")
