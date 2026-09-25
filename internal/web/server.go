@@ -952,7 +952,12 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	// 但等待会占住一条连接，所以默认关闭、由控制台决定。
 	videoURL := ""
 	if cfg := autoIntentConfig(settings); cfg.VideoWaitSec > 0 && videoID != "" {
-		videoURL = s.waitForVideo(r.Context(), result.Account, job, cfg.VideoWaitSec)
+		if u := s.waitForVideo(r.Context(), result.Account, job, cfg.VideoWaitSec); u != "" {
+			// 与轮询路径一致：把上游产出取回本地再回给调用方。
+			videoURL = s.localizeVideoURL(r.Context(), u)
+			job.URL = videoURL
+			s.Store.PutJob(job)
+		}
 	}
 
 	envelope := intent.ChatEnvelope(decision, result.ModelUsed,

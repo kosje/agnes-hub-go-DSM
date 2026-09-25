@@ -682,11 +682,24 @@ function viewJobs(){
     <td>${esc(j.model)}</td>
     <td class="mono" style="font-size:11px">${esc(j.account_id)}</td>
     <td><span class="pill info">${esc(j.status)}</span></td>
+    <td>${j.url?`<button class="sm" data-play="${esc(j.url)}">播放</button>`:'<span class="muted">—</span>'}</td>
     <td class="mono">${j.created_at?new Date(j.created_at*1000).toLocaleString():""}</td></tr>`).join("");
   return `<div class="card"><h2>视频任务（下游 job_id → 上游 video_id）</h2>
-    <div class="muted" style="margin-bottom:8px">客户端只认 job_id，上游语义（video_id / model_name）由网关维护，从根上避免「轮询用错字段」导致的卡住。</div>
-    <div class="scroll"><table><thead><tr><th>job_id</th><th>video_id</th><th>模型</th><th>承载账号</th><th>状态</th><th>创建时间</th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="6" class="muted">暂无任务</td></tr>'}</tbody></table></div></div>`;
+    <div class="muted" style="margin-bottom:8px">客户端只认 job_id，上游语义（video_id / model_name）由网关维护，从根上避免「轮询用错字段」导致的卡住。产出已落盘到数据目录的 <span class="mono">videos/</span>，点「播放」直接看本地副本。</div>
+    <div id="jobPlayer"></div>
+    <div class="scroll"><table><thead><tr><th>job_id</th><th>video_id</th><th>模型</th><th>承载账号</th><th>状态</th><th>产出</th><th>创建时间</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="7" class="muted">暂无任务</td></tr>'}</tbody></table></div></div>`;
+}
+function bindJobEvents(){
+  const box = document.getElementById("jobPlayer");
+  if(!box) return;
+  document.querySelectorAll("button[data-play]").forEach(b=>b.onclick=()=>{
+    // 只接受本地地址，避免把上游 CDN 链接渲染进来（那些地址浏览器常常够不到，
+    // 而且落盘之后也没必要再回上游取）。
+    const u = b.dataset.play || "";
+    if(!u.startsWith("/api/chat/videos/")){ toast("该记录没有本地副本","bad"); return; }
+    box.innerHTML = `<video controls autoplay src="${esc(u)}" style="width:100%;max-width:640px;margin-bottom:10px;border-radius:10px"></video>`;
+  });
 }
 function viewLogs(){
   const rows = (state.logs||[]).map(l=>`<tr>
@@ -825,8 +838,10 @@ function viewSettings(){
         <option value="concurrent_parallel" ${s.optimization_mode==="concurrent_parallel"?"selected":""}>并发并行 (Concurrent Parallel)</option>
       </select><div class="hint">concurrent_batch: 多账号并发处理批次请求; concurrent_parallel: 完全并行处理</div></div>
       ${fld("s_img_ret","图片记录保留天数", s.image_record_retention_days||30,"number","超过天数后自动清理历史记录")}
-      ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录；0 = 不限制")}
-      ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+      ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录")}
+      ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录")}
+      ${fld("s_vid_mb","本地视频缓存上限（MB）", s.video_cache_max_mb!=null?s.video_cache_max_mb:2048,"number","落盘的视频产出总占用上限；超出按最旧的先删。0 = 不限制")}
+      <div class="hint" style="grid-column:1/-1">生成的图片与视频会落盘到数据目录的 <span class="mono">images/</span> 与 <span class="mono">videos/</span>，正文里只放本地地址 —— 浏览器不一定够得到上游 CDN，落盘也便于长期回看。视频按「条数」和「总字节」两个约束一起淘汰，默认 2 GB。</div>
     </div>
   </div>
   <div class="card">
@@ -868,7 +883,8 @@ function bindSettingsEvents(){
       retry_base_backoff_ms:Number(g("s_rbase")), retry_max_backoff_ms:Number(g("s_rmax")),
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
-      image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap"))
+      image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
+      video_cache_max_mb:Number(g("s_vid_mb"))
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));
@@ -924,7 +940,7 @@ function render(){
     if(b) b.onclick = async ()=>{ if(!confirm("清空全部粘性绑定？")) return;
       await api("/api/bindings/clear",{method:"POST"}); await refresh(); };
   }
-  else if(state.tab==="jobs"){ v.innerHTML = viewJobs(); }
+  else if(state.tab==="jobs"){ v.innerHTML = viewJobs(); bindJobEvents(); }
   else if(state.tab==="intent"){ v.innerHTML = viewIntent(); bindIntentEvents(); }
   else if(state.tab==="logs"){ v.innerHTML = viewLogs(); }
   else if(state.tab==="settings"){ v.innerHTML = viewSettings(); bindSettingsEvents(); }

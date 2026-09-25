@@ -30,7 +30,7 @@ func newTempStore(t *testing.T) *config.Store {
 
 // onePixelPNG 是一张合法的 1x1 PNG。
 //
-// 必须用真图：fetchImageBytes 在 Content-Type 不可信时会用 http.DetectContentType
+// 必须用真图：mediaFetchClient 在 Content-Type 不可信时会用 http.DetectContentType
 // 按魔数判断，随便一串字节过不了白名单校验。
 const onePixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
@@ -72,7 +72,7 @@ func TestLocalizeImageURLConservativeFallbacks(t *testing.T) {
 
 	// 原样返回的几种情况
 	for _, c := range []struct{ name, in string }{
-		{"已是本地地址时原样返回", imageRoutePrefix + "0123456789abcdef0123456789abcdef.png"},
+		{"已是本地地址时原样返回", imageKind.route + "0123456789abcdef0123456789abcdef.png"},
 		{"data URI 不处理", "data:image/png;base64,AAAA"},
 		{"非 http(s) 协议不处理", "ftp://example.test/a.png"},
 		{"相对路径不处理", "/local/a.png"},
@@ -98,7 +98,7 @@ func TestLocalizeImageURLConservativeFallbacks(t *testing.T) {
 		if !strings.HasSuffix(m[1], ".png") {
 			t.Errorf("%s：扩展名应为 .png，实际 %q", c.name, m[1])
 		}
-		raw, err := os.ReadFile(filepath.Join(s.imageCacheDir(), m[1]))
+		raw, err := os.ReadFile(filepath.Join(s.mediaDir(imageKind), m[1]))
 		if err != nil {
 			t.Fatalf("%s：文件应已落盘，读取失败 %v", c.name, err)
 		}
@@ -123,7 +123,7 @@ func TestLocalizeImageURLDeduplicates(t *testing.T) {
 	if first != second {
 		t.Errorf("同一内容应得到同一地址，实际 %q vs %q", first, second)
 	}
-	entries, _ := os.ReadDir(s.imageCacheDir())
+	entries, _ := os.ReadDir(s.mediaDir(imageKind))
 	if len(entries) != 1 {
 		t.Errorf("缓存目录应只有 1 个文件，实际 %d 个", len(entries))
 	}
@@ -140,7 +140,7 @@ func TestValidImageNameRejectsTraversal(t *testing.T) {
 		"ffffffffffffffffffffffffffffffff.jpg",
 	}
 	for _, n := range good {
-		if !validImageName(n) {
+		if !validMediaName(imageKind, n) {
 			t.Errorf("%q 应被接受", n)
 		}
 	}
@@ -154,7 +154,7 @@ func TestValidImageNameRejectsTraversal(t *testing.T) {
 		"",
 	}
 	for _, n := range bad {
-		if validImageName(n) {
+		if validMediaName(imageKind, n) {
 			t.Errorf("%q 应被拒绝", n)
 		}
 	}
@@ -176,7 +176,7 @@ func TestChatImageRouteServesSavedFile(t *testing.T) {
 		t.Fatalf("正文里应含本地图片地址，实际：%q", truncateStr(content, 300))
 	}
 
-	resp, err := http.Get(h.ts.URL + imageRoutePrefix + m[1])
+	resp, err := http.Get(h.ts.URL + imageKind.route + m[1])
 	if err != nil {
 		t.Fatalf("取本地图片失败：%v", err)
 	}
@@ -213,7 +213,7 @@ func TestChatImageIsLinkedLocally(t *testing.T) {
 	}
 
 	content := chatContent(t, body)
-	if !strings.Contains(content, "]("+imageRoutePrefix) {
+	if !strings.Contains(content, "]("+imageKind.route) {
 		t.Errorf("Markdown 图片应指向本地地址，实际：%q", truncateStr(content, 300))
 	}
 	if strings.Contains(content, upstream) {
@@ -229,7 +229,7 @@ func TestChatImageIsLinkedLocally(t *testing.T) {
 		t.Fatalf("响应缺少 images[]：%v", body)
 	}
 	first, _ := imgs[0].(map[string]any)
-	if u, _ := first["url"].(string); !strings.HasPrefix(u, imageRoutePrefix) {
+	if u, _ := first["url"].(string); !strings.HasPrefix(u, imageKind.route) {
 		t.Errorf("images[0].url 应为本地地址，实际 %q", truncateStr(u, 120))
 	}
 }
@@ -244,7 +244,7 @@ func TestChatImageStreamIsLinkedLocally(t *testing.T) {
 		"messages": []any{map[string]any{"role": "user", "content": "画一幅山水画。"}},
 		"stream":   true,
 	})
-	if !strings.Contains(raw, imageRoutePrefix) {
+	if !strings.Contains(raw, imageKind.route) {
 		t.Errorf("SSE 帧里应带出本地图片地址，实际：%q", truncateStr(raw, 400))
 	}
 }
@@ -268,7 +268,7 @@ func TestWebImageTabGetsLocalURL(t *testing.T) {
 	}
 	first, _ := data[0].(map[string]any)
 	u, _ := first["url"].(string)
-	if !strings.HasPrefix(u, imageRoutePrefix) {
+	if !strings.HasPrefix(u, imageKind.route) {
 		t.Errorf("网页生图页的 data[0].url 应为本地地址，实际 %q", truncateStr(u, 120))
 	}
 }

@@ -147,9 +147,11 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/chat/v1/videos", s.handleChatMediaProxy)
 	// 视频状态查询：查本地任务 + 上游 /agnesapi，**不是**又一次提交。
 	m.HandleFunc("GET /api/chat/v1/videos/{job_id}", s.handleChatVideoStatus)
-	// 生图结果落盘后的回放端点：正文里的 Markdown 图片指向这里，
-	// 而不是上游地址（浏览器多半加载不出来）。
-	m.HandleFunc("GET "+imageRoutePrefix+"{name}", s.handleChatImage)
+	// 生图 / 生视频结果落盘后的回放端点：正文里的 Markdown 图片与 <video> 指向这里，
+	// 而不是上游地址（浏览器多半加载不出来）。ServeContent 自带 Range 支持，
+	// 视频才能拖动进度条。
+	m.HandleFunc("GET "+imageKind.route+"{name}", s.handleChatMedia(imageKind))
+	m.HandleFunc("GET "+videoKind.route+"{name}", s.handleChatMedia(videoKind))
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1200,9 @@ func applySettings(st *config.Settings, p map[string]any) {
 	i("image_record_retention_days", &st.ImageRecordRetention)
 	i("image_max_capacity", &st.ImageMaxCapacity)
 	i("video_max_capacity", &st.VideoMaxCapacity)
+	// 0 = 不限制。注意 Settings 里刻意没有给这个字段做 normalize 兜底，
+	// 否则「显式关掉上限」会被默认值覆盖回去。
+	i("video_cache_max_mb", &st.VideoCacheMaxMB)
 
 	// chat_password is handled separately in apiSetSettings to avoid accessing s here
 	i("retry_max", &st.RetryMax)
@@ -2260,6 +2265,9 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 		if job.Error != "" {
 			out["error"] = job.Error
 		}
+		if job.URL != "" {
+			out["video_url"] = job.URL
+		}
 		writeJSON(w, 200, out, nil)
 		return
 	}
@@ -2276,9 +2284,13 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if url := extractVideoURL(body); url != "" {
 		job.Status = "completed"
+		// 把上游产出取回本地：浏览器不一定够得到上游的 CDN 地址，直接塞进
+		// <video src> 可能是个转不动的播放器。顺带也就做了长期缓存 ——
+		// 体积有 VideoCacheMaxMB 兜底，不会把 NAS 填满。
+		job.URL = s.localizeVideoURL(r.Context(), url)
 		s.Store.PutJob(job)
 		out["status"] = "completed"
-		out["video_url"] = url
+		out["video_url"] = job.URL
 		writeJSON(w, 200, out, nil)
 		return
 	}
