@@ -40,7 +40,9 @@
   label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
   table{width:100%;border-collapse:collapse}
   th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-  th{font-size:12px;color:var(--muted);font-weight:600;background:#fafbfc}
+  /* 表头一律不换行：窄列会把「产出」「创建时间」这类短标题竖排成两三个字，
+     既难认又白白吃掉行高。 */
+  th{font-size:12px;color:var(--muted);font-weight:600;background:#fafbfc;white-space:nowrap}
   tr:last-child td{border-bottom:none}
   .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;
     background:#eef1f5;color:var(--muted);white-space:nowrap}
@@ -50,6 +52,9 @@
   .pill.warn{background:var(--warn-soft);color:var(--warn)}
   .muted{color:var(--muted)}
   .mono{font-family:var(--mono)}
+  .nowrap{white-space:nowrap}
+  .copyable{cursor:copy}
+  .copyable:hover{color:var(--brand)}
   .scroll{overflow:auto;max-height:520px}
   .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
   .tabs button{border-radius:999px;padding:6px 14px}
@@ -113,6 +118,9 @@
 <script>
 const POOLS = ["text","image_1k","image_2k","image_3k","image_4k","video"];
 const MODALITIES = ["text","image","video"];
+// videoRoutePrefix 是本地落盘视频的地址前缀。判断要用 includes 而不是 startsWith ——
+// 1.0.16 起为了外部客户端，地址已改成绝对地址（http://host/api/chat/videos/...）。
+const videoRoutePrefix = "/api/chat/videos/";
 const TYPES = ["free","enterprise","tokenplan","amd","openrouter"];
 // 各 access_type 的默认 Base URL（与后端 DefaultBaseURLByType 对应）。
 const DEFAULT_BASE_BY_TYPE = {
@@ -676,29 +684,127 @@ function viewQueue(){
   </div>`;
 }
 function viewJobs(){
-  const rows = (state.jobs||[]).map(j=>`<tr>
-    <td class="mono" style="font-size:11px">${esc(j.job_id)}</td>
-    <td class="mono" style="font-size:11px">${esc(j.video_id)}</td>
-    <td>${esc(j.model)}</td>
-    <td class="mono" style="font-size:11px">${esc(j.account_id)}</td>
-    <td><span class="pill info">${esc(j.status)}</span></td>
-    <td>${j.url?`<button class="sm" data-play="${esc(j.url)}">播放</button>`:'<span class="muted">—</span>'}</td>
-    <td class="mono">${j.created_at?new Date(j.created_at*1000).toLocaleString():""}</td></tr>`).join("");
-  return `<div class="card"><h2>视频任务（下游 job_id → 上游 video_id）</h2>
-    <div class="muted" style="margin-bottom:8px">客户端只认 job_id，上游语义（video_id / model_name）由网关维护，从根上避免「轮询用错字段」导致的卡住。产出已落盘到数据目录的 <span class="mono">videos/</span>，点「播放」直接看本地副本。</div>
+  const rows = (state.jobs||[]).map(j=>{
+    const name = accName(j.account_id);
+    return `<tr>
+      <td>
+        <div class="mono copyable" style="font-size:11px" data-copy="${esc(j.job_id)}"
+             title="点击复制完整 job_id：${esc(j.job_id)}">${esc(shortID(j.job_id))}</div>
+        <div class="mono muted" style="font-size:11px" title="上游 video_id：${esc(j.video_id)}">${esc(shortID(j.video_id))||"—"}</div>
+      </td>
+      <td class="mono nowrap" style="font-size:11px">${esc(j.model||"—")}</td>
+      <td>
+        <div style="font-size:12px">${name?esc(name):'<span class="muted">（账号已删除）</span>'}</div>
+        <div class="mono muted" style="font-size:11px" title="${esc(j.account_id)}">${esc(shortID(j.account_id))}</div>
+      </td>
+      <td class="nowrap"><span class="pill ${jobStatusClass(j.status)}">${esc(j.status)}</span></td>
+      <td class="nowrap">${jobOutputCell(j)}</td>
+      <td class="mono nowrap" style="font-size:11px">${j.created_at?new Date(j.created_at*1000).toLocaleString("zh-CN",{hour12:false}):""}</td>
+    </tr>`;
+  }).join("");
+  return `<div class="card">
+    <div class="spread"><h2>视频任务（${(state.jobs||[]).length}）</h2>
+      <div class="muted">客户端只认 job_id，上游语义（video_id / model_name）由网关维护</div></div>
+    <div class="muted" style="margin-bottom:8px">
+      产出已落盘到数据目录的 <span class="mono">videos/</span>，点「播放」直接看本地副本。
+      job_id / video_id 太长，这里只显示前后几位，<b>点一下即可复制完整值</b>。
+    </div>
     <div id="jobPlayer"></div>
-    <div class="scroll"><table><thead><tr><th>job_id</th><th>video_id</th><th>模型</th><th>承载账号</th><th>状态</th><th>产出</th><th>创建时间</th></tr></thead>
-      <tbody>${rows||'<tr><td colspan="7" class="muted">暂无任务</td></tr>'}</tbody></table></div></div>`;
+    <div class="scroll"><table>
+      <thead><tr><th>任务</th><th>模型</th><th>承载账号</th><th>状态</th><th>产出</th><th>创建时间</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="muted">暂无任务</td></tr>'}</tbody></table></div></div>`;
 }
+
+// shortID 把 64 字符的 job_id / video_id 压成「前 8…后 4」。
+//
+// 这些 id 是不换行的长串，原样铺进表格会把整张表撑出横向滚动条，
+// 其余列全被挤到换行。完整值放在 title 里、点一下可复制。
+function shortID(s){
+  s = String(s==null?"":s);
+  if(s.length<=16) return s;
+  return s.slice(0,8)+"…"+s.slice(-4);
+}
+
+// accName 把 account_id 换成可读的账号名（任务记录里只存了 id）。
+function accName(id){
+  const list = (state.accounts && state.accounts.accounts) || [];
+  const a = list.find(x=>x.id===id);
+  return a ? a.name : "";
+}
+
+function jobStatusClass(s){
+  switch(s){
+    case "completed": return "ok";
+    case "failed": return "off";
+    case "submitted": case "in_progress": case "queued": return "warn";
+    default: return "info";
+  }
+}
+
+// jobOutputCell 决定「产出」列显示什么。
+//
+// 注意 url 现在可能是绝对地址（1.0.16 起为了外部客户端改成绝对地址），
+// 所以判断用 includes 而不是 startsWith。
+function jobOutputCell(j){
+  if((j.url||"").includes(videoRoutePrefix)){
+    return `<button class="sm" data-play="${esc(j.url)}">播放</button>`;
+  }
+  if(j.status==="completed"){
+    return `<button class="sm" data-refetch="${esc(j.job_id)}"
+      title="这条记录产生于本地落盘功能上线之前，点一下去上游把产出取回本地">补取</button>`;
+  }
+  return '<span class="muted">—</span>';
+}
+
+// copyText 复制到剪贴板。
+//
+// 必须带兜底：控制台常通过局域网 http 访问，那种非安全上下文里
+// navigator.clipboard 是 undefined，只有老办法能用。
+async function copyText(v){
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(v);
+      return true;
+    }
+  }catch(e){}
+  try{
+    const ta = document.createElement("textarea");
+    ta.value = v;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  }catch(e){ return false; }
+}
+
 function bindJobEvents(){
   const box = document.getElementById("jobPlayer");
   if(!box) return;
   document.querySelectorAll("button[data-play]").forEach(b=>b.onclick=()=>{
-    // 只接受本地地址，避免把上游 CDN 链接渲染进来（那些地址浏览器常常够不到，
-    // 而且落盘之后也没必要再回上游取）。
     const u = b.dataset.play || "";
-    if(!u.startsWith("/api/chat/videos/")){ toast("该记录没有本地副本","bad"); return; }
-    box.innerHTML = `<video controls autoplay src="${esc(u)}" style="width:100%;max-width:640px;margin-bottom:10px;border-radius:10px"></video>`;
+    // 只接受本机落盘的地址，避免把上游 CDN 链接渲染进来（那些地址浏览器
+    // 常常够不到，而且落盘之后也没必要再回上游取）。
+    if(!u.includes(videoRoutePrefix)){ toast("该记录没有本地副本","bad"); return; }
+    box.innerHTML = `<video controls autoplay src="${esc(u)}"
+      style="width:100%;max-width:640px;margin-bottom:10px;border-radius:10px"></video>`;
+    box.scrollIntoView({behavior:"smooth", block:"nearest"});
+  });
+  document.querySelectorAll("[data-copy]").forEach(el=>el.onclick=async ()=>{
+    const ok = await copyText(el.dataset.copy);
+    toast(ok ? "已复制完整 ID" : "复制失败，请手动选中后复制", ok ? "good" : "bad");
+  });
+  document.querySelectorAll("button[data-refetch]").forEach(b=>b.onclick=async ()=>{
+    const id = b.dataset.refetch;
+    b.disabled = true; b.textContent = "取回中…";
+    try{
+      const r = await api("/api/video-jobs/"+encodeURIComponent(id)+"/refetch",{method:"POST",body:"{}"});
+      if(r.video_url){ toast("已取回本地副本","good"); await refresh(); }
+      else toast(r.error||"上游暂未给出产出地址","bad");
+    }catch(e){ toast(e.message,"bad"); }
+    finally{ b.disabled = false; b.textContent = "补取"; }
   });
 }
 function viewLogs(){

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agneshub/internal/config"
 )
@@ -271,4 +272,65 @@ func (h *harness) getJSON(path string) (*http.Response, map[string]any) {
 	var out map[string]any
 	_ = json.Unmarshal(raw, &out)
 	return resp, out
+}
+
+// TestRefetchVideoJobBackfillsLocalCopy 「补取」按钮：本地落盘功能上线之前
+// 完成的任务没有 url 字段，控制台里点不开，重新问一次上游即可补回本地副本。
+func TestRefetchVideoJobBackfillsLocalCopy(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	serveVideoUpstream(t, h, "video/mp4")
+
+	accs := h.store.AccountsSnapshot()
+	if len(accs) == 0 {
+		t.Fatal("测试夹具应至少有一个账号")
+	}
+	// 造一条「旧记录」：已完成、有 video_id、但没有 url
+	job := &config.VideoJob{
+		JobID: "job-legacy-0001", VideoID: "video_legacy_0001",
+		Model: "agnes-video-2.5-flash", AccountID: accs[0].ID,
+		Status: "completed", CreatedAt: float64(time.Now().Unix()),
+	}
+	h.store.PutJob(job)
+
+	req, _ := http.NewRequest(http.MethodPost,
+		h.ts.URL+"/api/video-jobs/"+job.JobID+"/refetch", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: h.store.SessionToken()})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("补取请求失败：%v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("补取应 200，实际 %d：%s", resp.StatusCode, raw)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	u, _ := out["video_url"].(string)
+	if !strings.Contains(u, videoKind.route) {
+		t.Fatalf("补取后应拿到本地地址，实际 %q（%s）", u, raw)
+	}
+
+	// 落库了，且文件真的在
+	got, _ := h.store.JobByID(job.JobID)
+	if got == nil || !strings.Contains(got.URL, videoKind.route) {
+		t.Errorf("任务记录应回写本地地址，实际 %+v", got)
+	}
+	name := u[strings.LastIndex(u, "/")+1:]
+	if _, err := os.Stat(filepath.Join(h.srv.mediaDir(videoKind), name)); err != nil {
+		t.Errorf("补取的视频应已落盘：%v", err)
+	}
+}
+
+// TestRefetchVideoJobRequiresAuth 补取会真的回上游取文件，必须要求管理员会话。
+func TestRefetchVideoJobRequiresAuth(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	resp, err := http.Post(h.ts.URL+"/api/video-jobs/job-x/refetch", "application/json", nil)
+	if err != nil {
+		t.Fatalf("请求失败：%v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 {
+		t.Error("没有管理员会话时不该放行")
+	}
 }
