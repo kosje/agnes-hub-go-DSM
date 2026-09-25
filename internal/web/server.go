@@ -213,6 +213,16 @@ func autoIntentConfig(s config.Settings) intent.Config {
 	}
 }
 
+// isAutoModel 判断模型名是否表示「让网关决定」。
+//
+// 必须带上设置里的 AutoModelName：默认值 "agnes-auto" 不在 intent.IsAutoModel
+// 的内置集合（auto / auto-all / auto*）里，只认内置名会把 auto 请求当成
+// 「显式模型」原样透传给上游 —— 内容判定整条链路被跳过，用户看到的就是
+// 「选了 agnes-auto 就不能生图 / 生视频」。
+func isAutoModel(name string, settings config.Settings) bool {
+	return intent.IsAutoModelNamed(name, settings.AutoModelName)
+}
+
 // autoModelUnion 汇总所有可用账号在指定模态下声明的模型（跨账号并集）。
 func (s *Server) autoModelUnion(settings config.Settings, modality string) []string {
 	var out []string
@@ -543,7 +553,7 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 	wantsStream := truthy(body["stream"])
 
 	var decision intent.Result
-	if intent.IsAutoModel(requested) || requested == "" {
+	if isAutoModel(requested, settings) || requested == "" {
 		decision = s.decideCached(path, body, requested, settings)
 	} else {
 		decision = intent.Result{
@@ -570,7 +580,7 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 
 	// ---- 文本 ----
 	poolClass := "text"
-	if !intent.IsAutoModel(requested) {
+	if !isAutoModel(requested, settings) {
 		poolClass = pool.Classify(requested, body, settings.ModelAliases, settings.DefaultImageTier)
 	}
 	if e := s.gate(item, poolClass); e != nil {
@@ -580,7 +590,7 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 
 	var requiredModel string
 	bodyFor := func(a *config.Account) ([]byte, string) { return nil, "" }
-	if intent.IsAutoModel(requested) || requested == "" {
+	if isAutoModel(requested, settings) || requested == "" {
 		model, e := s.resolveAutoModel(settings, intent.Text)
 		if e != nil {
 			writeErr(w, e)
@@ -655,7 +665,7 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request, path, modal
 // 否则「我明明指定了 image-2.1，系统却用 2.5 生图」会变成无法解释的行为。
 func (s *Server) pickMediaModel(settings config.Settings, decision intent.Result, modality string) (string, *apiError) {
 	requested := strings.TrimSpace(decision.ModelRequested)
-	if requested != "" && !intent.IsAutoModel(requested) {
+	if requested != "" && !isAutoModel(requested, settings) {
 		return pool.ResolveModel(requested, settings.ModelAliases), nil
 	}
 	return s.resolveAutoModel(settings, modality)
@@ -665,7 +675,8 @@ func (s *Server) pickMediaModel(settings config.Settings, decision intent.Result
 func (s *Server) mediaBodyFor(base map[string]any, settings config.Settings, decision intent.Result,
 	poolClass, modality, fallbackModel string) func(*config.Account) ([]byte, string) {
 
-	explicit := strings.TrimSpace(decision.ModelRequested) != "" && !intent.IsAutoModel(decision.ModelRequested)
+	explicit := strings.TrimSpace(decision.ModelRequested) != "" &&
+		!isAutoModel(decision.ModelRequested, settings)
 	if explicit {
 		model := pool.ResolveModel(decision.ModelRequested, settings.ModelAliases)
 		clone := make(map[string]any, len(base))
@@ -1442,9 +1453,34 @@ func decodeOrRaw(raw []byte) any {
 	var out any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": map[string]any{
-			"message": strings.TrimSpace(string(raw)), "type": "upstream_error"}}
+			"message": upstreamTextSummary(raw), "type": "upstream_error"}}
 	}
 	return out
+}
+
+// upstreamTextSummary 把非 JSON 的上游响应压成一句可读摘要。
+//
+// 上游被边缘 WAF 拦掉时回的是一整页 HTML（动辄几万字符），原样塞进
+// error.message 会把控制台和对话页整个刷满 —— 用户既看不懂，也看不到真正
+// 有用的信息（状态码、是哪个环节拦的）。这里只留开头一小段并点明性质。
+func upstreamTextSummary(raw []byte) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" {
+		return "上游返回了空响应（非 JSON）"
+	}
+	low := strings.ToLower(s)
+	looksHTML := strings.HasPrefix(low, "<!doctype html") ||
+		strings.HasPrefix(low, "<html") ||
+		strings.Contains(low, "<head")
+	if !looksHTML {
+		return truncateStr(s, 500)
+	}
+	what := "HTML 页面"
+	if strings.Contains(low, "cloudflare") {
+		what = "Cloudflare 拦截页"
+	}
+	return "上游返回了 " + what + "，而不是业务接口的 JSON 响应（通常是边缘 WAF / 网关拦截）。" +
+		"原文开头：" + truncateStr(s, 160)
 }
 
 func mapList(v any) []map[string]any {

@@ -101,8 +101,9 @@ PACKAGE_ARCHES = {
     "armv8": "armada37xx rtd1296 rtd1619 rtd1619b aarch64 armv8",
 }
 
-# 每次发布 SPK 都必须递增。仍可用 SPK_BUILD 临时覆盖。
-DEFAULT_SPK_BUILD = "3"
+# 每次发布 SPK 都必须递增；功能号（main.go 的 var version）变化时从 1 重新开始。
+# 仍可用 SPK_BUILD 临时覆盖。
+DEFAULT_SPK_BUILD = "1"
 
 DESCRIPTION = (
     "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定"
