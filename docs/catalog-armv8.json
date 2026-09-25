@@ -2,15 +2,15 @@
   "packages": [
     {
       "package": "agnes-hub",
-      "version": "1.0.12-0002",
+      "version": "1.0.13",
       "dname": "Agnes Hub",
       "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生 / 生图 / 生视频；FIFO 严格节拍限流、软粘性溢出、二维自适应校准、熔断自动复活。数据保存在套件目录内，全 JSON 文件，免 SSH 即可备份迁移。",
       "price": 0,
       "download_count": 0,
       "recent_download_count": 0,
-      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-armv8-1.0.12-0002.spk",
-      "size": 3829760,
-      "md5": "8e7143d4b9c9cb3bb161b53bfdd95944",
+      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-armv8-1.0.13.spk",
+      "size": 3870720,
+      "md5": "430936ba5cddd193810d5cf726d2ad2f",
       "thumbnail": [
         "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-72.png"
       ],
@@ -30,7 +30,7 @@
       "distributor": "kosje",
       "distributor_url": "https://github.com/kosje/agnes-hub-go-DSM",
       "support_url": "https://github.com/kosje/agnes-hub-go-DSM/issues",
-      "changelog": "【1.0.12-0002】<br>· 新增服务端「base64 回取代理」：生成的图片由服务端回取后以 base64 内联，对话窗口按 Markdown 直接显示，不再出现裂图（上游图片地址带鉴权或落在浏览器够不到的 CDN 上）<br>· 修复对话页 / 控制台生图结果无法显示：data[].url 现由服务端回取，浏览器零依赖即可渲染<br>· 裸 /v1 接口保持原样返回真实上游地址，程序化客户端不受影响<br>· 控制台「版本与自更新」：套件版仍能查到最新版本号与发布时间；「查看全部版本」只保留 GitHub 地址<br><br>【1.0.12-0001】<br>· 【重要】修复生图打不通：控制台路由 /api/chat/v1/... 转发上游时没摘掉 /api/chat 前缀，请求打到了上游不存在的路径，被边缘 WAF 拦成一张 HTML 错误页<br>· 【重要】修复 agnes-auto 不被识别为 auto：auto 判定只认内置的 auto/auto-all/auto* 前缀，不认识设置里的 AutoModelName（默认 agnes-auto），导致自动判定链路整条被跳过<br>· 【重要】修复对话入口提示词被读空（请求体被读第二遍）与响应形态未回译（images 结构按 chat 的 choices 解析 → 显示「无内容返回」）<br>· 控制台标题 / 侧边栏 / 登录页改为「Agnes Hub 控制台」，副标题与示例账号名同步去掉旧品牌（纯展示文本，不影响取值）<br>· 修复网页顶栏 logo 升级后不更新：/logo.png 原先 max-age=86400，改为 no-cache + 内容指纹 ETag，前端引用地址带指纹，缓存必然击穿<br>· 上游返回 HTML（WAF 拦截页）时不再把整页刷到界面，压成一句可读摘要",
+      "changelog": "【1.0.13】<br>· 版本号规则改为纯 x.y.z：发新版直接 +1，不再带 -0001 构建号；套件 INFO、catalog、控制台显示、Release tag 全部一致<br>· 生成的图片改为落盘保存（数据目录 images/），聊天窗口显示本地链接，不再把 base64 内联进正文（单条记录从 8 MB 降到几 KB，翻聊天记录时图片仍能显示）<br>· 【重要】修复生视频链路：提交现在返回本地 job_id 并落进「视频任务」；查询任务改走上游真正的查询接口，不再被当成「再提交一次」<br>· 上游错误信息不再只剩一个 HTTP 400：兼容 message/msg/detail/error 等字段名，把上游原话挖出来显示<br>· 新增控制台「向上游拉取可用模型」：拿账号 Key 问上游 /v1/models，直接标出本地清单里填了但上游没给的模型（用来判断视频模型是否被上游下架）<br>· 控制台「查看全部版本」改为 GitHub 徽标链接；套件版仍能查到最新版本号与发布时间<br>· 清理旧品牌标识：指标名 agnes_hub_*、cookie agnes_hub_session、User-Agent agnes-hub/1.0 等（升级后需重新登录一次控制台）<br><br>【1.0.12-0002】<br>· 生图结果由服务端回取后以 base64 内联（1.0.13 已改为落盘 + 本地链接）<br>· 控制台「版本与自更新」：套件版仍能查到最新版本号与发布时间<br><br>【1.0.12-0001】<br>· 【重要】修复生图打不通：控制台路由 /api/chat/v1/... 转发上游时没摘掉 /api/chat 前缀<br>· 【重要】修复 agnes-auto 不被识别为 auto，自动判定链路整条被跳过<br>· 【重要】修复对话入口提示词被读空与响应形态未回译<br>· 控制台标题 / 侧边栏 / 登录页改为「Agnes Hub 控制台」<br>· 修复网页顶栏 logo 升级后不更新（no-cache + 内容指纹 ETag）<br>· 上游返回 HTML（WAF 拦截页）时不再把整页刷到界面",
       "thirdparty": true,
       "category": 0,
       "subcategory": 0,
