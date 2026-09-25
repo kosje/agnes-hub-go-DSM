@@ -61,7 +61,7 @@ func TestChatVideoIsDownloadedLocally(t *testing.T) {
 		t.Fatalf("应已完成，实际 %q（%v）", got, body)
 	}
 	u, _ := body["video_url"].(string)
-	if !strings.HasPrefix(u, videoKind.route) {
+	if !strings.Contains(u, videoKind.route) {
 		t.Errorf("video_url 应为本地地址 %s，实际 %q（上游是 %s）", videoKind.route, u, upstream)
 	}
 	if !strings.HasSuffix(u, ".mp4") {
@@ -69,7 +69,7 @@ func TestChatVideoIsDownloadedLocally(t *testing.T) {
 	}
 
 	// 文件真的落了盘，内容与上游一致
-	name := strings.TrimPrefix(u, videoKind.route)
+	name := u[strings.LastIndex(u, "/")+1:]
 	raw, err := os.ReadFile(filepath.Join(h.srv.mediaDir(videoKind), name))
 	if err != nil {
 		t.Fatalf("视频应已落盘，读取失败 %v", err)
@@ -90,11 +90,11 @@ func TestChatVideoRouteServesFile(t *testing.T) {
 	jobID, _ := submit["job_id"].(string)
 	_, body := h.getJSON("/api/chat/v1/videos/" + jobID)
 	local, _ := body["video_url"].(string)
-	if !strings.HasPrefix(local, videoKind.route) {
+	if !strings.Contains(local, videoKind.route) {
 		t.Fatalf("应先落盘，实际 %q", local)
 	}
 
-	resp, err := http.Get(h.ts.URL + local)
+	resp, err := http.Get(local) // 现在返回的就是绝对地址
 	if err != nil {
 		t.Fatalf("取本地视频失败：%v", err)
 	}
@@ -124,7 +124,7 @@ func TestVideoRouteSupportsRange(t *testing.T) {
 	_, body := h.getJSON("/api/chat/v1/videos/" + jobID)
 	local, _ := body["video_url"].(string)
 
-	req, _ := http.NewRequest(http.MethodGet, h.ts.URL+local, nil)
+	req, _ := http.NewRequest(http.MethodGet, local, nil)
 	req.Header.Set("Range", "bytes=0-3")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -149,12 +149,12 @@ func TestVideoLocalizeFallsBackToUpstream(t *testing.T) {
 	}))
 	defer dead.Close()
 
-	got := s.localizeVideoURL(context.Background(), dead.URL+"/a.mp4")
+	got := s.localizeVideoURL(context.Background(), dead.URL+"/a.mp4", "")
 	if got != dead.URL+"/a.mp4" {
 		t.Errorf("取不到时应原样退回上游地址，实际 %q", got)
 	}
 	// 非 http(s) 与已是本地地址都不该被处理
-	if got := s.localizeVideoURL(context.Background(), videoKind.route+"abc.mp4"); got != videoKind.route+"abc.mp4" {
+	if got := s.localizeVideoURL(context.Background(), videoKind.route+"abc.mp4", ""); got != videoKind.route+"abc.mp4" {
 		t.Errorf("已是本地地址应原样返回，实际 %q", got)
 	}
 }
@@ -249,7 +249,7 @@ func TestVideoJobPersistsLocalURL(t *testing.T) {
 	if !ok {
 		t.Fatal("任务应已落库")
 	}
-	if !strings.HasPrefix(job.URL, videoKind.route) {
+	if !strings.Contains(job.URL, videoKind.route) {
 		t.Errorf("任务记录里应存本地地址，实际 %q", job.URL)
 	}
 	// 再查一次要能直接拿到（不再重复回取）

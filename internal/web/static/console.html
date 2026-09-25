@@ -841,6 +841,7 @@ function viewSettings(){
       ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录")}
       ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录")}
       ${fld("s_vid_mb","本地视频缓存上限（MB）", s.video_cache_max_mb!=null?s.video_cache_max_mb:2048,"number","落盘的视频产出总占用上限；超出按最旧的先删。0 = 不限制")}
+      ${fld("s_baseurl","对外访问地址", s.public_base_url||"","text","生成的图片/视频在正文里以绝对地址返回，外部 AI 客户端才能加载；留空按请求 Host 自动推断（如 http://nas:4142）")}
       <div class="hint" style="grid-column:1/-1">生成的图片与视频会落盘到数据目录的 <span class="mono">images/</span> 与 <span class="mono">videos/</span>，正文里只放本地地址 —— 浏览器不一定够得到上游 CDN，落盘也便于长期回看。视频按「条数」和「总字节」两个约束一起淘汰，默认 2 GB。</div>
     </div>
   </div>
@@ -884,7 +885,7 @@ function bindSettingsEvents(){
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
       image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
-      video_cache_max_mb:Number(g("s_vid_mb"))
+      video_cache_max_mb:Number(g("s_vid_mb")), public_base_url:g("s_baseurl")
     };
     MODALITIES.forEach(m=>payload.auto_intent.preferred_models[m] =
       g("s_pref_"+m).split(",").map(x=>x.trim()).filter(Boolean));

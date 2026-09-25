@@ -37,6 +37,10 @@ type mockAgnes struct {
 	imageURL string
 	// videoURL 是视频任务完成后 /agnesapi 返回的产出地址，语义同上。
 	videoURL string
+	// lastImgPrompt / lastImgModel 记录最近一次生图请求实际发出去的参数，
+	// 用来断言「网关挑给上游的提示词是不是用户真正说的那句话」。
+	lastImgPrompt string
+	lastImgModel  string
 }
 
 func newMockAgnes(minInterval time.Duration) *mockAgnes {
@@ -140,6 +144,10 @@ func (m *mockAgnes) handler() http.Handler {
 				writeJSONRaw(w, 400, map[string]any{"code": "invalid_request", "message": "prompt 不能为空"})
 				return
 			}
+			m.mu.Lock()
+			m.lastImgPrompt, _ = payload["prompt"].(string)
+			m.lastImgModel = model
+			m.mu.Unlock()
 			writeJSONRaw(w, 200, map[string]any{
 				"created": time.Now().Unix(),
 				"data":    []map[string]any{{"url": m.getImageURL(), "revised_prompt": "mock"}},
@@ -629,4 +637,17 @@ func (m *mockAgnes) lastModelOf(path string) string {
 		}
 	}
 	return ""
+}
+
+// lastImagePrompt / lastImageModel 记录最近一次生图请求的参数，供调试与断言使用。
+func (m *mockAgnes) lastImagePrompt() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastImgPrompt
+}
+
+func (m *mockAgnes) lastImageModel() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastImgModel
 }

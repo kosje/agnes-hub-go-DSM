@@ -300,6 +300,13 @@ type Settings struct {
 	// 视频光卡条数不够：一段 1080P 视频 10~30 MB，200 条能吃掉好几个 GB。
 	// 落盘缓存会在「条数」和「总字节」两个约束里取先到的那个淘汰。0 = 不限。
 	VideoCacheMaxMB int `json:"video_cache_max_mb"`
+	// PublicBaseURL 是「客户端能访问到的」网关基地址，形如 http://nas:4142。
+	//
+	// 生成的图片/视频在正文里以地址形式返回，外部 AI 客户端需要一个**绝对**地址
+	// 才能加载（相对路径只有网关自己的网页能解析）。留空则按请求头自动推断
+	// （优先 X-Forwarded-Host / X-Forwarded-Proto，其次 Host）。
+	// 走反向代理、或网关监听地址与客户端访问地址不一致时，显式填这里最稳。
+	PublicBaseURL string `json:"public_base_url"`
 	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
