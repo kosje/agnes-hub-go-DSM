@@ -1624,9 +1624,17 @@ func (s *Server) updateStatus() map[string]any {
 	if s.Updater != nil {
 		cur = s.Updater.Version()
 	}
+	// repo 是控制台「查看全部版本」要跳转的仓库。自更新开着时取自更新仓库
+	// （保证链接与「立即更新」能装上的版本对得上）；套件版自更新被禁用，
+	// 用 main 注入的套件 Release 仓库兜底。
+	repo := s.ReleaseRepo
+	if s.Updater != nil && s.Updater.Repo() != "" {
+		repo = s.Updater.Repo()
+	}
 	out := map[string]any{
 		"current_version": cur,
 		"enabled":         s.Updater != nil,
+		"repo":            repo,
 	}
 	if s.Updater == nil {
 		return out
@@ -1656,6 +1664,7 @@ func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
 			"current_version": s.Version,
 			"enabled":         false,
+			"repo":            s.ReleaseRepo,
 			"error":           "自更新未启用",
 		}, nil)
 		return
