@@ -295,6 +295,7 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
 	if err != nil {
+		cancel()
 		return nil, false, err
 	}
 	for k, values := range ClientHeaders(account, opts.ExtraHeaders, opts.Anthropic) {
@@ -306,6 +307,7 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	select {
 	case sem <- struct{}{}:
 	case <-ctx.Done():
+		cancel()
 		return nil, false, ctx.Err()
 	}
 

@@ -371,7 +371,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 //   - 不使用 prometheus.Client 依赖（保持零外部依赖），自己拼行。
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	h := s.Hub
-	m := h.Metrics
+	m := &h.Metrics
 	startedAt := h.Metrics.StartedAt.Unix()
 	settings := h.Settings()
 
