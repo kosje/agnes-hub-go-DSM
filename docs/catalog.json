@@ -2,15 +2,15 @@
   "packages": [
     {
       "package": "agnes-hub",
-      "version": "1.0.11-0001",
+      "version": "1.0.11-0002",
       "dname": "Agnes Hub",
       "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生 / 生图 / 生视频；FIFO 严格节拍限流、软粘性溢出、二维自适应校准、熔断自动复活。数据保存在套件目录内，全 JSON 文件，免 SSH 即可备份迁移。",
       "price": 0,
       "download_count": 0,
       "recent_download_count": 0,
-      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.11-0001.spk",
-      "size": 3655680,
-      "md5": "fb521b1071cac981c43232a4d594627f",
+      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.11-0002.spk",
+      "size": 3512320,
+      "md5": "f7e6723a662716a839807827c4a716bc",
       "thumbnail": [
         "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-72.png"
       ],
@@ -30,7 +30,7 @@
       "distributor": "kosje",
       "distributor_url": "https://github.com/kosje/agnes-hub-go-DSM",
       "support_url": "https://github.com/kosje/agnes-hub-go-DSM/issues",
-      "changelog": "同步上游 1.0.11 特性与修复，彻底修复 DSM 桌面与主菜单图标。<br>· 修复主菜单与桌面应用显示：将 ui/config 打入 package.tgz 内部，解决安装后主菜单找不到套件的根本缺陷<br>· 升级图标渲染算法：新增圆角呼吸边距与抗锯齿处理，在浅色/深色主题下均清晰细腻<br>· 同步上游 1.0.11：修复 AMD 空响应体、软粘性会话绑定模型判定，新增账号编辑完整弹窗与优先级支持",
+      "changelog": "重做 DSM 图标，彻底解决「套件图标显示不对」的问题。<br>· 图标改为按矢量精度重绘：从上游 logo 里量出白色字形的真实几何（外框、边框厚度、分隔线位置），再按几何重新栅格化，16/24/32/48/64/72/128/256 全尺寸都清晰、无锯齿<br>· 去掉原图的黑底与浅紫圆盘：原 logo 是「黑底 + 浅紫圆盘 + 白字形」的 RGB 图，抠掉黑底后白字形压在浅紫圆盘上对比度极低、还会与方底形成两层轮廓。现在改为品牌蓝渐变圆角方底 + 白色字形 + 淡蓝三格，浅色/深色主题下都清晰<br>· 同步上游 1.0.11：修复 AMD 空响应体、软粘性会话绑定模型判定，新增账号编辑完整弹窗与优先级支持",
       "thirdparty": true,
       "category": 0,
       "subcategory": 0,
