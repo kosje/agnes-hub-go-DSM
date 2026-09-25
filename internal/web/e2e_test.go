@@ -33,8 +33,10 @@ type mockAgnes struct {
 	byPath      sync.Map // path -> *atomic.Int64
 	lastModel   sync.Map // path -> string
 	// imageURL 是生图接口返回的 url。留空时用默认的不可达地址
-	// （cdn.example.test），需要验证「服务端回取图片」的用例再把它指向真实服务。
+	// （cdn.example.test），需要验证「服务端回取」的用例再把它指向真实服务。
 	imageURL string
+	// videoURL 是视频任务完成后 /agnesapi 返回的产出地址，语义同上。
+	videoURL string
 }
 
 func newMockAgnes(minInterval time.Duration) *mockAgnes {
@@ -55,6 +57,22 @@ func (m *mockAgnes) getImageURL() string {
 		return "https://cdn.example.test/mock-1.png"
 	}
 	return m.imageURL
+}
+
+// setVideoURL 指定视频任务完成后要返回的产出地址。
+func (m *mockAgnes) setVideoURL(u string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.videoURL = u
+}
+
+func (m *mockAgnes) getVideoURL() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.videoURL == "" {
+		return "https://cdn.example.test/mock-1.mp4"
+	}
+	return m.videoURL
 }
 
 func (m *mockAgnes) count(path string) *atomic.Int64 {
@@ -154,7 +172,7 @@ func (m *mockAgnes) handler() http.Handler {
 			writeJSONRaw(w, 200, map[string]any{"video_id": "vid-mock-0001", "status": "queued"})
 		case strings.Contains(path, "/agnesapi"):
 			writeJSONRaw(w, 200, map[string]any{"status": "completed",
-				"video_url": "https://cdn.example.test/mock-1.mp4"})
+				"video_url": m.getVideoURL()})
 		default:
 			writeJSONRaw(w, 404, map[string]any{"error": map[string]any{"message": "not found: " + path}})
 		}

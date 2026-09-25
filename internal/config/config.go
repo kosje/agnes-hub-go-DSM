@@ -210,6 +210,9 @@ type VideoJob struct {
 	CreatedAt float64 `json:"created_at"`
 	RequestID string  `json:"request_id"`
 	Error     string  `json:"error,omitempty"`
+	// URL 是最终可播放的地址。落盘成功时是本地地址（/api/chat/videos/...），
+	// 落盘失败则退回上游地址。老记录里没有这个字段，读到空串即可。
+	URL string `json:"url,omitempty"`
 }
 
 // ImageJob 是图片任务映射（下游 request_id → 上游 image_id + 产出 URL + 承载账号）。
@@ -292,6 +295,11 @@ type Settings struct {
 	ImageRecordRetention int                `json:"image_record_retention_days"`
 	ImageMaxCapacity     int                `json:"image_max_capacity"`
 	VideoMaxCapacity     int                `json:"video_max_capacity"`
+	// VideoCacheMaxMB 是本地视频缓存目录的总字节上限（MB）。
+	//
+	// 视频光卡条数不够：一段 1080P 视频 10~30 MB，200 条能吃掉好几个 GB。
+	// 落盘缓存会在「条数」和「总字节」两个约束里取先到的那个淘汰。0 = 不限。
+	VideoCacheMaxMB int `json:"video_cache_max_mb"`
 	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
 	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
@@ -350,6 +358,10 @@ func DefaultSettings() Settings {
 		ImageRecordRetention: 30,
 		ImageMaxCapacity:    500,
 		VideoMaxCapacity:    200,
+		// 注意：这里刻意**不**在 normalizeSettings 里给它补默认值。
+		// 旧版 settings.json 里没有这个键，反序列化时会保留这里的默认值；
+		// 而用户显式写 0 表示「不限」，一旦在 normalize 里补默认值就永远关不掉了。
+		VideoCacheMaxMB: 2048,
 		RegionPriority:      "cn_first",
 		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
 	}
