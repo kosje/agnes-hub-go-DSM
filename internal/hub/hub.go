@@ -557,33 +557,49 @@ type PickResult struct {
 	Bound   *config.Account
 }
 
-// pickWithPriority 按区域优先级选择账号：先试首选区域的健康账号，再 fallback 另一区域。
+// pickWithPriority 选择账号：优先级（数字越大越优先）为第一排序键，
+// 同优先级内按「首选区域 → 预计等待 → 在途」排序。这样手动调高的账号会稳定顶到前面，
+// 而区域优先级退化为同优先级内的次级偏好（与「cn_first / com_first」语义一致）。
 func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requiredModel string) *config.Account {
 	s := h.Settings()
 	primaryCN := s.RegionPriority != "com_first" // 默认 cn_first
 
-	primary, fallback := func() []*config.Account {
-		var out []*config.Account
-		for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
-			if config.IsCNHost(a.BaseURL) == primaryCN {
-				out = append(out, a)
-			}
+	bestAcc := (*config.Account)(nil)
+	bestScore := pickScore{}
+	init := false
+	for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
+		sc := pickScore{
+			priority:    a.Priority,
+			regionMatch: config.IsCNHost(a.BaseURL) == primaryCN,
+			wait:        h.Pacer(a, poolClass).ProjectedWait(),
+			inflight:    h.Inflight(a.ID),
 		}
-		return out
-	}(), func() []*config.Account {
-		var out []*config.Account
-		for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
-			if config.IsCNHost(a.BaseURL) != primaryCN {
-				out = append(out, a)
-			}
+		if !init || sc.betterThan(bestScore) {
+			bestAcc, bestScore, init = a, sc, true
 		}
-		return out
-	}()
-
-	if best := bestOf(h, primary, poolClass, ""); best != nil {
-		return best
 	}
-	return bestOf(h, fallback, poolClass, "")
+	return bestAcc
+}
+
+// pickScore 是候选账号的排序评分；betterThan 越大越优。
+type pickScore struct {
+	priority    int
+	regionMatch bool
+	wait        time.Duration
+	inflight    int
+}
+
+func (s pickScore) betterThan(o pickScore) bool {
+	if s.priority != o.priority {
+		return s.priority > o.priority
+	}
+	if s.regionMatch != o.regionMatch {
+		return s.regionMatch // 同优先级内首选区域更优
+	}
+	if s.wait != o.wait {
+		return s.wait < o.wait
+	}
+	return s.inflight < o.inflight
 }
 
 // Pick 选择账号。
@@ -605,7 +621,12 @@ func (h *Hub) Pick(sessionKey, poolClass, pinned, requiredModel string, exclude 
 			if a := h.store.AccountByID(b.AccountID); a != nil && a.Enabled &&
 				strings.TrimSpace(a.APIKey) != "" && h.Capable(a, poolClass) &&
 				(exclude == nil || !exclude[a.ID]) {
-				bound = a
+				// 软粘性绑定只在该账号能承载本次请求的「具体模型」时才生效。
+				// 否则（例如同一会话先用了 AMD 模型、后切到 agnes 模型）应放弃旧绑定，
+				// 让调度器按 requiredModel 重新选号，避免把 agnes 请求错发给 AMD 账号。
+				if requiredModel == "" || h.Declares(a, poolClass, requiredModel) {
+					bound = a
+				}
 			}
 		}
 	}
@@ -647,10 +668,10 @@ func (h *Hub) Pick(sessionKey, poolClass, pinned, requiredModel string, exclude 
 					ErrNoCapacity, poolClass)
 			}
 			var bestAcc *config.Account
-			var bestWait time.Duration
-			for i, a := range all {
+			bestWait := time.Duration(0)
+			for _, a := range all {
 				w := h.PenaltyRemaining(a.ID)
-				if i == 0 || w < bestWait {
+				if bestAcc == nil || a.Priority > bestAcc.Priority || (a.Priority == bestAcc.Priority && w < bestWait) {
 					bestAcc, bestWait = a, w
 				}
 			}

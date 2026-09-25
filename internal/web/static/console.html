@@ -87,15 +87,32 @@
 @media (min-width:769px){
   .tabs{overflow-x:visible}
 }
+/* ============ 弹窗 ============ */
+.modal-back{position:fixed;inset:0;background:rgba(16,22,30,.45);display:flex;align-items:flex-start;
+  justify-content:center;z-index:50;padding:40px 16px;overflow:auto}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;
+  max-width:780px;width:100%;box-shadow:0 14px 44px rgba(0,0,0,.20)}
+.modal .grid{grid-template-columns:1fr 1fr}
+.modal h2{margin-bottom:12px}
 </style>
 </head>
 <body>
 
 <div id="app"></div>
+<div id="modalRoot"></div>
 
 <script>
 const POOLS = ["text","image_1k","image_2k","image_3k","image_4k","video"];
 const MODALITIES = ["text","image","video"];
+const TYPES = ["free","enterprise","tokenplan","amd","openrouter"];
+// 各 access_type 的默认 Base URL（与后端 DefaultBaseURLByType 对应）。
+const DEFAULT_BASE_BY_TYPE = {
+  free: "https://apihub.agnes-ai.com/v1",
+  enterprise: "https://apihub.agnes-ai.com/v1",
+  tokenplan: "https://apihub.agnes-ai.com/v1",
+  amd: "https://developer.amd.com.cn/radeon/api/v1",
+  openrouter: "https://openrouter.ai/api/v1"
+};
 const state = { tab:"overview", session:null, stats:null, accounts:null, keys:[], logs:[], settings:null, jobs:[], bindings:[] };
 
 /* ---------------- 基础 ---------------- */
@@ -330,13 +347,22 @@ function viewAccounts(){
       <div class="grid">
         <div><label>名称</label><input id="aName" placeholder="白嫖-1"></div>
         <div><label>API Key</label><input id="aKey" placeholder="sk-..."></div>
-        <div><label>Base URL</label><input id="aBase" placeholder="https://api.api.example.cn/v1"></div>
+        <div><label>Base URL（留空按类型自动套用）</label><input id="aBase" placeholder="https://api.api.example.cn/v1"></div>
         <div class="row">
           <div style="flex:1"><label>账号类型</label>
-            <select id="aType">${["free","enterprise","tokenplan","amd"].map(t=>`<option>${t}</option>`).join("")}</select></div>
+            <select id="aType">${TYPES.map(t=>`<option>${t}</option>`).join("")}</select></div>
           <div style="flex:1"><label>分组（可选）</label><input id="aGroup" placeholder="cn-free"></div>
           <div style="flex:1"><label>单账号并发</label><input id="aConc" type="number" value="8" min="1"></div>
+          <div style="flex:1"><label>兜底模型（可选）</label><input id="aDefaultModel" placeholder="留空=auto"></div>
+          <div style="flex:1"><label>优先级（数字越大越优先，默认 0）</label><input id="aPriority" type="number" value="0" min="0"></div>
         </div>
+        <details style="margin-top:8px">
+          <summary>各池 RPM 覆盖（留空 = 按类型档位表）</summary>
+          <div class="row" style="margin-top:8px">
+            ${POOLS.map(p=>`<div style="flex:1"><label>${p}</label><input id="aRPM_${p}" type="number" min="0" placeholder="按档位"></div>`).join("")}
+          </div>
+          <div class="hint">AMD / OpenRouter 等自定义渠道的官方速率未知，默认套用保守值；实测可承受更高就在这里上调，网关会按你设的值排队。</div>
+        </details>
         ${manifestEditor("aMf", (data.default_manifest)||{})}
         <div class="hint">留空的模态会被视为「该账号不支持」，调度时自动跳过 —— 这正是「多账号按模态分工」的开关。</div>
         <div><button class="primary" id="btnAddAcc">添加账号</button></div>
@@ -375,15 +401,22 @@ function viewAccounts(){
 function bindAccountEvents(){
   const view = document.getElementById("view");
   const add = document.getElementById("btnAddAcc");
+  const typeSel = document.getElementById("aType");
+  if(typeSel) typeSel.onchange = ()=>{
+    const baseEl = document.getElementById("aBase");
+    if(baseEl && baseEl.value.trim()==="") baseEl.placeholder = "留空将自动套用：" + (DEFAULT_BASE_BY_TYPE[typeSel.value]||"");
+  };
   if(add) add.onclick = async ()=>{
     const manifest = {}; MODALITIES.forEach(m=>manifest[m] = document.getElementById("aMf_"+m).value.split(",").map(s=>s.trim()).filter(Boolean));
+    const rpm = {}; POOLS.forEach(p=>{ const v=document.getElementById("aRPM_"+p).value.trim(); if(v!=="") rpm[p]=Number(v); });
     try{
       await api("/api/accounts",{method:"POST",body:JSON.stringify({
         name:document.getElementById("aName").value, api_key:document.getElementById("aKey").value,
         base_url:document.getElementById("aBase").value, access_type:document.getElementById("aType").value,
         group:document.getElementById("aGroup").value, max_concurrency:Number(document.getElementById("aConc").value)||8,
+        priority:Number(document.getElementById("aPriority").value)||0,
         default_model:document.getElementById("aDefaultModel").value,
-        model_manifest:manifest
+        model_manifest:manifest, rpm_overrides:rpm
       })});
       toast("账号已添加","good"); await refresh();
     }catch(e){ toast(e.message,"bad"); }
@@ -410,6 +443,73 @@ function bindAccountEvents(){
   };
   view.querySelectorAll("button[data-act]").forEach(b=>b.onclick=()=>accountAction(b.dataset.act,b.dataset.id,b.dataset.on));
 }
+/* ---------------- 弹窗基础 ---------------- */
+function openModal(html){
+  let r = document.getElementById("modalRoot");
+  if(!r){ r = document.createElement("div"); r.id="modalRoot"; document.body.appendChild(r); }
+  r.innerHTML = html;
+}
+function closeModal(){ const r = document.getElementById("modalRoot"); if(r) r.innerHTML = ""; }
+
+/* ---------------- 编辑账号弹窗（可编辑所有添加时可设的字段） ---------------- */
+function editAccountModal(acc){
+  const id = acc.id;
+  const rpm = acc.rpm_overrides || {};
+  const mf = acc.model_manifest || {};
+  const html = `
+  <div class="modal-back" onclick="if(event.target===this)closeModal()">
+    <div class="modal">
+      <div class="spread"><h2>编辑账号 · ${esc(acc.name)}</h2>
+        <button class="sm" onclick="closeModal()">✕</button></div>
+      <div class="grid">
+        <div><label>名称</label><input id="eName" value="${esc(acc.name)}"></div>
+        <div><label>API Key（留空 = 保留原 Key）</label><input id="eKey" placeholder="留空保留原 Key"></div>
+        <div><label>Base URL（留空按类型自动套用）</label><input id="eBase" value="${esc(acc.base_url)}"></div>
+        <div class="row">
+          <div style="flex:1"><label>账号类型</label>
+            <select id="eType">${TYPES.map(t=>`<option value="${t}" ${t===acc.access_type?"selected":""}>${t}</option>`).join("")}</select></div>
+          <div style="flex:1"><label>分组</label><input id="eGroup" value="${esc(acc.group||"")}"></div>
+          <div style="flex:1"><label>单账号并发</label><input id="eConc" type="number" value="${acc.max_concurrency||8}" min="1"></div>
+          <div style="flex:1"><label>优先级（越大越优先）</label><input id="ePriority" type="number" value="${acc.priority||0}" min="0"></div>
+        </div>
+        <div><label>兜底模型（可选）</label><input id="eDefaultModel" value="${esc(acc.default_model||"")}" placeholder="留空=auto"></div>
+        ${manifestEditor("eMf", mf)}
+        <details open><summary>各池 RPM 覆盖（留空 = 按类型档位表）</summary>
+          <div class="row" style="margin-top:8px">
+            ${POOLS.map(p=>`<div style="flex:1"><label>${p}</label><input id="eRPM_${p}" type="number" min="0" value="${rpm[p]||""}" placeholder="按档位"></div>`).join("")}
+          </div>
+          <div class="hint">AMD / OpenRouter 等自定义渠道的官方速率未知，默认套用保守值；实测可承受更高就在这里上调。</div>
+        </details>
+        <div class="row" style="margin-top:12px">
+          <button class="primary" id="btnSaveAcc">保存</button>
+          <button onclick="closeModal()">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  openModal(html);
+  const eType = document.getElementById("eType");
+  eType.onchange = ()=>{
+    const baseEl = document.getElementById("eBase");
+    if(baseEl && baseEl.value.trim()==="") baseEl.placeholder = "留空将自动套用：" + (DEFAULT_BASE_BY_TYPE[eType.value]||"");
+  };
+  document.getElementById("btnSaveAcc").onclick = async ()=>{
+    try{
+      const manifest = {}; MODALITIES.forEach(m=>manifest[m]=document.getElementById("eMf_"+m).value.split(",").map(s=>s.trim()).filter(Boolean));
+      const rpmOv = {}; POOLS.forEach(p=>{ const v=document.getElementById("eRPM_"+p).value.trim(); if(v!=="") rpmOv[p]=Number(v); });
+      const body = {
+        name:document.getElementById("eName").value, base_url:document.getElementById("eBase").value,
+        access_type:document.getElementById("eType").value, group:document.getElementById("eGroup").value,
+        max_concurrency:Number(document.getElementById("eConc").value)||8,
+        priority:Number(document.getElementById("ePriority").value)||0,
+        default_model:document.getElementById("eDefaultModel").value, model_manifest:manifest, rpm_overrides:rpmOv
+      };
+      const k = document.getElementById("eKey").value.trim(); if(k!=="") body.api_key = k;
+      await api("/api/accounts/"+id,{method:"PATCH",body:JSON.stringify(body)});
+      toast("已保存","good"); closeModal(); await refresh();
+    }catch(e){ toast(e.message,"bad"); }
+  };
+}
 async function accountAction(act,id,on){
   try{
     if(act==="test"){
@@ -431,18 +531,7 @@ async function accountAction(act,id,on){
     if(act==="del"){ if(!confirm("确认删除该账号？")) return; await api("/api/accounts/"+id,{method:"DELETE"}); }
     if(act==="edit"){
       const acc = (state.accounts.accounts||[]).find(x=>x.id===id); if(!acc) return;
-      const name = prompt("名称", acc.name); if(name===null) return;
-      const group = prompt("分组", acc.group||""); if(group===null) return;
-      const conc = prompt("单账号并发", acc.max_concurrency); if(conc===null) return;
-      const mf = {};
-      for(const m of MODALITIES){
-        const cur = (acc.model_manifest?.[m]||[]).join(", ");
-        const v = prompt(`${m} 模型（逗号分隔，留空 = 不支持）`, cur);
-        if(v===null) return;
-        mf[m] = v.split(",").map(s=>s.trim()).filter(Boolean);
-      }
-      await api("/api/accounts/"+id,{method:"PATCH",body:JSON.stringify({
-        name, group, max_concurrency:Number(conc)||8, model_manifest:mf})});
+      editAccountModal(acc);
     }
     await refresh();
   }catch(e){ toast(e.message,"bad"); }

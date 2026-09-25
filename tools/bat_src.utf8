@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 title baipiao-hub
 
-set "BIN=baipiao-hub.exe"
+set "BIN=agnes-hub-go.exe"
 set "HOST=127.0.0.1"
 set "PORT=4142"
 set "DATADIR=%~dp0data"

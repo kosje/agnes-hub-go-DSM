@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>白嫖 Hub v1.0.11 发布说明</title>
+<style>
+  :root {
+    --bg: #f5f7fb; --card: #ffffff; --ink: #1f2733; --muted: #5b6776;
+    --line: #e6ebf2; --brand: #2f6df6; --brand-soft: #eaf1ff;
+    --good: #1f9d57; --good-soft: #e9f8ef; --warn: #c8741a; --warn-soft: #fdf2e3;
+    --bad: #d6453d; --bad-soft: #fdeceb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.65; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 36px 24px 64px; }
+  header.hero { background: linear-gradient(135deg, #2f6df6 0%, #5a8bff 100%);
+    color: #fff; border-radius: 16px; padding: 28px 32px; margin-bottom: 24px;
+    box-shadow: 0 10px 30px rgba(47,109,246,.25); }
+  header.hero h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: .5px; }
+  header.hero .sub { opacity: .92; font-size: 14px; }
+  .pill { display: inline-block; padding: 3px 11px; border-radius: 999px; font-size: 12px;
+    font-weight: 600; margin: 4px 6px 0 0; }
+  .pill.brand { background: rgba(255,255,255,.18); color: #fff; }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.bad  { background: var(--bad-soft);  color: var(--bad); }
+  h2 { font-size: 19px; margin: 30px 0 14px; padding-left: 12px; border-left: 4px solid var(--brand); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .kpi { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .kpi .num { font-size: 22px; font-weight: 700; color: var(--brand); }
+  .kpi .lbl { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin: 14px 0; }
+  .card ul { margin: 8px 0 0; padding-left: 20px; }
+  .card li { margin: 6px 0; }
+  .box { border-radius: 10px; padding: 14px 16px; margin: 14px 0; font-size: 14.5px; }
+  .box.good { background: var(--good-soft); border: 1px solid #bfe9cf; }
+  .box.warn { background: var(--warn-soft); border: 1px solid #f0d6a8; }
+  .box.bad  { background: var(--bad-soft);  border: 1px solid #f3c3bf; }
+  .box b { display: block; margin-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card);
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 14px; }
+  th, td { text-align: left; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  th { background: #f0f4fb; font-weight: 600; color: var(--muted); }
+  tr:last-child td { border-bottom: none; }
+  code { background: #eef2f9; padding: 2px 6px; border-radius: 5px; font-size: 13px;
+    font-family: "SFMono-Regular", Consolas, monospace; color: #2b3a55; }
+  .foot { margin-top: 34px; color: var(--muted); font-size: 13px; text-align: center; }
+  a { color: var(--brand); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>白嫖 Hub · Agnes Hub</h1>
+    <div class="sub">v1.0.11 发布说明 · 多上游网关 + 控制台大改 · 2026-09-21</div>
+    <div style="margin-top:12px">
+      <span class="pill brand">飞牛应用中心 已上线 1.0.11</span>
+      <span class="pill brand">GitHub Release v1.0.11</span>
+      <span class="pill good">8 账号运行正常</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="kpi"><div class="num">3</div><div class="lbl">支持的上游类型：agnes / AMD / OpenRouter</div></div>
+    <div class="kpi"><div class="num">8</div><div class="lbl">在线账号（healthz 实测）</div></div>
+    <div class="kpi"><div class="num">2</div><div class="lbl">关键回归修复（空体 + 粘性别名）</div></div>
+    <div class="kpi"><div class="num">5</div><div class="lbl">GitHub Release 产物</div></div>
+  </div>
+
+  <h2>一、本次新增能力</h2>
+  <div class="card">
+    <ul>
+      <li><b>多上游支持</b>：账号类型新增 <code>amd</code>（<code>developer.amd.com.cn/radeon</code>）与 <code>openrouter</code>，不再局限于 agnes 通道。实测 AMD <code>MiniCPM5-2B</code> / <code>Qwen3.8-27B</code> 经网关返回真实完成体。</li>
+      <li><b>完整编辑弹窗</b>：控制台点击「编辑账号」弹出完整表单，可修改添加时的所有字段（名称、API Key、base_url、text/image 模型清单、优先级、RPM 上限）。</li>
+      <li><b>按账号 RPM</b>：每个账号可单独设置 RPM 上限，不再统一套用 agnes 的 20rpm；未设置时回退默认值。</li>
+      <li><b>账号调用优先级</b>：调度器按 <code>priority → 区域匹配 → 等待时长 → 在飞请求数</code> 选号，高优先级优先承接请求。</li>
+      <li><b>chat UI 支持非 agnes 模型</b>：<code>/chat</code> 网页界面可下拉已添加的全部模型（含 AMD / OpenRouter），一键验证连通性。</li>
+    </ul>
+  </div>
+
+  <h2>二、两个关键修复（务必了解）</h2>
+
+  <div class="box bad">
+    <b>① AMD 经网关返回 <code>{}</code></b>
+    根因在 relay 层：<code>attemptOnce</code> 的 <code>defer cancel()</code> 与 <code>defer resp.Body.Close()</code> 在调用方读取上游响应体<b>之前</b>就触发，连接被提前关闭 / context 被取消，读到空体。
+    已改为：调用方<b>读毕 body 后</b>才 <code>cancel()</code> 并关闭（成功路径用 <code>releaseOnClose</code>）。
+    该 bug 影响<b>所有上游</b>（含 agnes，偶发空体），AMD 因响应体大被显式发现。
+  </div>
+
+  <div class="box warn">
+    <b>② 软粘性会话绑定错发模型</b>
+    chat 请求因无下游 key / 无 <code>x-session-id</code>，<code>SessionKey</code> 恒为 <code>"key:"</code>，<b>所有 chat 请求共享同一绑定</b>。原 <code>Pick</code> 只按粘性选号、不校验本次 <code>requiredModel</code>：先用 AMD 模型把绑定钉到 <code>amd1</code> 后，再请求 <code>agnes-2.5-flash</code> / <code>auto</code> 仍错发 <code>amd1</code>（404/400）。
+    已在绑定判定加守卫：绑定账号不能服务本次具体模型时放弃旧绑定，按 <code>requiredModel</code> 重选。
+  </div>
+
+  <div class="box good">
+    <b>③ E2E 验证通过</b>
+    共享会话最坏情况：<code>MiniCPM5-2B → amd1</code> 绑定后，<code>agnes-2.5-flash</code> 仍正确命中 agnes 账号；家族内粘性正常，<code>MiniCPM5-2B</code> 再次正确回到 <code>amd1</code>。
+  </div>
+
+  <h2>三、部署状态</h2>
+  <div class="card">
+    <ul>
+      <li><b>飞牛 fnOS 应用中心</b>：已安装并运行 <code>白嫖 Hub 1.0.11</code>（应用 ID <code>agnes-hub</code>），状态 <code>running</code>。</li>
+      <li><b>健康检查</b>：<code>GET /healthz</code> → <code>{"accounts":8,"ok":true,"version":"1.0.11"}</code>（实测 uptime &gt; 1300s）。</li>
+      <li><b>运行二进制版本号 grep</b>：<code>baipiao-hub</code> / <code>baipiao-hub-arm64</code> 均为 <code>1.0.11</code>。</li>
+    </ul>
+  </div>
+
+  <h2>四、下载 / 资源（GitHub Release v1.0.11）</h2>
+  <table>
+    <thead><tr><th>资源</th><th>说明</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><code>baipiao-hub-1.0.11.fpk</code></td><td>飞牛 fnOS 安装包（应用名「白嫖 Hub」）</td><td>fnOS 应用中心</td></tr>
+      <tr><td><code>baipiao-hub-linux-amd64</code></td><td>Linux x86_64 二进制</td><td>自托管 / Docker</td></tr>
+      <tr><td><code>baipiao-hub-linux-arm64</code></td><td>Linux aarch64 二进制</td><td>树莓派 / ARM 服务器</td></tr>
+      <tr><td><code>agnes-hub-go-windows-1.0.11.zip</code></td><td>Windows 绿色版（exe + 启动脚本 + 说明）</td><td>Windows 直跑</td></tr>
+      <tr><td><code>agnes-hub-go.exe</code></td><td>Windows 裸可执行文件</td><td>Windows 直跑</td></tr>
+    </tbody>
+  </table>
+
+  <h2>五、配置要点</h2>
+  <div class="card">
+    <ul>
+      <li><b>AMD 账号</b>：类型 <code>amd</code>，<code>base_url=https://developer.amd.com.cn/radeon/api/v1</code>，模型如 <code>MiniCPM5-2B</code>、<code>Qwen3.8-27B</code>。网关会自动剥离尾部 <code>/v1</code> 拼接为 <code>.../api/v1/chat/completions</code>。</li>
+      <li><b>OpenRouter 账号</b>：类型 <code>openrouter</code>，按 OpenRouter 模型名填写。</li>
+      <li><b>每账号独立</b>：可设 <code>rpm_override</code>（RPM 上限）与 <code>priority</code>（调度优先级）。</li>
+      <li>多账号买到的是<b>吞吐</b>不是延迟：并发批量任务才能线性提速，单请求串行任务加速比约为 1.00x。</li>
+    </ul>
+  </div>
+
+  <h2>六、已知限制 / 注意事项</h2>
+  <div class="card">
+    <ul>
+      <li><code>MinerU2.5-Pro</code> 等 OCR 模型需走 <code>/v1/ocr</code>，经 <code>/chat/completions</code> 会返回 400（模型自身限制，非网关 bug）。</li>
+      <li>飞牛应用中心「列表版本」为缓存展示值；<b>功能版本以 <code>/healthz</code> 为准</b>。</li>
+      <li>添加账号时若提示 <code>Cannot read properties of null (reading 'value')</code>，请确认所用控制台版本 ≥ 1.0.11（旧版表单字段绑定缺陷已修复）。</li>
+    </ul>
+  </div>
+
+  <div class="foot">
+    白嫖 Hub · Agnes Hub &nbsp;|&nbsp; v1.0.11 &nbsp;|&nbsp; 仓库
+    <a href="https://github.com/my788525/agnes-hub-go" target="_blank" rel="noopener">my788525/agnes-hub-go</a>
+  </div>
+
+</div>
+</body>
+</html>
