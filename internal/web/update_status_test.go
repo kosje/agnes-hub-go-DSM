@@ -15,7 +15,7 @@ import (
 // 看到的是上游仓库，那里根本没有 SPK。这里把两条分支都钉住。
 func TestUpdateStatusRepo(t *testing.T) {
 	// 分支一：套件版 —— 自更新未启用，repo 必须回落到 main 注入的套件仓库
-	s := &Server{Version: "1.0.11", ReleaseRepo: "kosje/agnes-hub-go-DSM"}
+	s := &Server{Version: "1.0.13", ReleaseRepo: "kosje/agnes-hub-go-DSM"}
 	got := s.updateStatus()
 	if got["enabled"] != false {
 		t.Errorf("Updater 为 nil 时 enabled 应为 false，实际 %v", got["enabled"])
@@ -23,15 +23,15 @@ func TestUpdateStatusRepo(t *testing.T) {
 	if got["repo"] != "kosje/agnes-hub-go-DSM" {
 		t.Errorf("套件版的 repo 应为 kosje/agnes-hub-go-DSM，实际 %v", got["repo"])
 	}
-	if got["current_version"] != "1.0.11" {
-		t.Errorf("current_version 应为 1.0.11，实际 %v", got["current_version"])
+	if got["current_version"] != "1.0.13" {
+		t.Errorf("current_version 应为 1.0.13，实际 %v", got["current_version"])
 	}
 
 	// 分支二：自更新启用 —— repo 必须跟随自更新仓库，否则链接与「立即更新」
 	// 实际会拉取的来源对不上
 	upd := updater.New(updater.Config{Repo: "my788525/agnes-hub-go"},
-		"1.0.11", "/tmp/agnes-hub-go", nil)
-	s2 := &Server{Version: "1.0.11", ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd}
+		"1.0.13", "/tmp/agnes-hub-go", nil)
+	s2 := &Server{Version: "1.0.13", ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd}
 	got2 := s2.updateStatus()
 	if got2["enabled"] != true {
 		t.Errorf("Updater 非 nil 时 enabled 应为 true，实际 %v", got2["enabled"])
@@ -41,8 +41,8 @@ func TestUpdateStatusRepo(t *testing.T) {
 	}
 
 	// 分支三：自更新仓库为空串（未配置）时回落到套件仓库，不能给出空链接
-	upd3 := updater.New(updater.Config{}, "1.0.11", "/tmp/agnes-hub-go", nil)
-	s3 := &Server{Version: "1.0.11", ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd3}
+	upd3 := updater.New(updater.Config{}, "1.0.13", "/tmp/agnes-hub-go", nil)
+	s3 := &Server{Version: "1.0.13", ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd3}
 	if got3 := s3.updateStatus(); got3["repo"] != "kosje/agnes-hub-go-DSM" {
 		t.Errorf("自更新仓库为空时应回落到套件仓库，实际 %v", got3["repo"])
 	}
@@ -60,10 +60,10 @@ func TestUpdateStatusRepo(t *testing.T) {
 // 曾经把这两件事合在一个 enabled 里，导致套件版查不到版本号。
 func TestUpdateStatusSuiteManagedSeparatesCheckFromApply(t *testing.T) {
 	upd := updater.New(updater.Config{Repo: "kosje/agnes-hub-go-DSM"},
-		"1.0.12", "/tmp/agnes-hub-go", nil)
+		"1.0.13", "/tmp/agnes-hub-go", nil)
 
 	// 套件版：能查、不能装
-	suite := &Server{Version: "1.0.12", ReleaseRepo: "kosje/agnes-hub-go-DSM",
+	suite := &Server{Version: "1.0.13", ReleaseRepo: "kosje/agnes-hub-go-DSM",
 		Updater: upd, SuiteManaged: true}
 	got := suite.updateStatus()
 	if got["suite_managed"] != true {
@@ -77,14 +77,14 @@ func TestUpdateStatusSuiteManagedSeparatesCheckFromApply(t *testing.T) {
 	}
 
 	// 自更新版：能查、能装
-	self := &Server{Version: "1.0.12", ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd}
+	self := &Server{Version: "1.0.13", ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd}
 	got2 := self.updateStatus()
 	if got2["suite_managed"] != false || got2["enabled"] != true || got2["checkable"] != true {
 		t.Errorf("自更新版应 suite_managed=false / enabled=true / checkable=true，实际 %v", got2)
 	}
 
 	// 未配置更新仓库：两个能力都必须为 false，前端才不会一直转圈去联网
-	none := &Server{Version: "1.0.12", ReleaseRepo: "kosje/agnes-hub-go-DSM"}
+	none := &Server{Version: "1.0.13", ReleaseRepo: "kosje/agnes-hub-go-DSM"}
 	got3 := none.updateStatus()
 	if got3["enabled"] != false || got3["checkable"] != false {
 		t.Errorf("未配置更新仓库时 enabled / checkable 都应为 false，实际 %v", got3)
@@ -97,15 +97,19 @@ func TestUpdateStatusSuiteManagedSeparatesCheckFromApply(t *testing.T) {
 // 与「已安装版本」对不上，下次套件中心校验或升级必然冲突。
 func TestApplyUpdateRefusedWhenSuiteManaged(t *testing.T) {
 	upd := updater.New(updater.Config{Repo: "kosje/agnes-hub-go-DSM"},
-		"1.0.12", "/tmp/agnes-hub-go", nil)
-	s := &Server{Version: "1.0.12", ReleaseRepo: "kosje/agnes-hub-go-DSM",
-		Updater: upd, SuiteManaged: true}
+		"1.0.13", "/tmp/agnes-hub-go", nil)
+	store := newTempStore(t)
+	s := &Server{Store: store, Version: "1.0.13",
+		ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd, SuiteManaged: true}
 
+	// 这个接口要求管理员会话，得带上有效 cookie，否则先被鉴权拦成 401
+	req := httptest.NewRequest(http.MethodPost, "/api/update/apply", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: store.SessionToken()})
 	rec := httptest.NewRecorder()
-	s.apiUpdateApply(rec, httptest.NewRequest(http.MethodPost, "/api/update/apply", nil))
+	s.apiUpdateApply(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("应返回 200 + success=false，实际 %d", rec.Code)
+		t.Fatalf("应返回 200 + success=false，实际 %d：%s", rec.Code, rec.Body.String())
 	}
 	var out map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {

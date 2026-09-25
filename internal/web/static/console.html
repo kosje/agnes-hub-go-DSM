@@ -60,6 +60,14 @@
   .banner.good{background:var(--good-soft);color:var(--good)}
   .banner.info{background:var(--brand-soft);color:var(--brand)}
   .banner.bad{background:var(--bad-soft);color:var(--bad)}
+  /* 「查看全部版本」——GitHub 徽标链接。
+     图标用内联 SVG：控制台是 go:embed 进二进制的，NAS 上多半连不上外网 CDN，
+     不能依赖外部图标资源。绿色 + 下划线是 GitHub 自己的链接观感。 */
+  .gh-link{display:inline-flex;align-items:center;gap:6px;color:var(--good);
+    font-weight:600;font-size:13px;text-decoration:none;
+    border-bottom:1px solid currentColor;padding-bottom:1px;line-height:1.25}
+  .gh-link:hover{color:#0d6b4c}
+  .gh-link svg{width:15px;height:15px;fill:currentColor;flex:none}
   .bar{height:7px;border-radius:999px;background:#eef1f5;overflow:hidden;min-width:70px}
   .bar>i{display:block;height:100%;background:var(--brand)}
   .login{max-width:380px;margin:8vh auto}
@@ -392,7 +400,11 @@ function viewAccounts(){
   </div>
   <div class="card">
     <div class="spread"><h2>账号列表（${(data.accounts||[]).length}）</h2>
-      <div class="muted">标称 RPM 来自官方档位表；「校准后」是吃 429 反馈自适应后的实际节拍</div></div>
+      <div class="row">
+        <button class="sm" id="btnUpModels">向上游拉取可用模型</button>
+        <span class="muted">标称 RPM 来自官方档位表；「校准后」是吃 429 反馈自适应后的实际节拍</span>
+      </div></div>
+    <div id="upModelsBox" style="margin-top:10px"></div>
     <div class="scroll"><table>
       <thead><tr><th>账号 / 模型清单</th><th>状态</th><th>各池有效 RPM</th><th>操作</th></tr></thead>
       <tbody>${rows||'<tr><td colspan="4" class="muted">暂无账号</td></tr>'}</tbody>
@@ -442,7 +454,61 @@ function bindAccountEvents(){
       toast(`已更新 ${r.updated} / ${r.matched} 个账号`,"good"); await refresh();
     }catch(e){ toast(e.message,"bad"); }
   };
+  bindUpstreamModels();
   view.querySelectorAll("button[data-act]").forEach(b=>b.onclick=()=>accountAction(b.dataset.act,b.dataset.id,b.dataset.on));
+}
+
+/* ---------------- 上游可用模型探测 ----------------
+   控制台里的模型清单是手填的，上游改了可售清单本地不会知道，
+   表现就是「模型明明填了却一直报错」。这个按钮拿账号自己的 Key 去问上游
+   /v1/models，把「上游实际给的」与「本地清单填的」对一遍。 */
+function bindUpstreamModels(){
+  const btn = document.getElementById("btnUpModels");
+  const box = document.getElementById("upModelsBox");
+  if(!btn || !box) return;
+  btn.onclick = async ()=>{
+    btn.disabled = true; btn.textContent = "查询中…";
+    box.innerHTML = '<div class="muted">正在向各账号的上游查询模型列表…</div>';
+    try{
+      const r = await api("/api/models/upstream",{method:"POST",body:JSON.stringify({})});
+      box.innerHTML = renderUpstreamModels(r);
+    }catch(e){
+      box.innerHTML = `<div class="banner bad">${esc(e.message)}</div>`;
+    }finally{
+      btn.disabled = false; btn.textContent = "向上游拉取可用模型";
+    }
+  };
+}
+function renderUpstreamModels(r){
+  const results = r.results || [];
+  if(results.length === 0) return '<div class="banner info">没有启用中的账号可探测。</div>';
+  const mods = r.by_modality || {};
+  const summary = MODALITIES.map(m=>{
+    const list = mods[m] || [];
+    return `<div class="kpi"><div class="k">上游可用的 ${m} 模型（${list.length}）</div>
+      <div class="v" style="font-size:12px;font-family:var(--mono);word-break:break-all">${esc(list.join(", ")||"—")}</div></div>`;
+  }).join("");
+  const rows = results.map(x=>{
+    const miss = x.missing || {};
+    const missKeys = Object.keys(miss);
+    const missHTML = missKeys.length
+      ? missKeys.map(m=>`<div class="banner bad" style="margin:6px 0 0">
+          本地清单里的 <b>${esc(m)}</b> 模型上游没给：<span class="mono">${esc(miss[m].join(", "))}</span>
+        </div>`).join("")
+      : (x.ok ? '<div class="banner good" style="margin:6px 0 0">本地清单里的模型上游都有。</div>' : "");
+    const head = x.ok
+      ? `<span class="pill ok">${x.count} 个模型</span>`
+      : `<span class="pill off">HTTP ${x.status||"—"}</span>`;
+    return `<div class="card" style="margin:10px 0 0">
+      <div class="spread"><b>${esc(x.account_name)}</b><span>${head}</span></div>
+      <div class="muted mono" style="font-size:11px">${esc(x.base_url)}</div>
+      ${x.ok ? `<div class="mono muted" style="font-size:11px;margin-top:6px;word-break:break-all">${esc((x.models||[]).join(", "))}</div>` : ""}
+      ${x.error ? `<div class="banner bad" style="margin:6px 0 0">${esc(x.error)}</div>` : ""}
+      ${missHTML}
+    </div>`;
+  }).join("");
+  return `<div class="grid g4">${summary}</div>${rows}
+    <div class="hint" style="margin-top:8px">${esc(r.probe_note||"")}（${esc(r.probed_at||"")}）</div>`;
 }
 /* ---------------- 弹窗基础 ---------------- */
 function openModal(html){
@@ -880,8 +946,11 @@ function viewAbout(){
         <button class="sm" id="btnChk">检查更新</button>
         <button class="sm primary" id="btnApply">立即更新</button>
       </span>
-      <a class="mono" style="font-size:12px" target="_blank" rel="noopener noreferrer"
-         id="lnkReleases" href="https://github.com/kosje/agnes-hub-go-DSM/releases">https://github.com/kosje/agnes-hub-go-DSM/releases</a>
+      <a class="gh-link" id="lnkReleases" target="_blank" rel="noopener noreferrer"
+         title="在 GitHub 查看项目仓库"
+         href="https://github.com/kosje/agnes-hub-go-DSM/releases">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>GitHub
+      </a>
     </div>
   </div>
   <div class="card">
@@ -922,10 +991,10 @@ function bindAboutEvents(){
                       : '<span class="pill ok">已是最新</span>'}</div></div>
       <div class="kpi"><div class="k">发布时间</div><div class="v" style="font-size:15px">${esc(last.release_date || "—")}</div></div>`;
 
-    // 仓库地址跟着后端返回的 repo 走，保证与「最新版本」的实际来源一致
+    // 仓库地址跟着后端返回的 repo 走，保证与「最新版本」的实际来源一致。
+    // 只改 href —— 链接文字是固定的「GitHub」徽标，改 textContent 会把图标一起抹掉。
     const lnk = document.getElementById("lnkReleases");
-    const repoURL = "https://github.com/" + (s.repo || "kosje/agnes-hub-go-DSM") + "/releases";
-    if(lnk){ lnk.href = repoURL; lnk.textContent = repoURL; }
+    if(lnk) lnk.href = "https://github.com/" + (s.repo || "kosje/agnes-hub-go-DSM") + "/releases";
 
     // 「检查更新 / 立即更新」只在进程内自更新可用时才露出来。
     // 套件版由套件中心升级，按钮留着只会误导。

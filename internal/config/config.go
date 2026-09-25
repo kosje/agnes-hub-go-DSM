@@ -1395,10 +1395,15 @@ func (s *Store) SetChatPassword(password string) error {
 }
 
 // SessionToken 派生会话令牌（改密即全端失效）。
+//
+// 末尾的固定串是「域分隔符」：把会话令牌的用途和其它可能的哈希用途隔开，
+// 避免同一个 salt+hash 组合在别处被复用推导出同一串。它只是个常量，
+// 不参与口令哈希本身 —— 改它只会让已下发的会话 cookie 失效（需重新登录），
+// 不会让任何人改密码。
 func (s *Store) SessionToken() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	sum := sha256.Sum256([]byte(s.Settings.AdminPasswordSalt + ":" + s.Settings.AdminPasswordHash + ":baiPiao-hub"))
+	sum := sha256.Sum256([]byte(s.Settings.AdminPasswordSalt + ":" + s.Settings.AdminPasswordHash + ":agnes-hub"))
 	return hex.EncodeToString(sum[:])
 }
 

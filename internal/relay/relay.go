@@ -95,7 +95,7 @@ func ClientHeaders(a *config.Account, extra map[string]string, anthropic bool) h
 	h.Set("Authorization", "Bearer "+a.APIKey)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
-	h.Set("User-Agent", "baiPiao-hub/1.0")
+	h.Set("User-Agent", "agnes-hub/1.0")
 	if anthropic {
 		// 官方文档：/v1/messages 走 Anthropic 兼容通道、以 x-api-key 鉴权。
 		// 同时带上两种鉴权头以兼容。

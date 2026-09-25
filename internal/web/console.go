@@ -54,8 +54,8 @@ var logoURL = "/logo.png?v=" + logoFingerprint
 // logoURL。放在服务端替换而不是写死在 JS 里，是为了换图标时不必记得手改版本号。
 var chatMainJSServed = []byte(strings.ReplaceAll(string(chatMainJS), "/logo.png", logoURL))
 
-const cookieName = "baipiao_hub_session"
-const chatPasswordCookie = "baipiao_chat_password"
+const cookieName = "agnes_hub_session"
+const chatPasswordCookie = "agnes_chat_password"
 
 func (s *Server) consoleRoutes() {
 	m := s.mux
@@ -122,6 +122,8 @@ func (s *Server) consoleRoutes() {
 
 	m.HandleFunc("POST /api/intent/preview", s.apiIntentPreview)
 	m.HandleFunc("POST /api/probe", s.apiProbe)
+	// 向上游问「你到底给了哪些模型」——用来区分「上游停了模型」与「本地清单填错」。
+	m.HandleFunc("POST /api/models/upstream", s.apiUpstreamModels)
 	m.HandleFunc("GET /api/rpm-table", s.apiRPMTable)
 
 	m.HandleFunc("GET /api/update/status", s.apiUpdateStatus)
@@ -143,7 +145,11 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("POST /api/chat/v1/chat/completions", s.handleChatProxy)
 	m.HandleFunc("POST /api/chat/v1/images/generations", s.handleChatMediaProxy)
 	m.HandleFunc("POST /api/chat/v1/videos", s.handleChatMediaProxy)
-	m.HandleFunc("GET /api/chat/v1/videos/{job_id}", s.handleChatMediaProxy)
+	// 视频状态查询：查本地任务 + 上游 /agnesapi，**不是**又一次提交。
+	m.HandleFunc("GET /api/chat/v1/videos/{job_id}", s.handleChatVideoStatus)
+	// 生图结果落盘后的回放端点：正文里的 Markdown 图片指向这里，
+	// 而不是上游地址（浏览器多半加载不出来）。
+	m.HandleFunc("GET "+imageRoutePrefix+"{name}", s.handleChatImage)
 }
 
 // ---------------------------------------------------------------------------
@@ -1868,7 +1874,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 		if result.Status >= 400 {
-			writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+			writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
 			return
 		}
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
@@ -1972,7 +1978,7 @@ func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, e
 	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 	if result.Status >= 400 {
-		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
 		return
 	}
 	// stream=true 时，上游返回的 raw 本身就是 SSE 帧序列；直接原样写回并声明 event-stream。
@@ -2150,30 +2156,138 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 	if result.Status >= 400 {
-		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
 		return
+	}
+
+	// 视频是异步的：先落一条本地任务记录，再把 job_id / poll_url 回给调用方。
+	//
+	// 这一步以前只在裸 /v1（serveAutoVideo）里做，而网页走的是这里 —— 于是
+	// 网页提交的视频既不出现在「视频任务」里，前端也拿不到 job_id（上游只回
+	// video_id），后面的轮询根本无从发起。
+	var job *config.VideoJob
+	if decision.Modality == intent.Video {
+		job = s.recordVideoJob(result, raw)
 	}
 
 	// 对话入口：调用方只认 chat 响应结构，必须回译。
 	// 不回译的话，前端按 choices[0].message.content 取值会拿到空串，
 	// 明明图已经生成好了，界面却显示「（无内容返回）」。
 	if chatShape {
-		s.serveChatShapedMedia(w, r, decision, result, raw, headers, wantsStream)
+		s.serveChatShapedMedia(w, r, decision, result, raw, headers, wantsStream, job)
 		return
 	}
 
-	// 官方形态。程序化客户端要真实的上游地址，不能塞 base64；
-	// 只有自家网页（inlineImages=true）才把 data[].url 换成服务端回取的 data URI，
+	// 官方形态。程序化客户端要真实的上游地址，不能塞本地缓存路径；
+	// 只有自家网页（inlineImages=true）才把 data[].url 换成服务端落盘的本地地址，
 	// 否则对话页的「生图」标签页拿 item.url 直接当 <img src> 用，只会是裂图。
 	payload := decodeOrRaw(raw)
-	if inlineImages && decision.Modality == intent.Image {
-		if m, ok := payload.(map[string]any); ok {
+	if m, ok := payload.(map[string]any); ok {
+		if inlineImages && decision.Modality == intent.Image {
 			if items := mapList(m["data"]); len(items) > 0 {
-				m["data"] = toAnySlice(s.inlineImageDataURIs(r.Context(), items))
+				m["data"] = toAnySlice(s.localizeImageURLs(r.Context(), items))
 			}
+		}
+		// 网页端就是靠这个 job_id 去轮询 /api/chat/v1/videos/<id>。
+		if job != nil {
+			m["job_id"] = job.JobID
+			if job.VideoID != "" {
+				m["video_id"] = job.VideoID
+			}
+			m["poll_url"] = "/api/chat/v1/videos/" + job.JobID
 		}
 	}
 	writeJSON(w, result.Status, payload, headers)
+}
+
+// recordVideoJob 把一次成功的视频提交落成本地任务记录。
+//
+// 为什么要自己发一个 job_id：上游只回 video_id，而 video_id 是上游的命名空间，
+// 用户拿它来查我们的任务对不上号；而且上游的查询接口要额外带 model_name，
+// 只有本地记录才存得下这些上下文。
+func (s *Server) recordVideoJob(result *relay.Result, raw []byte) *config.VideoJob {
+	payload := decodeMap(raw)
+	job := &config.VideoJob{
+		JobID:     config.NewID("job"),
+		VideoID:   extractVideoID(payload),
+		Model:     result.ModelUsed,
+		Status:    "submitted",
+		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
+	}
+	if result.Account != nil {
+		job.AccountID = result.Account.ID
+	}
+	s.Store.PutJob(job)
+	return job
+}
+
+// handleChatVideoStatus 查询视频任务状态（对话页轮询用）。
+//
+// 这里**绝对不能**转发给上游：上游的查询接口是 GET {root}/agnesapi?video_id=...，
+// 和提交接口完全不是一个路径。早先这个 GET 路由直接落到媒体代理上，被当成
+// 「又一次提交」以 POST /v1/videos/<job_id> 发出去 —— 上游只会回 400/404，
+// 于是视频即使提交成功也永远等不到结果。
+func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w)
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("job_id"))
+	job, ok := s.Store.JobByID(id)
+	if !ok {
+		// 也接受直接用上游 video_id 查，方便用户拿上游返回的 id 核对。
+		job, ok = s.Store.JobByVideoID(id)
+	}
+	if !ok {
+		writeJSON(w, 404, map[string]any{
+			"status": "unknown",
+			"error":  "找不到这个视频任务，可能已被清理（视频任务有容量上限）",
+		}, nil)
+		return
+	}
+
+	out := map[string]any{
+		"job_id":   job.JobID,
+		"video_id": job.VideoID,
+		"status":   job.Status,
+		"model":    job.Model,
+	}
+	if job.Status == "completed" || job.Status == "failed" {
+		if job.Error != "" {
+			out["error"] = job.Error
+		}
+		writeJSON(w, 200, out, nil)
+		return
+	}
+
+	account := s.Store.AccountByID(job.AccountID)
+	if account == nil {
+		writeJSON(w, 200, out, nil)
+		return
+	}
+	body := s.pollUpstream(r.Context(), account, job)
+	if body == nil {
+		writeJSON(w, 200, out, nil)
+		return
+	}
+	if url := extractVideoURL(body); url != "" {
+		job.Status = "completed"
+		s.Store.PutJob(job)
+		out["status"] = "completed"
+		out["video_url"] = url
+		writeJSON(w, 200, out, nil)
+		return
+	}
+	if st := strings.ToLower(asStr(body["status"])); st == "failed" || st == "error" {
+		job.Status = "failed"
+		job.Error = upstreamErrorMessage(200, body, nil)
+		s.Store.PutJob(job)
+		out["status"] = "failed"
+		out["error"] = job.Error
+		writeJSON(w, 200, out, nil)
+		return
+	}
+	writeJSON(w, 200, out, nil)
 }
 
 // toAnySlice 把 []map[string]any 转成 []any。
@@ -2193,18 +2307,20 @@ func toAnySlice(items []map[string]any) []any {
 // 复用与裸 /v1 代理（serveAutoImage / serveAutoVideo）同一套翻译函数，
 // 保证「对话页生图」与「程序化客户端生图」的正文完全一致。
 //
-// 与裸 /v1 的唯一差别：这里的图片一律先由服务端回取成 base64 再拼 Markdown。
+// 与裸 /v1 的差别：这里的图片先由服务端回取落盘，正文里只放本地地址。
 // 调用方是网页对话窗口，正文要能直接被 <img> 渲染；上游 URL 带鉴权或落在
 // 浏览器够不到的 CDN 上时，照抄 URL 只会得到一张裂图。
+//
+// job 非 nil 时表示这是视频提交，携带本地任务记录（见 recordVideoJob）。
 func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, decision intent.Result,
-	result *relay.Result, raw []byte, headers map[string]string, stream bool) {
+	result *relay.Result, raw []byte, headers map[string]string, stream bool, job *config.VideoJob) {
 
 	if decision.Modality == intent.Video {
 		payload := decodeMap(raw)
 		videoID := extractVideoID(payload)
-		jobID := asStr(payload["job_id"])
-		if jobID == "" {
-			jobID = videoID
+		jobID := ""
+		if job != nil {
+			jobID, videoID = job.JobID, firstNonEmpty(job.VideoID, videoID)
 		}
 		jobInfo := map[string]any{"job_id": jobID, "video_id": videoID}
 		if jobID != "" {
@@ -2227,9 +2343,9 @@ func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, de
 
 	data := decodeMap(raw)
 	items := mapList(data["data"])
-	// 回取上游图片并内联成 data URI —— ImageContent 会把它拼进 Markdown，
-	// 前端 renderMarkdown 放行 data:image/，于是浏览器零依赖即可显示。
-	items = s.inlineImageDataURIs(r.Context(), items)
+	// 回取上游图片落盘，换成本地地址 —— ImageContent 会把它拼进 Markdown，
+	// 前端 renderMarkdown 放行相对路径，于是浏览器直接向本机要图。
+	items = s.localizeImageURLs(r.Context(), items)
 	content, images := intent.ImageContent(items, decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") +

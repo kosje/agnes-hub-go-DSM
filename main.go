@@ -29,7 +29,18 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.12"
+// version 是本套件的版本号，也是唯一的版本号。
+//
+// 采用纯 x.y.z，**不再带 -000N 构建号**：套件 INFO 的 version、catalog 的
+// version、控制台显示的「当前版本 / 最新版本」、GitHub Release 的 tag 全部
+// 来自这一个值，发新版直接 +1（1.0.13 → 1.0.14）。
+//
+// 之前用「功能号-构建号」（1.0.12-0002）是为了能在功能号不变时重发，
+// 但代价是三处显示不一致：套件装的是 1.0.12-0002、控制台当前版本显示 1.0.12、
+// Release tag 又是 v1.0.12-0002，用户根本对不上。而且 updater 的版本比较会在
+// 第一个 '-' 处截断，1.0.12-0002 与 1.0.12 被判成相等，永远显示「已是最新」。
+// 统一成一个号之后这些问题自然消失。
+var version = "1.0.13"
 
 // releaseRepo 是控制台「版本与自更新」卡片里「查看全部版本」要跳转的 GitHub 仓库
 // （owner/name），非套件版会被自更新仓库覆盖，见 main()。这里是本 DSM 套件分支的仓库：
@@ -113,6 +124,11 @@ func main() {
 		BinaryName:    "agnes-hub-go",
 		DataDir:       *dataDir,
 		CheckInterval: checkInterval,
+		// 套件版的 release 资产是 SPK（agnes-hub-x86_64-1.0.13.spk），
+		// 不是裸二进制，pickAsset 永远挑不到 —— 若不告诉 updater，它会判定
+		// 「没有本平台的资产」→ IsUpdateAvailable 恒为 false，控制台永远显示
+		// 「已是最新」，还会弹一条莫名其妙的资产缺失告警。
+		SuiteManaged: *noSelfUpdate,
 	}
 	upd := updater.New(updCfg, version, exe, nil)
 	srv.SetUpdater(upd)

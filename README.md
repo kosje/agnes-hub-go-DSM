@@ -469,9 +469,9 @@ python tools/build_catalog.py         # 生成群晖套件源 docs/catalog.json
 # 1. 交叉编译（源码零改动，Go 自带交叉编译，不需要 CGO）
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
 
-# 2. 打包（产出 dist/agnes-hub-x86_64-<版本>-<构建号>.spk）
+# 2. 打包（产出 dist/agnes-hub-x86_64-<版本>.spk，版本号取 main.go 的 var version）
 python tools/build_spk.py
-SPK_BUILD=2 python tools/build_spk.py    # 同一功能版本重发时递增构建号
+# 发新版：把 main.go 的 var version 直接 +1（1.0.13 → 1.0.14）再打包，没有构建号
 
 # 3. 生成套件源（产出 docs/catalog.json，并把 SPK 复制到 docs/ 一起发布）
 python tools/build_catalog.py
@@ -575,9 +575,11 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 - **一个 SPK 只能装一种架构**。群晖官方要求不要把多平台二进制打进同一个 spk，
   所以 `build_spk.py` 按 CPU 架构产出独立的包（默认只出 x86_64），并在 INFO
   中列出兼容该二进制的具体 DSM 平台代号。
-- **`INFO` 的值必须带双引号**（`package="agnes-hub"`），且 `version` 必须是
-  「功能号-构建号」（如 `1.0.9-0001`）。版本号必须严格递增，否则套件中心认为版本没变、
-  不提示升级。换功能版本时构建号从 0001 重新起算（`1.0.9-0001` > `1.0.2-0002` 成立）。
+- **`INFO` 的值必须带双引号**（`package="agnes-hub"`），`version` 取 `main.go`
+  的 `var version`（纯 `x.y.z`，如 `1.0.13`）。版本号必须严格递增，否则套件中心认为
+  版本没变、不提示升级 —— 所以发新版就是把这个数字直接 +1，不再有 `-0001` 构建号。
+  这样做还有个好处：套件 INFO、catalog、控制台显示的「当前版本 / 最新版本」、
+  Release tag 全部来自同一个值，不会出现「装的是一版、界面显示另一版」。
 - **`thirdparty="yes"` 不能漏**。DSM 靠它判定这是第三方套件、走「信任层级」那套流程；
   缺了它 DSM 会把包当成群晖官方包、要求有效的官方签名，安装直接被拒。
 - **生命周期脚本是固定文件名**：`scripts/start-stop-status` 加六个钩子

@@ -7,9 +7,10 @@
   1. 一个 SPK 只能装一种架构的二进制。群晖官方 INFO 文档对 arch 字段的原话是
      "Please not pack all binary files with different platforms to one package spk file."
      所以这里按架构产出独立的 SPK（默认只出 x86_64）。
-  2. INFO 的每个值都必须带双引号（package="x" 而不是 package=x），
-     且 version 必须是「功能号-构建号」（1.0.2-0001），构建号每次发布要递增，
-     否则套件中心认为版本没变、不提示升级。
+  2. INFO 的每个值都必须带双引号（package="x" 而不是 package=x）。
+     version 直接取 main.go 的 var version（纯 x.y.z，如 1.0.13），
+     发新版 +1 即可 —— 套件中心靠它判断有无更新，SPK 内 INFO 与 catalog
+     两边的 version 必须完全一致。
   3. thirdparty="yes" 不能漏。DSM 靠它判定这是第三方套件、走「信任层级」那套流程；
      缺了它 DSM 会把包当成群晖官方包、要求有效的官方签名，安装直接被拒。
   4. 生命周期脚本是固定文件名的 scripts/ 目录，其中 start-stop-status 加
@@ -28,7 +29,6 @@
 
 用法：
     python tools/build_spk.py                      # 默认只出 x86_64，输出到 dist/
-    SPK_BUILD=7 python tools/build_spk.py          # 指定构建号 -> 1.0.2-0007
     python tools/build_spk.py --arch armv8         # 只出 armv8
     python tools/build_spk.py --arch all           # 两个架构都出
     SPK_OUT_DIR=D:/somewhere python tools/build_spk.py
@@ -101,9 +101,8 @@ PACKAGE_ARCHES = {
     "armv8": "armada37xx rtd1296 rtd1619 rtd1619b aarch64 armv8",
 }
 
-# 每次发布 SPK 都必须递增；功能号（main.go 的 var version）变化时从 1 重新开始。
-# 仍可用 SPK_BUILD 临时覆盖。
-DEFAULT_SPK_BUILD = "2"
+# 版本号直接取 main.go 的 var version（纯 x.y.z），发新版 +1 即可。
+# 见 spk_version() 的说明：这里不再有构建号。
 
 DESCRIPTION = (
     "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定"
@@ -276,15 +275,17 @@ def read_version():
 
 
 def spk_version(go_version):
-    """把 1.0.2 变成群晖要求的 1.0.2-0001。
+    """套件版本号 = main.go 里的功能号，原样使用（1.0.13）。
 
-    群晖 version 必须是「功能号-构建号」；构建号要在每次发布时递增，
-    否则套件中心认为版本没变、不会提示升级。用 SPK_BUILD 环境变量指定。
+    早先是「功能号-构建号」（1.0.12-0002），为的是功能号不变时也能重发。
+    代价是三处显示对不上：套件装的是 1.0.12-0002、控制台当前版本显示 1.0.12、
+    Release tag 又是 v1.0.12-0002；而且 updater 的版本比较会在第一个 '-' 处
+    截断，把 1.0.12-0002 和 1.0.12 判成相等，永远显示「已是最新」。
+
+    现在统一成一个号：发新版直接 +1（1.0.13 → 1.0.14），套件 INFO、catalog、
+    控制台显示、Release tag 全部一致。需要重发时同样 +1，不再有构建号。
     """
-    build = os.environ.get("SPK_BUILD", DEFAULT_SPK_BUILD)
-    if not build.isdigit():
-        sys.exit("[ERROR] SPK_BUILD 必须是纯数字，当前为 %r" % build)
-    return "%s-%04d" % (go_version, int(build))
+    return go_version
 
 
 # ---------------------------------------------------------------------------

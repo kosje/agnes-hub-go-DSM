@@ -11,12 +11,10 @@ package web
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -222,94 +220,6 @@ func autoIntentConfig(s config.Settings) intent.Config {
 		VideoWaitSec:     s.AutoIntent.VideoWaitSec,
 		PreferredModels:  s.AutoIntent.PreferredModels,
 	}
-}
-
-// maxFetchedImageBytes 是服务端回取图片的大小上限。
-//
-// 超过就退回原始 URL：一张几十 MB 的图转成 base64 会把聊天记录（全 JSON 存储）
-// 瞬间撑爆，得不偿失。实测上游生图产出普遍在 1~3 MB，6 MB 足够覆盖 1K~4K。
-const maxFetchedImageBytes = 6 << 20
-
-// imageFetchClient 专用于回取上游图片。
-//
-// 刻意与 relay.BuildClient() 分开：那个客户端把 CheckRedirect 设成
-// http.ErrUseLastResponse（要把上游的 302 原样透给调用方），而 CDN 的图片地址
-// 经常就是 302 到真正的存储节点 —— 用它取图必然拿不到内容。
-var imageFetchClient = &http.Client{Timeout: 30 * time.Second}
-
-// fetchImageDataURI 服务端把上游图片拉回来，转成 base64 data URI。
-//
-// 为什么必须由服务端回取：上游返回的 url 往往带鉴权、或落在浏览器够不到的 CDN 上，
-// 直接写进 Markdown 只会渲染成一个裂图（实测就是如此：正文是
-// ![画一幅山水画](https://...) 但浏览器加载不出来）。
-// 由服务端取回再以 base64 内联，浏览器零依赖即可显示，也不受跨域 / 鉴权影响。
-//
-// 任何一步失败都原样返回入参 —— 宁可退化成裂图，也不能让整个响应挂掉。
-func (s *Server) fetchImageDataURI(ctx context.Context, raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || strings.HasPrefix(raw, "data:") {
-		return raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return raw
-	}
-	fctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(fctx, http.MethodGet, raw, nil)
-	if err != nil {
-		return raw
-	}
-	resp, err := imageFetchClient.Do(req)
-	if err != nil {
-		return raw
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return raw
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchedImageBytes+1))
-	if err != nil || len(data) == 0 || len(data) > maxFetchedImageBytes {
-		return raw
-	}
-	mime := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if i := strings.IndexByte(mime, ';'); i >= 0 {
-		mime = strings.TrimSpace(mime[:i])
-	}
-	if !strings.HasPrefix(mime, "image/") {
-		// 上游常常把 Content-Type 写成 application/octet-stream，
-		// 用魔数兜底，避免 data URI 的 MIME 不对导致浏览器不渲染。
-		mime = http.DetectContentType(data)
-	}
-	if !strings.HasPrefix(mime, "image/") {
-		return raw
-	}
-	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
-}
-
-// inlineImageDataURIs 把生图结果里的 url 换成服务端回取的 base64 data URI。
-//
-// 返回新切片，不改动入参 —— 入参还要按「官方形态」回给程序化客户端，
-// 那些客户端要的是真实的上游地址，不是几 MB 的 data URI。
-func (s *Server) inlineImageDataURIs(ctx context.Context, items []map[string]any) []map[string]any {
-	if len(items) == 0 {
-		return items
-	}
-	out := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		clone := make(map[string]any, len(item)+1)
-		for k, v := range item {
-			clone[k] = v
-		}
-		// 只处理字符串型 url：上游偶尔会回 null 或对象，交给下游按原样处理即可。
-		if u, ok := clone["url"].(string); ok {
-			if u = strings.TrimSpace(u); u != "" {
-				clone["url"] = s.fetchImageDataURI(ctx, u)
-			}
-		}
-		out = append(out, clone)
-	}
-	return out
 }
 
 // isAutoModel 判断模型名是否表示「让网关决定」。
@@ -521,85 +431,85 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("# HELP baiPiao_hub_requests_total Total requests served\n")
-	sb.WriteString("# TYPE baiPiao_hub_requests_total counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_requests_total %d\n", m.RequestsTotal.Load()))
+	sb.WriteString("# HELP agnes_hub_requests_total Total requests served\n")
+	sb.WriteString("# TYPE agnes_hub_requests_total counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_requests_total %d\n", m.RequestsTotal.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_requests_ok Successful requests\n")
-	sb.WriteString("# TYPE baiPiao_hub_requests_ok counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_requests_ok %d\n", m.RequestsOK.Load()))
+	sb.WriteString("# HELP agnes_hub_requests_ok Successful requests\n")
+	sb.WriteString("# TYPE agnes_hub_requests_ok counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_requests_ok %d\n", m.RequestsOK.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_requests_error Failed requests\n")
-	sb.WriteString("# TYPE baiPiao_hub_requests_error counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_requests_error %d\n", m.RequestsError.Load()))
+	sb.WriteString("# HELP agnes_hub_requests_error Failed requests\n")
+	sb.WriteString("# TYPE agnes_hub_requests_error counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_requests_error %d\n", m.RequestsError.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_upstream_429 Upstream 429s received\n")
-	sb.WriteString("# TYPE baiPiao_hub_upstream_429 counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_upstream_429 %d\n", m.Upstream429.Load()))
+	sb.WriteString("# HELP agnes_hub_upstream_429 Upstream 429s received\n")
+	sb.WriteString("# TYPE agnes_hub_upstream_429 counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_upstream_429 %d\n", m.Upstream429.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_queued_total Requests that had to wait in queue\n")
-	sb.WriteString("# TYPE baiPiao_hub_queued_total counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_queued_total %d\n", m.QueuedTotal.Load()))
+	sb.WriteString("# HELP agnes_hub_queued_total Requests that had to wait in queue\n")
+	sb.WriteString("# TYPE agnes_hub_queued_total counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_queued_total %d\n", m.QueuedTotal.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_queue_timeout Requests that timed out waiting\n")
-	sb.WriteString("# TYPE baiPiao_hub_queue_timeout counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_queue_timeout %d\n", m.QueueTimeout.Load()))
+	sb.WriteString("# HELP agnes_hub_queue_timeout Requests that timed out waiting\n")
+	sb.WriteString("# TYPE agnes_hub_queue_timeout counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_queue_timeout %d\n", m.QueueTimeout.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_queue_overflow Requests dropped because queue full\n")
-	sb.WriteString("# TYPE baiPiao_hub_queue_overflow counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_queue_overflow %d\n", m.QueueOverflow.Load()))
+	sb.WriteString("# HELP agnes_hub_queue_overflow Requests dropped because queue full\n")
+	sb.WriteString("# TYPE agnes_hub_queue_overflow counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_queue_overflow %d\n", m.QueueOverflow.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_spillovers Soft-affinity spillovers\n")
-	sb.WriteString("# TYPE baiPiao_hub_spillovers counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_spillovers %d\n", m.Spillovers.Load()))
+	sb.WriteString("# HELP agnes_hub_spillovers Soft-affinity spillovers\n")
+	sb.WriteString("# TYPE agnes_hub_spillovers counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_spillovers %d\n", m.Spillovers.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_breaker_opened Breakers opened (401/403/402)\n")
-	sb.WriteString("# TYPE baiPiao_hub_breaker_opened counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_breaker_opened %d\n", m.BreakerOpened.Load()))
+	sb.WriteString("# HELP agnes_hub_breaker_opened Breakers opened (401/403/402)\n")
+	sb.WriteString("# TYPE agnes_hub_breaker_opened counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_breaker_opened %d\n", m.BreakerOpened.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_breaker_revived Breakers revived after cooldown\n")
-	sb.WriteString("# TYPE baiPiao_hub_breaker_revived counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_breaker_revived %d\n", m.BreakerRevived.Load()))
+	sb.WriteString("# HELP agnes_hub_breaker_revived Breakers revived after cooldown\n")
+	sb.WriteString("# TYPE agnes_hub_breaker_revived counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_breaker_revived %d\n", m.BreakerRevived.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_wait_ms_total Total wait time in milliseconds\n")
-	sb.WriteString("# TYPE baiPiao_hub_wait_ms_total counter\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_wait_ms_total %d\n", m.WaitMS.Load()))
+	sb.WriteString("# HELP agnes_hub_wait_ms_total Total wait time in milliseconds\n")
+	sb.WriteString("# TYPE agnes_hub_wait_ms_total counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_wait_ms_total %d\n", m.WaitMS.Load()))
 
-	sb.WriteString("# HELP baiPiao_hub_uptime_seconds Seconds since startup\n")
-	sb.WriteString("# TYPE baiPiao_hub_uptime_seconds gauge\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_uptime_seconds %.0f\n", now.Sub(h.Metrics.StartedAt).Seconds()))
+	sb.WriteString("# HELP agnes_hub_uptime_seconds Seconds since startup\n")
+	sb.WriteString("# TYPE agnes_hub_uptime_seconds gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_uptime_seconds %.0f\n", now.Sub(h.Metrics.StartedAt).Seconds()))
 
-	sb.WriteString("# HELP baiPiao_hub_started_at_seconds Unix timestamp when hub started\n")
-	sb.WriteString("# TYPE baiPiao_hub_started_at_seconds gauge\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_started_at_seconds %.0f\n", float64(startedAt)))
+	sb.WriteString("# HELP agnes_hub_started_at_seconds Unix timestamp when hub started\n")
+	sb.WriteString("# TYPE agnes_hub_started_at_seconds gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_started_at_seconds %.0f\n", float64(startedAt)))
 
-	sb.WriteString("# HELP baiPiao_hub_total_text_rpm Current effective text RPM sum across all accounts\n")
-	sb.WriteString("# TYPE baiPiao_hub_total_text_rpm gauge\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_total_text_rpm %.2f\n", totalTextRPM))
+	sb.WriteString("# HELP agnes_hub_total_text_rpm Current effective text RPM sum across all accounts\n")
+	sb.WriteString("# TYPE agnes_hub_total_text_rpm gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_total_text_rpm %.2f\n", totalTextRPM))
 
-	sb.WriteString("# HELP baiPiao_hub_account_penalty_remaining_sec Seconds until account unblocked\n")
-	sb.WriteString("# TYPE baiPiao_hub_account_penalty_remaining_sec gauge\n")
+	sb.WriteString("# HELP agnes_hub_account_penalty_remaining_sec Seconds until account unblocked\n")
+	sb.WriteString("# TYPE agnes_hub_account_penalty_remaining_sec gauge\n")
 	sb.WriteString("# LABELS account_id,account_name,enabled\n")
 	for _, g := range gauges {
 		enabledLabel := "0"
 		if g.enabled {
 			enabledLabel = "1"
 		}
-		sb.WriteString(fmt.Sprintf("baiPiao_hub_account_penalty_remaining_sec{account_id=\"%s\",account_name=\"%s\",enabled=\"%s\"} %.2f\n",
+		sb.WriteString(fmt.Sprintf("agnes_hub_account_penalty_remaining_sec{account_id=\"%s\",account_name=\"%s\",enabled=\"%s\"} %.2f\n",
 			g.id, g.name, enabledLabel, g.penaltyRemainingSec))
 	}
 
-	sb.WriteString("# HELP baiPiao_hub_account_consecutive_failures Consecutive error count per account\n")
-	sb.WriteString("# TYPE baiPiao_hub_account_consecutive_failures gauge\n")
+	sb.WriteString("# HELP agnes_hub_account_consecutive_failures Consecutive error count per account\n")
+	sb.WriteString("# TYPE agnes_hub_account_consecutive_failures gauge\n")
 	sb.WriteString("# LABELS account_id,account_name\n")
 	for _, g := range gauges {
-		sb.WriteString(fmt.Sprintf("baiPiao_hub_account_consecutive_failures{account_id=\"%s\",account_name=\"%s\"} %d\n",
+		sb.WriteString(fmt.Sprintf("agnes_hub_account_consecutive_failures{account_id=\"%s\",account_name=\"%s\"} %d\n",
 			g.id, g.name, g.consecutiveFailures))
 	}
 
-	sb.WriteString("# HELP baiPiao_hub_request_timeout_ms Configured request timeout\n")
-	sb.WriteString("# TYPE baiPiao_hub_request_timeout_ms gauge\n")
-	sb.WriteString(fmt.Sprintf("baiPiao_hub_request_timeout_ms %d\n", settings.RequestTimeoutMS))
+	sb.WriteString("# HELP agnes_hub_request_timeout_ms Configured request timeout\n")
+	sb.WriteString("# TYPE agnes_hub_request_timeout_ms gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_request_timeout_ms %d\n", settings.RequestTimeoutMS))
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -901,7 +811,7 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	extra["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 
 	if result.Status >= 400 {
-		writeJSON(w, result.Status, decodeOrRaw(raw), extra)
+		writeJSON(w, result.Status, errorPayload(result.Status, raw), extra)
 		return
 	}
 
@@ -912,10 +822,10 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	}
 
 	// 走到这里说明 chatShape=true，调用方是对话形态的客户端（对话页 / 带 messages
-	// 或 stream 的调用方），正文按 Markdown 渲染 —— 图片必须由服务端回取成 base64
-	// 内联，否则正文里那行 ![prompt](https://...) 在浏览器里只会显示成裂图。
+	// 或 stream 的调用方），正文按 Markdown 渲染 —— 图片必须由服务端回取并落盘、
+	// 换成本地地址，否则正文里那行 ![prompt](https://...) 在浏览器里只会显示成裂图。
 	// 注意上面对 imgJob.URL 用的是原始 items，聊天记录里保留上游地址（体积小）。
-	content, images := intent.ImageContent(s.inlineImageDataURIs(r.Context(), items), decision.Prompt.Text)
+	content, images := intent.ImageContent(s.localizeImageURLs(r.Context(), items), decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") + " 未被生图端点接受，已忽略。"
 	}
@@ -975,7 +885,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	extra["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 
 	if result.Status >= 400 {
-		writeJSON(w, result.Status, decodeOrRaw(raw), extra)
+		writeJSON(w, result.Status, errorPayload(result.Status, raw), extra)
 		return
 	}
 
@@ -1245,7 +1155,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 		if result.Status >= 400 {
-			writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+			writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
 			return
 		}
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
@@ -1298,7 +1208,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		case out := <-ch:
 			if out.err != nil {
 				writeSSEFrame(w, flusher, map[string]any{
-					"error": map[string]any{"message": out.err.Error(), "type": "baipiao_hub_queue"}})
+					"error": map[string]any{"message": out.err.Error(), "type": "agnes_hub_queue"}})
 				return
 			}
 			result := out.result
@@ -1342,7 +1252,7 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 		for k, v := range decision.Headers() {
 			headers[k] = v
 		}
-		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+		writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
 		return
 	}
 	s.Store.ChargeKey(item.Key)
@@ -1559,6 +1469,99 @@ func decodeOrRaw(raw []byte) any {
 			"message": upstreamTextSummary(raw), "type": "upstream_error"}}
 	}
 	return out
+}
+
+// errorPayload 构造一个「一定带 error.message」的上游错误响应体。
+//
+// 为什么必须有这一层：前端只认 error.message，拿不到就退化显示成「HTTP 400」。
+// 实测生视频失败时界面就只有这四个字，完全看不出是模型不可用、额度不够、
+// 还是参数不合法 —— 用户没法自查，我们也拿不到线索。
+//
+// 上游各家 relay 的错误字段名并不统一（message / msg / detail / error 是字符串…），
+// 所以这里做三件事：
+//  1. 已经是标准的 error.message → 原样透传，一个字段都不动（程序化客户端不受影响）；
+//  2. 非标准字段名 → 挖出来补成 error.message，原有字段全部保留；
+//  3. 实在挖不到 → 给一句明确的话 + 原始响应开头，而不是让前端只剩「HTTP 400」。
+func errorPayload(status int, raw []byte) any {
+	payload := decodeOrRaw(raw)
+	m, ok := payload.(map[string]any)
+	if !ok {
+		// 上游回的是数组 / 标量 / HTML：包一层，别让原因丢掉。
+		return map[string]any{"error": map[string]any{
+			"message": fmt.Sprintf("上游返回 HTTP %d，响应不是标准的错误对象。原文：%s",
+				status, truncateStr(strings.TrimSpace(string(raw)), 300)),
+			"type": "upstream_error", "upstream_status": status}}
+	}
+	if errorObjectHasMessage(m) {
+		return m
+	}
+	out := make(map[string]any, len(m)+1)
+	for k, v := range m {
+		out[k] = v
+	}
+	merged := map[string]any{}
+	if e, ok := m["error"].(map[string]any); ok {
+		for k, v := range e {
+			merged[k] = v
+		}
+	}
+	// error 是个裸字符串时也留着，别在改写成对象的过程中把原文丢了。
+	if es, ok := m["error"].(string); ok && strings.TrimSpace(es) != "" {
+		merged["upstream_error"] = es
+	}
+	merged["message"] = upstreamErrorMessage(status, m, raw)
+	if s, _ := merged["type"].(string); strings.TrimSpace(s) == "" {
+		merged["type"] = "upstream_error"
+	}
+	merged["upstream_status"] = status
+	out["error"] = merged
+	return out
+}
+
+// errorObjectHasMessage 判断响应体是否已经是标准的 {"error":{"message":...}} 形态。
+//
+// 注意只认「对象 + message」这一种：上游把 error 写成裸字符串时前端照样读不到
+// error.message，必须走补齐流程。
+func errorObjectHasMessage(m map[string]any) bool {
+	e, ok := m["error"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(asStr(e["message"])) != ""
+}
+
+// upstreamErrorMessage 尽最大努力从上游错误响应里挖出一句人能看懂的原因。
+func upstreamErrorMessage(status int, m map[string]any, raw []byte) string {
+	// 非标准但常见的字段名（各家 relay 五花八门）
+	for _, k := range []string{"message", "msg", "detail", "error_msg", "error_description", "reason"} {
+		if v, ok := m[k]; ok {
+			if s := strings.TrimSpace(asStr(v)); s != "" {
+				return s
+			}
+		}
+	}
+	// error 直接是字符串
+	if e, ok := m["error"].(string); ok {
+		if s := strings.TrimSpace(e); s != "" {
+			return s
+		}
+	}
+	// 再往下挖一层：{"error":{"code":"...","detail":"..."}}
+	if e, ok := m["error"].(map[string]any); ok {
+		for _, k := range []string{"detail", "msg", "reason", "code"} {
+			if v, ok := e[k]; ok {
+				if s := strings.TrimSpace(asStr(v)); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	// 非 JSON（HTML 拦截页等）
+	if s := strings.TrimSpace(string(raw)); s != "" && !strings.HasPrefix(s, "{") && !strings.HasPrefix(s, "[") {
+		return upstreamTextSummary(raw)
+	}
+	return fmt.Sprintf("上游返回 HTTP %d，但响应里没有可读的错误说明。原始响应：%s",
+		status, truncateStr(strings.TrimSpace(string(raw)), 300))
 }
 
 // upstreamTextSummary 把非 JSON 的上游响应压成一句可读摘要。
