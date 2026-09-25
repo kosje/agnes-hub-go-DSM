@@ -2,15 +2,15 @@
   "packages": [
     {
       "package": "agnes-hub",
-      "version": "1.0.11-0003",
+      "version": "1.0.12-0001",
       "dname": "Agnes Hub",
       "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生 / 生图 / 生视频；FIFO 严格节拍限流、软粘性溢出、二维自适应校准、熔断自动复活。数据保存在套件目录内，全 JSON 文件，免 SSH 即可备份迁移。",
       "price": 0,
       "download_count": 0,
       "recent_download_count": 0,
-      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.11-0003.spk",
+      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.12-0001.spk",
       "size": 4177920,
-      "md5": "090c3b997699659c9f04e7ee56adfb01",
+      "md5": "fc27728c6179354592850a6d9b6b21ac",
       "thumbnail": [
         "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-72.png"
       ],
@@ -30,7 +30,7 @@
       "distributor": "kosje",
       "distributor_url": "https://github.com/kosje/agnes-hub-go-DSM",
       "support_url": "https://github.com/kosje/agnes-hub-go-DSM/issues",
-      "changelog": "换用全新的「A」字形图标，并修复控制台更新面板的链接与状态显示。<br>· 图标换成「铬质 A 字 + 星空光环」插画：整幅裁切 + 线性光空间缩放（直接在 sRGB 上缩小会让暗部发灰）+ 轻调色 + DSM 圆角遮罩，16/24/32/48/64/72/128/256 全尺寸都清晰<br>· 小尺寸自适应：16/24/32px 自动往里收一点，保证「A」在小图标里还认得出来<br>· 修复控制台「查看全部版本」指向上游仓库的问题，改为指向本套件仓库，且链接跟随实际升级来源<br>· 套件版如实显示「由套件中心管理」并置灰自更新按钮：套件是用 -no-selfupdate 启动的，原来那句「当前已是最新版本」会让用户以为没得升<br>· 网页顶栏 logo 同步换成新图标（原先还是「黑底 + 浅紫圆盘」的老图，22px 下白字形糊成一团）",
+      "changelog": "修复「生图 / 生视频」整条链路，控制台品牌改为 Agnes Hub。<br>· 【重要】修复生图打不通：控制台路由 /api/chat/v1/... 转发上游时没摘掉 /api/chat 前缀，请求打到了上游不存在的路径，被边缘 WAF 拦成一张 HTML 错误页<br>· 【重要】修复 agnes-auto 不被识别为 auto：auto 判定只认内置的 auto/auto-all/auto* 前缀，不认识设置里的 AutoModelName（默认 agnes-auto），导致自动判定链路整条被跳过<br>· 【重要】修复对话入口提示词被读空（请求体被读第二遍）与响应形态未回译（images 结构按 chat 的 choices 解析 → 显示「无内容返回」）<br>· 控制台标题 / 侧边栏 / 登录页改为「Agnes Hub 控制台」，副标题与示例账号名同步去掉旧品牌（纯展示文本，不影响取值）<br>· 修复网页顶栏 logo 升级后不更新：/logo.png 原先 max-age=86400，改为 no-cache + 内容指纹 ETag，前端引用地址带指纹，缓存必然击穿<br>· 上游返回 HTML（WAF 拦截页）时不再把整页刷到界面，压成一句可读摘要",
       "thirdparty": true,
       "category": 0,
       "subcategory": 0,

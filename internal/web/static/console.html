@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>baiPiao-hub 控制台</title>
+<title>Agnes Hub 控制台</title>
 <style>
   :root{
     --bg:#f6f7f9; --panel:#ffffff; --line:#e4e7ec; --ink:#1c2430; --muted:#65717f;
@@ -140,8 +140,8 @@ function renderLogin(mustChange){
   document.getElementById("app").innerHTML = `
   <div class="login">
     <div class="card">
-      <h1>baiPiao-hub 控制台</h1>
-      <p class="muted">白嫖 Hub 聚合网关 · RPM 排队限流</p>
+      <h1>Agnes Hub 控制台</h1>
+      <p class="muted">Agnes Hub 聚合网关 · RPM 排队限流</p>
       <div id="toast" class="hide"></div>
       <label>管理员密码</label>
       <input id="pw" type="password" placeholder="请输入管理员密码" autocomplete="current-password">
@@ -175,7 +175,7 @@ function renderShell(){
   <div style="max-width:1240px;margin:0 auto;padding:20px">
     <div class="spread" style="margin-bottom:14px">
       <div>
-        <h1>baiPiao-hub 控制台</h1>
+        <h1>Agnes Hub 控制台</h1>
         <div class="muted" id="subline">加载中…</div>
       </div>
       <div class="row">
@@ -346,7 +346,7 @@ function viewAccounts(){
     <div class="card">
       <h2>添加账号</h2>
       <div class="grid">
-        <div><label>名称</label><input id="aName" placeholder="白嫖-1"></div>
+        <div><label>名称</label><input id="aName" placeholder="账号-1"></div>
         <div><label>API Key</label><input id="aKey" placeholder="sk-..."></div>
         <div><label>Base URL（留空按类型自动套用）</label><input id="aBase" placeholder="https://api.api.example.cn/v1"></div>
         <div class="row">
@@ -372,8 +372,8 @@ function viewAccounts(){
     <div class="card">
       <h2>批量导入</h2>
       <label>每行一个账号：<span class="mono">名称,key[,base_url[,access_type[,group]]]</span>，以 # 开头的行会被忽略</label>
-      <textarea id="bulkText" placeholder="白嫖-1,sk-xxxx,https://api.example.cn/v1,free,cn
-白嫖-2,sk-yyyy,https://api.example.cn/v1,free,cn"></textarea>
+      <textarea id="bulkText" placeholder="账号-1,sk-xxxx,https://api.example.cn/v1,free,cn
+账号-2,sk-yyyy,https://api.example.cn/v1,free,cn"></textarea>
       <div class="row" style="margin-top:10px">
         <button class="primary" id="btnBulk">批量导入</button>
         <span class="muted">逐行校验，失败的行会单独回报原因</span>

@@ -209,6 +209,23 @@ func IsAutoModel(name string) bool {
 	return false
 }
 
+// IsAutoModelNamed 判断 name 是否表示「让网关决定」，同时认内置 auto 名与
+// 设置里的 AutoModelName。
+//
+// 为什么必须有这个重载：IsAutoModel 只认 auto / auto-all / auto* 前缀，
+// 而本项目的默认 AutoModelName 是 "agnes-auto" —— 不在内置集合里。
+// 单用 IsAutoModel 会把 agnes-auto 判成「显式模型」，于是整条自动判定链路
+// （内容判定 → 生图 / 生视频）被跳过，请求带着 model=agnes-auto 原样透传给
+// 上游，界面表现就是「选了 auto 就不能生图」。
+func IsAutoModelNamed(name, autoName string) bool {
+	if IsAutoModel(name) {
+		return true
+	}
+	a := strings.ToLower(strings.TrimSpace(name))
+	b := strings.ToLower(strings.TrimSpace(autoName))
+	return a != "" && b != "" && a == b
+}
+
 // ModalityFromPath 端点信号。
 func ModalityFromPath(path string) string {
 	low := strings.ToLower(path)

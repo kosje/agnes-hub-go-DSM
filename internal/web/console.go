@@ -2,8 +2,9 @@ package web
 
 import (
 	"context"
-	_ "embed"
 	"crypto/rand"
+	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,27 @@ var chatMainJS []byte
 //go:embed static/logo.png
 var logoPNG []byte
 
+// logoFingerprint 是 logo.png 的内容指纹（sha256 前 8 字节的十六进制）。
+//
+// 同时用在两处：/logo.png 的 ETag，以及前端 <img src> 的 ?v= 查询串。
+// 为什么必须带指纹：logo.png 是 go:embed 进二进制的，URL 恒定不变，
+// 一旦浏览器把它缓存住，换图标后用户会一直看到旧图 ——
+// 实测踩过这个坑：1.0.11-0001 换成 0003 换了整套图标，网页顶栏仍是旧图。
+var logoFingerprint = func() string {
+	sum := sha256.Sum256(logoPNG)
+	return hex.EncodeToString(sum[:8])
+}()
+
+// logoETag 是 /logo.png 的强校验器。
+var logoETag = `"` + logoFingerprint + `"`
+
+// logoURL 是前端引用 logo 的地址。指纹变化即等于换了个 URL，缓存必然击穿。
+var logoURL = "/logo.png?v=" + logoFingerprint
+
+// chatMainJSServed 是下发前的 chat.main.js：把里面的 /logo.png 换成带指纹的
+// logoURL。放在服务端替换而不是写死在 JS 里，是为了换图标时不必记得手改版本号。
+var chatMainJSServed = []byte(strings.ReplaceAll(string(chatMainJS), "/logo.png", logoURL))
+
 const cookieName = "baipiao_hub_session"
 const chatPasswordCookie = "baipiao_chat_password"
 
@@ -44,9 +66,16 @@ func (s *Server) consoleRoutes() {
 		_, _ = w.Write(consoleHTML)
 	})
 	m.HandleFunc("GET /logo.png", func(w http.ResponseWriter, r *http.Request) {
+		// 刻意不用 max-age：URL 恒定 + 长缓存 = 换图标后用户看不到新图。
+		// 改成 no-cache + ETag：每次回源校验，内容没变就 304，开销可以忽略。
+		w.Header().Set("ETag", logoETag)
+		w.Header().Set("Cache-Control", "no-cache")
+		if strings.Contains(r.Header.Get("If-None-Match"), logoFingerprint) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		w.Header().Set("Content-Type", "image/png")
 		w.Header().Set("Content-Length", fmt.Sprint(len(logoPNG)))
-		w.Header().Set("Cache-Control", "public, max-age=86400")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(logoPNG)
 	})
@@ -103,8 +132,9 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("GET /chat", s.handleChat)
 	m.HandleFunc("GET /chat.main.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
-		w.Header().Set("Content-Length", fmt.Sprint(len(chatMainJS)))
-		_, _ = w.Write(chatMainJS)
+		w.Header().Set("Content-Length", fmt.Sprint(len(chatMainJSServed)))
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write(chatMainJSServed)
 	})
 	m.HandleFunc("POST /api/chat/login", s.apiChatLogin)
 	m.HandleFunc("GET /api/chat/session", s.apiChatSession)
@@ -1724,7 +1754,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 	wantsStream := truthy(body["stream"])
 
 	var decision intent.Result
-	if intent.IsAutoModel(requested) || requested == "" {
+	if isAutoModel(requested, settings) || requested == "" {
 		decision = intent.Decide("/v1/chat/completions", body, requested,
 			autoIntentConfig(settings), s.rules, settings.ModelAliases,
 			pool.ModalityOfModel, "")
@@ -1742,15 +1772,19 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 非文本模态（图片/视频意图）转发到媒体代理
+	// 非文本模态（图片/视频意图）转发到媒体代理。
+	//
+	// 注意这里必须把已经解析好的 body 传过去：readBody 是直接消费 r.Body 的，
+	// 再读一次只会拿到空 map，提示词会丢 —— 那样上游会以「prompt 不能为空」拒绝。
+	// chatShape=true：调用方是对话入口，响应要回译成 chat 形态。
 	if decision.Modality != intent.Text {
-		s.handleChatMediaProxy(w, r)
+		s.serveChatMedia(w, r, body, &decision, true)
 		return
 	}
 
 	// 文本路径：走账号池，无需下游密钥
 	poolClass := "text"
-	if !intent.IsAutoModel(requested) {
+	if !isAutoModel(requested, settings) {
 		poolClass = pool.Classify(requested, body, settings.ModelAliases, settings.DefaultImageTier)
 	}
 
@@ -1764,13 +1798,13 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 	// RequiredModel 必须用「用户请求的模型」而不是 auto 解析出的兜底模型，
 	// 否则调度器会去找声明了兜底模型的账号，把请求错发给不认识该模型的渠道。
 	requiredModel := model
-	if !intent.IsAutoModel(requested) && requested != "" {
+	if !isAutoModel(requested, settings) && requested != "" {
 		requiredModel = requested
 		decision.ModelUsed = requested
 	}
 
 	bodyFor := func(a *config.Account) ([]byte, string) {
-		if intent.IsAutoModel(requested) || requested == "" {
+		if isAutoModel(requested, settings) || requested == "" {
 			manifest := pool.ManifestOf(a, settings)
 			chosen := intent.ChooseModel(manifest.Text, autoIntentConfig(settings).PreferredModels["text"])
 			if chosen == "" {
@@ -1941,22 +1975,74 @@ func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
+	// 控制台「生图 / 生视频」页直接打这个路由：端点即意图，响应保持官方形态。
+	// preDecision 传 nil —— 让 serveChatMedia 自己按端点判定模态。
+	s.serveChatMedia(w, r, body, nil, false)
+}
+
+// chatUpstreamPath 把控制台路由映射回上游路径。
+//
+// 控制台路由带 /api/chat 前缀（用于和裸 /v1 代理区分开），转发给上游时必须摘掉，
+// 否则会拼成 {root}/api/chat/v1/images/generations —— 上游只认
+// {root}/v1/images/generations，实测会 404，或被边缘 WAF 拦成一张 HTML 错误页。
+func chatUpstreamPath(p string) string {
+	if rest, ok := strings.CutPrefix(p, "/api/chat"); ok && strings.HasPrefix(rest, "/") {
+		return rest
+	}
+	return p
+}
+
+// serveChatMedia 是图片 / 视频请求的公共实现。
+//
+// body 由调用方传入而不是在这里 readBody：对话入口（handleChatProxy）已经读过
+// 一次请求体，而 readBody 是直接消费 r.Body 的，再读一次只会拿到空 map。
+//
+// preDecision 非 nil 时直接复用对话入口已经判好的模态。这一条很关键：
+// 对话入口的 URL 是 /v1/chat/completions，若在这里按 URL 重新判定，会被端点
+// 信号强行锁成 text，前面判出来的 image 就白判了。
+//
+// chatShape 决定响应形态：true 时把上游的 images / videos 结构回译成 chat 响应，
+// 让「对话页选 agnes-auto 说一句画图」也能正常出图。
+func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
+	body map[string]any, preDecision *intent.Result, chatShape bool) {
+
 	settings := s.Store.SettingsSnapshot()
 	requested := strings.TrimSpace(asStr(body["model"]))
+	wantsStream := truthy(body["stream"])
 
-	var modality string
-	path := r.URL.Path
-	switch {
-	case strings.HasSuffix(path, "images/generations"):
-		modality = intent.Image
-	case strings.HasSuffix(path, "videos"), strings.Contains(path, "videos/"):
-		modality = intent.Video
-	default:
-		modality = intent.Text
+	path := chatUpstreamPath(r.URL.Path)
+
+	var decision intent.Result
+	if preDecision != nil {
+		decision = *preDecision
+	} else {
+		var modality string
+		switch {
+		case strings.HasSuffix(path, "images/generations"):
+			modality = intent.Image
+		case strings.HasSuffix(path, "videos"), strings.Contains(path, "videos/"):
+			modality = intent.Video
+		default:
+			modality = intent.Text
+		}
+		decision = intent.Decide(path, body, firstNonEmpty(requested, settings.AutoModelName),
+			autoIntentConfig(settings), s.rules, settings.ModelAliases, pool.ModalityOfModel, modality)
 	}
 
-	decision := intent.Decide(path, body, firstNonEmpty(requested, settings.AutoModelName),
-		autoIntentConfig(settings), s.rules, settings.ModelAliases, pool.ModalityOfModel, modality)
+	// 上游路径：对话入口进来时 path 是 /v1/chat/completions，不能拿它去请求
+	// 生图端点，必须按判定出的模态改写；已经指向正确端点的（控制台生图页、
+	// 视频轮询）保持原样。
+	upstreamPath := path
+	switch decision.Modality {
+	case intent.Image:
+		if !strings.Contains(path, "images") {
+			upstreamPath = "/v1/images/generations"
+		}
+	case intent.Video:
+		if !strings.Contains(path, "videos") {
+			upstreamPath = "/v1/videos"
+		}
+	}
 
 	poolClass := ""
 	switch decision.Modality {
@@ -1990,7 +2076,7 @@ func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// 兜底：作为文本处理
 		bodyFor = func(a *config.Account) ([]byte, string) {
-			if intent.IsAutoModel(requested) || requested == "" {
+			if isAutoModel(requested, settings) || requested == "" {
 				manifest := pool.ManifestOf(a, settings)
 				chosen := intent.ChooseModel(manifest.Text, autoIntentConfig(settings).PreferredModels["text"])
 				if chosen == "" {
@@ -2013,10 +2099,11 @@ func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionKey := s.Hub.SessionKey(headerMap(r), "")
-	isIdempotent := strings.HasPrefix(path, "GET /v1/videos/") || strings.Contains(path, "videos/")
+	// 视频轮询（GET /v1/videos/<id>）可安全重试；提交类请求不能。
+	isIdempotent := strings.Contains(upstreamPath, "videos/")
 	opts := relay.Options{
 		SessionKey: sessionKey, PoolClass: poolClass,
-		RequiredModel: model, Method: http.MethodPost, Path: path,
+		RequiredModel: model, Method: http.MethodPost, Path: upstreamPath,
 		BodyFor: bodyFor, Idempotent: isIdempotent,
 	}
 
@@ -2042,5 +2129,62 @@ func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 		return
 	}
+
+	// 对话入口：调用方只认 chat 响应结构，必须回译。
+	// 不回译的话，前端按 choices[0].message.content 取值会拿到空串，
+	// 明明图已经生成好了，界面却显示「（无内容返回）」。
+	if chatShape {
+		s.serveChatShapedMedia(w, decision, result, raw, headers, wantsStream)
+		return
+	}
 	writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+}
+
+// serveChatShapedMedia 把生图 / 生视频的上游结果回译成 chat 响应。
+//
+// 复用与裸 /v1 代理（serveAutoImage / serveAutoVideo）同一套翻译函数，
+// 保证「对话页生图」与「程序化客户端生图」的正文完全一致。
+func (s *Server) serveChatShapedMedia(w http.ResponseWriter, decision intent.Result,
+	result *relay.Result, raw []byte, headers map[string]string, stream bool) {
+
+	if decision.Modality == intent.Video {
+		payload := decodeMap(raw)
+		videoID := extractVideoID(payload)
+		jobID := asStr(payload["job_id"])
+		if jobID == "" {
+			jobID = videoID
+		}
+		jobInfo := map[string]any{"job_id": jobID, "video_id": videoID}
+		if jobID != "" {
+			jobInfo["poll_url"] = "/api/chat/v1/videos/" + jobID
+		}
+		envelope := intent.ChatEnvelope(decision, result.ModelUsed,
+			intent.VideoContent(result.ModelUsed, jobInfo, ""), jobInfo)
+		if meta, ok := envelope["agnes_hub"].(map[string]any); ok {
+			meta["video"] = jobInfo
+			meta["job_id"] = jobID
+			meta["video_id"] = videoID
+		}
+		if stream {
+			s.writeSyntheticSSE(w, envelope, headers)
+			return
+		}
+		writeJSON(w, 200, envelope, headers)
+		return
+	}
+
+	data := decodeMap(raw)
+	items := mapList(data["data"])
+	content, images := intent.ImageContent(items, decision.Prompt.Text)
+	if len(decision.DroppedFields) > 0 {
+		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") +
+			" 未被生图端点接受，已忽略。"
+	}
+	envelope := intent.ChatEnvelope(decision, result.ModelUsed, content,
+		map[string]any{"data": data["data"], "images": images})
+	if stream {
+		s.writeSyntheticSSE(w, envelope, headers)
+		return
+	}
+	writeJSON(w, 200, envelope, headers)
 }

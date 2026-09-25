@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.11"
+var version = "1.0.12"
 
 // releaseRepo 是控制台「版本与自更新」卡片里「查看全部版本」要跳转的 GitHub 仓库
 // （owner/name），非套件版会被自更新仓库覆盖，见 main()。这里是本 DSM 套件分支的仓库：
