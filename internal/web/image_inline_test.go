@@ -80,7 +80,7 @@ func TestLocalizeImageURLConservativeFallbacks(t *testing.T) {
 		{"HTML 响应不本地化", htmlPage.URL + "/a.png"},
 		{"上游 404 时退回原地址", notFound.URL + "/a.png"},
 	} {
-		if got := s.localizeImageURL(context.Background(), c.in); got != c.in {
+		if got := s.localizeImageURL(context.Background(), c.in, ""); got != c.in {
 			t.Errorf("%s：localizeImageURL(%q) = %q，期望原样返回", c.name, c.in, got)
 		}
 	}
@@ -90,7 +90,7 @@ func TestLocalizeImageURLConservativeFallbacks(t *testing.T) {
 		{"正常图片落盘", normal.URL + "/a.png"},
 		{"Content-Type 不可信时按魔数兜底", octet.URL + "/a.png"},
 	} {
-		got := s.localizeImageURL(context.Background(), c.in)
+		got := s.localizeImageURL(context.Background(), c.in, "")
 		m := localImageRe.FindStringSubmatch(got)
 		if m == nil {
 			t.Fatalf("%s：应返回本地图片地址，实际 %q", c.name, got)
@@ -118,8 +118,8 @@ func TestLocalizeImageURLDeduplicates(t *testing.T) {
 	defer srv.Close()
 
 	s := &Server{Store: newTempStore(t)}
-	first := s.localizeImageURL(context.Background(), srv.URL+"/a.png")
-	second := s.localizeImageURL(context.Background(), srv.URL+"/b.png")
+	first := s.localizeImageURL(context.Background(), srv.URL+"/a.png", "")
+	second := s.localizeImageURL(context.Background(), srv.URL+"/b.png", "")
 	if first != second {
 		t.Errorf("同一内容应得到同一地址，实际 %q vs %q", first, second)
 	}
@@ -213,7 +213,8 @@ func TestChatImageIsLinkedLocally(t *testing.T) {
 	}
 
 	content := chatContent(t, body)
-	if !strings.Contains(content, "]("+imageKind.route) {
+	// 地址是绝对的（外部客户端需要），所以只断言含本地路由而非以它开头
+	if !strings.Contains(content, "](") || !strings.Contains(content, imageKind.route) {
 		t.Errorf("Markdown 图片应指向本地地址，实际：%q", truncateStr(content, 300))
 	}
 	if strings.Contains(content, upstream) {
@@ -229,7 +230,7 @@ func TestChatImageIsLinkedLocally(t *testing.T) {
 		t.Fatalf("响应缺少 images[]：%v", body)
 	}
 	first, _ := imgs[0].(map[string]any)
-	if u, _ := first["url"].(string); !strings.HasPrefix(u, imageKind.route) {
+	if u, _ := first["url"].(string); !strings.Contains(u, imageKind.route) {
 		t.Errorf("images[0].url 应为本地地址，实际 %q", truncateStr(u, 120))
 	}
 }
@@ -268,7 +269,7 @@ func TestWebImageTabGetsLocalURL(t *testing.T) {
 	}
 	first, _ := data[0].(map[string]any)
 	u, _ := first["url"].(string)
-	if !strings.HasPrefix(u, imageKind.route) {
+	if !strings.Contains(u, imageKind.route) {
 		t.Errorf("网页生图页的 data[0].url 应为本地地址，实际 %q", truncateStr(u, 120))
 	}
 }

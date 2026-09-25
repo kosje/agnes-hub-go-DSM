@@ -314,42 +314,152 @@ type Prompt struct {
 	Images []string
 }
 
+// contentWrapperTags 是「里面包着用户真实输入」的标签。
+//
+// 与框架注入块相反：这些标签的内容要取出来，标签本身丢掉。
+var contentWrapperTags = []string{"user_query", "query", "question", "input", "text", "prompt"}
+
+// metaInjectionTags 是已知的框架注入块标签。
+//
+// 只在「标签没闭合」时作为兜底用（客户端可能把内容截断）；正常闭合的块由
+// stripLeadingTagBlock 按通用规则剥掉，不依赖这份清单 —— 各家客户端的框架块
+// 名字五花八门，枚举必然漏。
+var metaInjectionTags = []string{
+	"craft_mode", "system-reminder", "system_reminder", "user_info",
+	"additional-data", "additional_data", "memory", "task-notification",
+	"hook", "user-prompt-submit-hook", "instructions_for_visualizer",
+}
+
+// cleanUserText 从一条 role=user 的消息里取出「用户真正说的话」。
+//
+// 返回空串表示这条消息整条都是框架注入，调用方应继续往前找。
+//
+// 为什么必须有这一步：AI 客户端会在对话尾部追加自己的框架块
+// （`<craft_mode>` / `<system-reminder>` / `<user_info>` …），它们同样以
+// role=user 出现。直接取「最后一条 user」就会把框架指令当成提示词 ——
+// 实测：用户说「帮我画一张水墨国风佳人图片」，网关却拿
+// "<craft_mode>You are now in Agent mode…" 去生图，用户的原话根本没送出去。
+//
+// 只剥**开头**的标签块，不做全文删除：用户完全可能问「把 <div>foo</div> 居中」，
+// 全文删标签会把代码片段一起吃掉。
+func cleanUserText(s string) string {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return ""
+	}
+	// 交替做两件事，直到不再变化：
+	//   1. 拆开「包着真实输入」的包装标签（<user_query>…</user_query>）
+	//   2. 剥掉开头的框架注入块（<craft_mode>…</craft_mode>）
+	// 顺序必须是「先拆包装、再剥框架」—— 反过来会把 <user_query> 当成普通
+	// 框架块整段删掉，用户的真实输入就丢了。
+	// 迭代次数给个上限，避免畸形输入把这里转成死循环。
+	for i := 0; i < 8; i++ {
+		changed := false
+		for _, tag := range contentWrapperTags {
+			if inner, ok := unwrapTag(t, tag); ok {
+				t = inner
+				changed = true
+				break
+			}
+		}
+		if next, ok := stripLeadingTagBlock(t); ok {
+			t = next
+			changed = true
+		}
+		if !changed || t == "" {
+			break
+		}
+	}
+	if t == "" {
+		return ""
+	}
+	// 兜底：开头是已知框架块但没闭合（被客户端截断的情况），整条丢弃
+	for _, tag := range metaInjectionTags {
+		if strings.HasPrefix(t, "<"+tag+">") || strings.HasPrefix(t, "<"+tag+" ") {
+			return ""
+		}
+	}
+	return t
+}
+
+// unwrapTag 当 s 恰好是 <tag>…</tag> 包起来的整体时，返回内层内容。
+func unwrapTag(s, tag string) (string, bool) {
+	open, close := "<"+tag+">", "</"+tag+">"
+	if !strings.HasPrefix(s, open) || !strings.HasSuffix(s, close) {
+		return "", false
+	}
+	inner := strings.TrimSpace(s[len(open) : len(s)-len(close)])
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
+}
+
+// stripLeadingTagBlock 若 s 以 <tag>…</tag> 开头则剥掉该块。
+//
+// 手写而不用正则：Go 的 RE2 不支持反向引用，`<(tag)>…</\1>` 这种写法匹配不了
+// 成对标签，只能自己找闭合标签。
+func stripLeadingTagBlock(s string) (string, bool) {
+	if !strings.HasPrefix(s, "<") {
+		return s, false
+	}
+	end := strings.IndexByte(s, '>')
+	if end < 0 {
+		return s, false
+	}
+	tag := s[1:end]
+	if tag == "" || strings.HasPrefix(tag, "/") {
+		return s, false
+	}
+	for i := 0; i < len(tag); i++ {
+		c := tag[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-'
+		if !ok {
+			return s, false
+		}
+	}
+	close := "</" + tag + ">"
+	j := strings.Index(s, close)
+	if j < 0 {
+		return s, false
+	}
+	return strings.TrimSpace(s[j+len(close):]), true
+}
+
 // ExtractPrompt 提取提示词与输入图（后者的用户是图生图 / 图生视频）。
+//
+// 取「最后一条真正带用户输入的 user 消息」：框架注入块要跳过（见 cleanUserText），
+// 一条都找不到时退回最后一条 user 的原文，避免把提示词彻底取空。
 func ExtractPrompt(body map[string]any) Prompt {
 	var texts, images []string
 	if msgs := asMessages(body["messages"]); len(msgs) > 0 {
+		fallbackText := ""
 		for i := len(msgs) - 1; i >= 0; i-- {
 			msg := msgs[i]
 			if asString(msg["role"]) != "user" {
 				continue
 			}
-			switch content := msg["content"].(type) {
-			case string:
-				texts = append(texts, content)
-			case []any:
-				for _, rawPart := range content {
-					part, ok := rawPart.(map[string]any)
-					if !ok {
-						continue
-					}
-					switch asString(part["type"]) {
-					case "text", "input_text":
-						if t := asString(part["text"]); t != "" {
-							texts = append(texts, t)
-						}
-					case "image_url", "input_image":
-						switch v := part["image_url"].(type) {
-						case string:
-							images = append(images, strings.TrimSpace(v))
-						case map[string]any:
-							if u := strings.TrimSpace(asString(v["url"])); u != "" {
-								images = append(images, u)
-							}
-						}
-					}
-				}
+			text, imgs := messageContent(msg["content"])
+			if text == "" && len(imgs) == 0 {
+				continue
 			}
+			if fallbackText == "" {
+				fallbackText = text
+			}
+			clean := cleanUserText(text)
+			if clean == "" && len(imgs) == 0 {
+				// 整条都是框架注入，继续往前找用户真正说的话
+				continue
+			}
+			if clean != "" {
+				texts = append(texts, clean)
+			}
+			images = append(images, imgs...)
 			break
+		}
+		if len(texts) == 0 && len(images) == 0 && fallbackText != "" {
+			texts = append(texts, fallbackText)
 		}
 	}
 	if len(texts) == 0 {
@@ -375,6 +485,44 @@ func ExtractPrompt(body map[string]any) Prompt {
 		}
 	}
 	return Prompt{Text: strings.TrimSpace(strings.Join(texts, "\n")), Images: images}
+}
+
+// messageContent 从一条消息的 content 里取出文本与输入图。
+//
+// content 有两种合法形态：纯字符串，或 [{type:"text"|"image_url", …}] 的分片数组。
+func messageContent(content any) (string, []string) {
+	var texts, images []string
+	switch c := content.(type) {
+	case string:
+		if t := strings.TrimSpace(c); t != "" {
+			texts = append(texts, t)
+		}
+	case []any:
+		for _, rawPart := range c {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch asString(part["type"]) {
+			case "text", "input_text":
+				if t := strings.TrimSpace(asString(part["text"])); t != "" {
+					texts = append(texts, t)
+				}
+			case "image_url", "input_image":
+				switch v := part["image_url"].(type) {
+				case string:
+					if u := strings.TrimSpace(v); u != "" {
+						images = append(images, u)
+					}
+				case map[string]any:
+					if u := strings.TrimSpace(asString(v["url"])); u != "" {
+						images = append(images, u)
+					}
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(texts, "\n")), images
 }
 
 // videoNounRe / imageNounRe / generateVerbRe 用于组合信号判定。

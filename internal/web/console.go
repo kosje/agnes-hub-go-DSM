@@ -1203,6 +1203,7 @@ func applySettings(st *config.Settings, p map[string]any) {
 	// 0 = 不限制。注意 Settings 里刻意没有给这个字段做 normalize 兜底，
 	// 否则「显式关掉上限」会被默认值覆盖回去。
 	i("video_cache_max_mb", &st.VideoCacheMaxMB)
+	s2("public_base_url", &st.PublicBaseURL)
 
 	// chat_password is handled separately in apiSetSettings to avoid accessing s here
 	i("retry_max", &st.RetryMax)
@@ -2194,7 +2195,7 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 	if m, ok := payload.(map[string]any); ok {
 		if inlineImages && decision.Modality == intent.Image {
 			if items := mapList(m["data"]); len(items) > 0 {
-				m["data"] = toAnySlice(s.localizeImageURLs(r.Context(), items))
+				m["data"] = toAnySlice(s.localizeImageURLs(r.Context(), items, publicBaseURL(r, settings)))
 			}
 		}
 		// 网页端就是靠这个 job_id 去轮询 /api/chat/v1/videos/<id>。
@@ -2241,6 +2242,7 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 		s.deny(w)
 		return
 	}
+	settings := s.Store.SettingsSnapshot()
 	id := strings.TrimSpace(r.PathValue("job_id"))
 	job, ok := s.Store.JobByID(id)
 	if !ok {
@@ -2287,7 +2289,7 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 		// 把上游产出取回本地：浏览器不一定够得到上游的 CDN 地址，直接塞进
 		// <video src> 可能是个转不动的播放器。顺带也就做了长期缓存 ——
 		// 体积有 VideoCacheMaxMB 兜底，不会把 NAS 填满。
-		job.URL = s.localizeVideoURL(r.Context(), url)
+		job.URL = s.localizeVideoURL(r.Context(), url, publicBaseURL(r, settings))
 		s.Store.PutJob(job)
 		out["status"] = "completed"
 		out["video_url"] = job.URL
@@ -2331,6 +2333,7 @@ func toAnySlice(items []map[string]any) []any {
 func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, decision intent.Result,
 	result *relay.Result, raw []byte, headers map[string]string, stream bool, job *config.VideoJob) {
 
+	settings := s.Store.SettingsSnapshot()
 	if decision.Modality == intent.Video {
 		payload := decodeMap(raw)
 		videoID := extractVideoID(payload)
@@ -2361,7 +2364,7 @@ func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, de
 	items := mapList(data["data"])
 	// 回取上游图片落盘，换成本地地址 —— ImageContent 会把它拼进 Markdown，
 	// 前端 renderMarkdown 放行相对路径，于是浏览器直接向本机要图。
-	items = s.localizeImageURLs(r.Context(), items)
+	items = s.localizeImageURLs(r.Context(), items, publicBaseURL(r, settings))
 	content, images := intent.ImageContent(items, decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") +

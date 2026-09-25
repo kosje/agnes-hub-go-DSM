@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"agneshub/internal/config"
 )
 
 // ---------------------------------------------------------------------------
@@ -280,10 +282,53 @@ func (s *Server) saveMediaBytes(k mediaKind, data []byte, mime string) (string, 
 	return k.route + name, true
 }
 
+// publicBaseURL 推导「客户端能访问到的」基地址（形如 http://nas:4142）。
+//
+// 为什么必须给外部客户端绝对地址：网关自己网页里的 /api/chat/images/xxx.png 是
+// 相对地址，靠页面的 origin 解析；而 AI 客户端（WorkBuddy / Cherry Studio …）拿到的
+// 是一段 Markdown，没有任何基准可以解析这个相对路径 —— 图片必然加载失败，客户端
+// 只能退化成显示 alt 文本（实测用户看到的就是一串莫名其妙的提示词）。
+//
+// 优先用显式配置；否则按请求头推断 —— 走反向代理时 r.Host 可能是内网地址，
+// 所以先看 X-Forwarded-*。
+func publicBaseURL(r *http.Request, settings config.Settings) string {
+	if s := strings.TrimSpace(settings.PublicBaseURL); s != "" {
+		return strings.TrimRight(s, "/")
+	}
+	if r == nil {
+		return ""
+	}
+	host := firstHeaderValue(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		return ""
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := firstHeaderValue(r.Header.Get("X-Forwarded-Proto")); p != "" {
+		scheme = strings.ToLower(p)
+	}
+	return scheme + "://" + host
+}
+
+// firstHeaderValue 取逗号分隔头里的第一个值（代理链会追加多个）。
+func firstHeaderValue(v string) string {
+	v = strings.TrimSpace(v)
+	if i := strings.IndexByte(v, ','); i >= 0 {
+		v = strings.TrimSpace(v[:i])
+	}
+	return v
+}
+
 // localizeMediaURL 把上游地址换成「先落盘、再返回本地地址」。
 //
+// base 非空时返回绝对地址（外部客户端需要），否则返回相对路径（网关自己的网页够用）。
 // 已是本地地址、已是 data URI、非 http(s)、或取回失败时原样返回入参。
-func (s *Server) localizeMediaURL(ctx context.Context, k mediaKind, raw string) string {
+func (s *Server) localizeMediaURL(ctx context.Context, k mediaKind, raw, base string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.HasPrefix(raw, k.route) || strings.HasPrefix(raw, "data:") {
 		return raw
@@ -295,26 +340,29 @@ func (s *Server) localizeMediaURL(ctx context.Context, k mediaKind, raw string) 
 	if !ok {
 		return raw
 	}
-	return local
+	if base == "" {
+		return local
+	}
+	return base + local
 }
 
 // localizeImageURL 把上游图片地址本地化。
-func (s *Server) localizeImageURL(ctx context.Context, raw string) string {
-	return s.localizeMediaURL(ctx, imageKind, raw)
+func (s *Server) localizeImageURL(ctx context.Context, raw, base string) string {
+	return s.localizeMediaURL(ctx, imageKind, raw, base)
 }
 
 // localizeVideoURL 把上游视频地址本地化。
 //
 // 与图片同源，但走 videoKind：上限 200 MB、超时 5 分钟、扩展名优先按 URL 后缀定。
-func (s *Server) localizeVideoURL(ctx context.Context, raw string) string {
-	return s.localizeMediaURL(ctx, videoKind, raw)
+func (s *Server) localizeVideoURL(ctx context.Context, raw, base string) string {
+	return s.localizeMediaURL(ctx, videoKind, raw, base)
 }
 
 // localizeImageURLs 对生图结果逐条做本地化，返回新切片。
 //
 // 返回新切片、不改动入参：入参还要按「官方形态」原样回给程序化客户端
 // （那些客户端要的是真实的上游地址，不是我们本地的缓存路径）。
-func (s *Server) localizeImageURLs(ctx context.Context, items []map[string]any) []map[string]any {
+func (s *Server) localizeImageURLs(ctx context.Context, items []map[string]any, base string) []map[string]any {
 	if len(items) == 0 {
 		return items
 	}
@@ -326,7 +374,7 @@ func (s *Server) localizeImageURLs(ctx context.Context, items []map[string]any) 
 		}
 		// 只处理字符串型 url：上游偶尔会回 null 或对象，交给下游按原样处理即可。
 		if u, ok := clone["url"].(string); ok {
-			clone["url"] = s.localizeImageURL(ctx, u)
+			clone["url"] = s.localizeImageURL(ctx, u, base)
 		}
 		// 上游有时只回 b64_json 不回 url。落盘一份本地地址，正文里就不必内联
 		// 那一大串 base64 了（ImageContent 对 b64_json 是直接拼 data URI 的）。
@@ -334,7 +382,7 @@ func (s *Server) localizeImageURLs(ctx context.Context, items []map[string]any) 
 			if b64, ok := clone["b64_json"].(string); ok && strings.TrimSpace(b64) != "" {
 				if data, err := decodeBase64Loose(b64); err == nil {
 					if local, ok := s.saveMediaBytes(imageKind, data, ""); ok {
-						clone["url"] = local
+						clone["url"] = base + local
 					}
 				}
 			}
@@ -433,17 +481,18 @@ func validMediaName(k mediaKind, name string) bool {
 
 // handleChatMedia 回放本地落盘的产出。
 //
-// 需要对话页或管理员会话 —— 文件名虽然不可猜（128 位），但把接口完全敞开
-// 会让任何能访问到端口的人都拿到用户生成过的内容。
+// 刻意**不做会话鉴权**：文件名是内容的 sha256 前 16 字节（128 位），既不可枚举
+// 也不可猜测 —— 这是一个 capability URL，与 S3 预签名链接同一类做法。
+//
+// 之所以必须放开：外部 AI 客户端拿到的只是正文里的一段地址，它没有、也不可能
+// 带上网关的会话 cookie；一旦要求登录，客户端里就永远是一张裂图（实测如此）。
+// 这与 /api/chat/v1/* 那批生成接口的信任模型是一致的 —— 那些接口本来就免鉴权，
+// 而且危害更大（能直接消耗账号配额），媒体回放只是读一份已经生成好的文件。
 //
 // 用 http.ServeContent 而不是自己 io.Copy：它自带 Range 支持，
 // 视频才能拖动进度条、断点续传。
 func (s *Server) handleChatMedia(k mediaKind) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.authedOrChat(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
 		name := r.PathValue("name")
 		if !validMediaName(k, name) {
 			http.Error(w, "not found", http.StatusNotFound)
