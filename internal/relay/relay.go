@@ -292,7 +292,6 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		timeoutMS = 30000 // 默认 30s
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
-	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
 	if err != nil {
@@ -313,6 +312,7 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	resp, err := client.Do(req)
 	if err != nil {
 		<-sem
+		cancel()
 		h.NoteError(account, fmt.Sprintf("%T: %v", err, err))
 		h.Metrics.RequestsError.Add(1)
 		return &Result{
@@ -322,14 +322,15 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
 		}, true, nil
 	}
-	defer resp.Body.Close() // P1 修复：确保 body 关闭（原代码只在错误路径 close，成功路径依赖调用方）
 
 	status := resp.StatusCode
 
 	if status == 402 {
 		// 402 Payment Required：额度耗尽，不熔断（等待复活即可），但记录错误不重试
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
 		<-sem
+		cancel()
 		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
 		h.Metrics.RequestsError.Add(1)
 		return &Result{
@@ -340,7 +341,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	if AuthFailStatus[status] { // 401 / 403
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
 		<-sem
+		cancel()
 		h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
 		return &Result{
 			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
@@ -350,8 +353,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	if status == http.StatusTooManyRequests {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
+		resp.Body.Close()
 		<-sem
+		cancel()
 		h.OnRateLimited(account, opts.PoolClass)
 		return &Result{
 			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
@@ -361,8 +365,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	if RetryableStatus[status] {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		_ = resp.Body.Close()
+		resp.Body.Close()
 		<-sem
+		cancel()
 		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
 		return &Result{
 			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
@@ -370,8 +375,12 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		}, true, nil
 	}
 
-	// 交给调用方消费：包一层以便在关闭时释放并发信号量
+	// 交给调用方消费：包一层以便在关闭时释放并发信号量并取消 context。
+	// 注意：成功路径【绝不】在此提前关闭 body 或取消 reqCtx，否则调用方读取 body 时
+	// 连接已关闭 / context 已取消，会读到空体（表现为网关回 {}）。
+	// 直到调用方读完 body 触发 Close()，才在此 release 里 cancel()。
 	wrapped := &releaseOnClose{ReadCloser: resp.Body, release: func() {
+		cancel() // body 读取完毕后才取消 context
 		select {
 		case <-sem:
 		default:
