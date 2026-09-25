@@ -2,15 +2,15 @@
   "packages": [
     {
       "package": "agnes-hub",
-      "version": "1.0.16",
+      "version": "1.0.17",
       "dname": "Agnes Hub",
       "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生 / 生图 / 生视频；FIFO 严格节拍限流、软粘性溢出、二维自适应校准、熔断自动复活。数据保存在套件目录内，全 JSON 文件，免 SSH 即可备份迁移。",
       "price": 0,
       "download_count": 0,
       "recent_download_count": 0,
-      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-armv8-1.0.16.spk",
-      "size": 3880960,
-      "md5": "c49534afddaba3d775dda220d24722b6",
+      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-armv8-1.0.17.spk",
+      "size": 3891200,
+      "md5": "feb8d932027ad5431c38b741d744641d",
       "thumbnail": [
         "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-72.png"
       ],
@@ -30,7 +30,7 @@
       "distributor": "kosje",
       "distributor_url": "https://github.com/kosje/agnes-hub-go-DSM",
       "support_url": "https://github.com/kosje/agnes-hub-go-DSM/issues",
-      "changelog": "【1.0.16】<br>· 【重要】修复在 AI 客户端里生图「不出图、只显示一串莫名其妙的文字」：<br>  · 提示词取错 —— 客户端会在对话尾部追加自己的框架块（&lt;craft_mode&gt; 等），它们同样是 role=user，网关把框架指令当成了用户的话，用户原话根本没发给上游<br>  · 图片地址是相对路径 —— 只有网关自己的网页能解析，外部客户端必然加载失败，只能退化成显示图片的 alt 文本<br>· 生成的图片/视频改为返回绝对地址；新增「对外访问地址」设置项（留空按请求 Host 自动推断，走反向代理时建议显式填写）<br>· 媒体回放接口改为免鉴权（文件名是内容的 128 位指纹，属 capability URL）—— 外部客户端不可能带上网关的会话 cookie，要求登录就等于永远裂图<br><br>【1.0.15】<br>· 生成的视频改为落盘保存，聊天窗口与「视频任务」页播放本地副本<br>· 视频缓存按「条数 + 总字节」双重淘汰，默认上限 2 GB<br>· 视频回放支持 Range 请求，进度条可拖动、可断点续传<br><br>【1.0.14】<br>· 【重要】修复生视频一直报 400「mode is required」<br>· 【重要】视频请求体按模型家族分两套口径（2.5 与 v2.0 参数互不兼容）<br>· 修复 JSON 数组型字段被静默丢弃（\"images\": [\"https://...\"] 发不出去）<br><br>【1.0.13】<br>· 版本号规则改为纯 x.y.z：发新版直接 +1，不再带 -0001 构建号<br>· 生成的图片改为落盘保存，聊天窗口显示本地链接<br>· 【重要】修复生视频链路：提交返回本地 job_id；查询改走上游真正的查询接口<br>· 上游错误信息不再只剩一个 HTTP 400<br>· 新增控制台「向上游拉取可用模型」；「查看全部版本」改为 GitHub 徽标链接<br>· 清理旧品牌标识（升级后需重新登录一次控制台）<br><br>【1.0.12-0002 / 1.0.12-0001】<br>· 【重要】修复生图打不通（/api/chat 前缀没摘）与 agnes-auto 不被识别为 auto<br>· 控制台品牌改为 Agnes Hub；修复网页顶栏 logo 升级后不更新",
+      "changelog": "【1.0.17】<br>· 重排控制台「视频任务」页：长 job_id/video_id 收成「前 8…后 4」并支持点击复制，表格不再横向溢出、列不再挤到折行<br>· 「承载账号」直接显示账号名（原来只有一串 acc_ 开头的 ID）<br>· 新增「补取」按钮：本地落盘功能上线前完成的任务没有本地副本，点一下即可回上游取回并落盘<br>· 修正「播放」按钮的判断 —— 1.0.16 起地址改为绝对地址，原判断会误报「没有本地副本」<br><br>【1.0.16】<br>· 【重要】修复在 AI 客户端里生图「不出图、只显示一串莫名其妙的文字」：提示词被取成客户端自己的框架块（&lt;craft_mode&gt; 等），且图片地址是相对路径客户端无法解析<br>· 生成的图片/视频改为返回绝对地址；新增「对外访问地址」设置项<br>· 媒体回放接口改为免鉴权（文件名是内容的 128 位指纹）<br><br>【1.0.15】<br>· 生成的视频改为落盘保存，聊天窗口与「视频任务」页播放本地副本<br>· 视频缓存按「条数 + 总字节」双重淘汰，默认上限 2 GB<br>· 视频回放支持 Range 请求，进度条可拖动、可断点续传<br><br>【1.0.14】<br>· 【重要】修复生视频一直报 400「mode is required」<br>· 【重要】视频请求体按模型家族分两套口径（2.5 与 v2.0 参数互不兼容）<br>· 修复 JSON 数组型字段被静默丢弃（\"images\": [\"https://...\"] 发不出去）<br><br>【1.0.13】<br>· 版本号规则改为纯 x.y.z：发新版直接 +1，不再带 -0001 构建号<br>· 生成的图片改为落盘保存，聊天窗口显示本地链接<br>· 【重要】修复生视频链路：提交返回本地 job_id；查询改走上游真正的查询接口<br>· 上游错误信息不再只剩一个 HTTP 400<br>· 新增控制台「向上游拉取可用模型」；「查看全部版本」改为 GitHub 徽标链接<br>· 清理旧品牌标识（升级后需重新登录一次控制台）<br><br>【1.0.12-0002 / 1.0.12-0001】<br>· 【重要】修复生图打不通（/api/chat 前缀没摘）与 agnes-auto 不被识别为 auto<br>· 控制台品牌改为 Agnes Hub；修复网页顶栏 logo 升级后不更新",
       "thirdparty": true,
       "category": 0,
       "subcategory": 0,
