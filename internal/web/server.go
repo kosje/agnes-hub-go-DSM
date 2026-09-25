@@ -11,10 +11,12 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +43,11 @@ type Server struct {
 	// 由 main 注入。套件版禁用了自更新，这里指向套件自己的 Release 仓库；
 	// 自更新开启时指向自更新仓库，保证链接与「立即更新」实际会拉取的来源一致。
 	ReleaseRepo string
+	// SuiteManaged 表示二进制由外部包管理器（群晖套件中心等）负责升级，
+	// 必须禁止进程内替换自身。注意它只关掉「应用更新」——
+	// 「查最新版本号」是只读的，仍然保留，否则控制台的
+	// 「最新版本 / 发布时间」永远只能显示「—」。
+	SuiteManaged bool
 	// intentCache 缓存 auto 路径的意图判定（body 哈希 + 规则指纹 → 结论）。
 	// 仅 handleTextish 命中 auto 模型时读写；显式模型名、媒体端点均不走。
 	intentCache *intent.Cache
@@ -62,6 +69,10 @@ func (s *Server) SetUpdater(u *updater.Updater) { s.Updater = u }
 
 // SetReleaseRepo 注入控制台「查看全部版本」要跳转的仓库（owner/name）。
 func (s *Server) SetReleaseRepo(repo string) { s.ReleaseRepo = repo }
+
+// SetSuiteManaged 声明二进制由外部包管理器管理（群晖套件中心等）。
+// 只关闭「应用更新」，不影响「查最新版本」。
+func (s *Server) SetSuiteManaged(v bool) { s.SuiteManaged = v }
 
 // Updater 返回当前 updater 实例（测试用）。
 func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
@@ -211,6 +222,94 @@ func autoIntentConfig(s config.Settings) intent.Config {
 		VideoWaitSec:     s.AutoIntent.VideoWaitSec,
 		PreferredModels:  s.AutoIntent.PreferredModels,
 	}
+}
+
+// maxFetchedImageBytes 是服务端回取图片的大小上限。
+//
+// 超过就退回原始 URL：一张几十 MB 的图转成 base64 会把聊天记录（全 JSON 存储）
+// 瞬间撑爆，得不偿失。实测上游生图产出普遍在 1~3 MB，6 MB 足够覆盖 1K~4K。
+const maxFetchedImageBytes = 6 << 20
+
+// imageFetchClient 专用于回取上游图片。
+//
+// 刻意与 relay.BuildClient() 分开：那个客户端把 CheckRedirect 设成
+// http.ErrUseLastResponse（要把上游的 302 原样透给调用方），而 CDN 的图片地址
+// 经常就是 302 到真正的存储节点 —— 用它取图必然拿不到内容。
+var imageFetchClient = &http.Client{Timeout: 30 * time.Second}
+
+// fetchImageDataURI 服务端把上游图片拉回来，转成 base64 data URI。
+//
+// 为什么必须由服务端回取：上游返回的 url 往往带鉴权、或落在浏览器够不到的 CDN 上，
+// 直接写进 Markdown 只会渲染成一个裂图（实测就是如此：正文是
+// ![画一幅山水画](https://...) 但浏览器加载不出来）。
+// 由服务端取回再以 base64 内联，浏览器零依赖即可显示，也不受跨域 / 鉴权影响。
+//
+// 任何一步失败都原样返回入参 —— 宁可退化成裂图，也不能让整个响应挂掉。
+func (s *Server) fetchImageDataURI(ctx context.Context, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "data:") {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return raw
+	}
+	fctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(fctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return raw
+	}
+	resp, err := imageFetchClient.Do(req)
+	if err != nil {
+		return raw
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return raw
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchedImageBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxFetchedImageBytes {
+		return raw
+	}
+	mime := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = strings.TrimSpace(mime[:i])
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		// 上游常常把 Content-Type 写成 application/octet-stream，
+		// 用魔数兜底，避免 data URI 的 MIME 不对导致浏览器不渲染。
+		mime = http.DetectContentType(data)
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		return raw
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// inlineImageDataURIs 把生图结果里的 url 换成服务端回取的 base64 data URI。
+//
+// 返回新切片，不改动入参 —— 入参还要按「官方形态」回给程序化客户端，
+// 那些客户端要的是真实的上游地址，不是几 MB 的 data URI。
+func (s *Server) inlineImageDataURIs(ctx context.Context, items []map[string]any) []map[string]any {
+	if len(items) == 0 {
+		return items
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		clone := make(map[string]any, len(item)+1)
+		for k, v := range item {
+			clone[k] = v
+		}
+		// 只处理字符串型 url：上游偶尔会回 null 或对象，交给下游按原样处理即可。
+		if u, ok := clone["url"].(string); ok {
+			if u = strings.TrimSpace(u); u != "" {
+				clone["url"] = s.fetchImageDataURI(ctx, u)
+			}
+		}
+		out = append(out, clone)
+	}
+	return out
 }
 
 // isAutoModel 判断模型名是否表示「让网关决定」。
@@ -812,7 +911,11 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 		return
 	}
 
-	content, images := intent.ImageContent(items, decision.Prompt.Text)
+	// 走到这里说明 chatShape=true，调用方是对话形态的客户端（对话页 / 带 messages
+	// 或 stream 的调用方），正文按 Markdown 渲染 —— 图片必须由服务端回取成 base64
+	// 内联，否则正文里那行 ![prompt](https://...) 在浏览器里只会显示成裂图。
+	// 注意上面对 imgJob.URL 用的是原始 items，聊天记录里保留上游地址（体积小）。
+	content, images := intent.ImageContent(s.inlineImageDataURIs(r.Context(), items), decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") + " 未被生图端点接受，已忽略。"
 	}
@@ -1211,7 +1314,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 				return
 			}
 			s.Store.ChargeKey(item.Key)
-			writeSSEComment(w, flusher, fmt.Sprintf("baiPiao-hub account=%s wait_ms=%d attempts=%d model=%s",
+			writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub account=%s wait_ms=%d attempts=%d model=%s",
 				safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
 			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
 			result.Close()
