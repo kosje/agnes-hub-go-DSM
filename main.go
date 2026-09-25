@@ -93,8 +93,7 @@ func main() {
 
 	// 初始化自更新器
 	exe, _ := os.Executable()
-	// 检查频率：12 小时。自更新是「有就换」，没必要更勤；
-	// 控制台上也可以随时手动点「检查更新」。
+	// 检查频率：12 小时。自更新是「有就换」，没必要更勤。
 	updRepo, checkInterval := "my788525/agnes-hub-go", 12*time.Hour
 	// 控制台「查看全部版本」的跳转目标：默认用套件仓库，自更新开着时跟随自更新仓库，
 	// 否则用户点进去看到的版本跟「立即更新」能装上的版本会对不上。
@@ -102,10 +101,12 @@ func main() {
 	if *noSelfUpdate {
 		// 群晖套件等场景：二进制由套件中心管理，套件 INFO 里登记了 package.tgz 的 checksum。
 		// 若允许进程内替换二进制，套件的「实际内容」与「已安装版本」就会不一致，
-		// 下次套件中心校验或升级必然冲突 —— 所以这里彻底关掉检查，而不是只忽略检查结果。
-		updRepo, checkInterval = "", 0
-	} else {
-		relRepo = updRepo
+		// 下次套件中心校验或升级必然冲突 —— 所以应用更新必须关掉。
+		//
+		// 但「查最新版本号」是只读的、没有任何副作用，必须保留：控制台要如实显示
+		// 「最新版本 / 发布时间 / 是否已是最新」，否则这三格永远是一片「—」，
+		// 用户根本不知道有没有新版。所以这里仍然配 releaseRepo，只是标记为套件托管。
+		updRepo = releaseRepo
 	}
 	updCfg := updater.Config{
 		Repo:          updRepo,
@@ -115,8 +116,17 @@ func main() {
 	}
 	upd := updater.New(updCfg, version, exe, nil)
 	srv.SetUpdater(upd)
+	srv.SetSuiteManaged(*noSelfUpdate)
 	srv.SetReleaseRepo(relRepo)
 	upd.StartBackground(ctx, checkInterval)
+
+	// 启动后立刻查一次：StartBackground 要等一个周期（12h）才首次检查，
+	// 控制台的「最新版本 / 发布时间」会空很久。
+	go func() {
+		if _, err := upd.Check(ctx); err != nil {
+			log.Printf("检查更新失败：%v", err)
+		}
+	}()
 
 	// 应用完更新后要真的退出：光置一个标志位没人看，
 	// 必须有人把它翻译成取消信号，进程才会走到优雅关闭。
@@ -206,7 +216,7 @@ func main() {
 		cancel()
 		wg.Wait()
 	}
-	fmt.Println("baiPiao-hub 已停止。")
+	fmt.Println("Agnes Hub 已停止。")
 }
 
 // buildListeners 按平台拆分到 listener_linux.go / listener_other.go：

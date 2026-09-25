@@ -871,17 +871,17 @@ function viewAbout(){
   <div class="card">
     <h2>版本与自更新</h2>
     <div class="muted" style="margin-bottom:12px" id="updDesc">
-      程序会定时向本项目的 GitHub Releases 查询新版本，也可以在这里手动检查、立即更新。
-      更新包只从本仓库的 release 下载，并做尺寸与可执行文件魔数校验，
-      防止把一页错误信息当成新版本换上。
+      进入本页会自动向本项目的 GitHub Releases 查询一次最新版本，并显示版本号与发布时间。
     </div>
     <div class="grid g4" id="updKpi"></div>
     <div id="updBox" style="margin-top:12px"></div>
     <div class="row" style="margin-top:12px">
-      <button class="sm" id="btnChk">检查更新</button>
-      <button class="sm primary" id="btnApply">立即更新</button>
-      <a class="muted" style="font-size:12px" target="_blank" rel="noopener noreferrer"
-         id="lnkReleases" href="https://github.com/kosje/agnes-hub-go-DSM/releases">查看全部版本 ↗</a>
+      <span class="row hide" id="updBtns">
+        <button class="sm" id="btnChk">检查更新</button>
+        <button class="sm primary" id="btnApply">立即更新</button>
+      </span>
+      <a class="mono" style="font-size:12px" target="_blank" rel="noopener noreferrer"
+         id="lnkReleases" href="https://github.com/kosje/agnes-hub-go-DSM/releases">https://github.com/kosje/agnes-hub-go-DSM/releases</a>
     </div>
   </div>
   <div class="card">
@@ -908,60 +908,66 @@ function bindAboutEvents(){
     const cur = s.current_version || "—";
     const last = s.last_check || {};
     const avail = !!last.is_update_available;
-    const on = s.enabled !== false;
+    // canApply：能否在进程内替换二进制（套件版恒为 false）
+    // canCheck：能否向 GitHub 查最新版本（套件版仍为 true）
+    const canApply = s.enabled === true;
+    const canCheck = s.checkable !== false;
+
     kpi.innerHTML = `
       <div class="kpi"><div class="k">当前版本</div><div class="v">${esc(cur)}</div></div>
       <div class="kpi"><div class="k">最新版本</div><div class="v">${esc(last.latest_version || "—")}</div></div>
       <div class="kpi"><div class="k">更新状态</div><div class="v" style="font-size:15px">
-        ${!on ? '<span class="pill info">由套件中心管理</span>'
+        ${!canCheck ? '<span class="pill info">无法查询</span>'
               : avail ? '<span class="pill warn">有可用更新</span>'
                       : '<span class="pill ok">已是最新</span>'}</div></div>
       <div class="kpi"><div class="k">发布时间</div><div class="v" style="font-size:15px">${esc(last.release_date || "—")}</div></div>`;
 
-    // 「查看全部版本」跟着后端返回的仓库走，避免链接与升级来源对不上
-    if(s.repo){
-      const lnk = document.getElementById("lnkReleases");
-      if(lnk) lnk.href = "https://github.com/" + s.repo + "/releases";
-    }
-    // 自更新未启用时两个按钮点了只会报错，直接置灰
-    const chk = document.getElementById("btnChk");
-    const app = document.getElementById("btnApply");
-    if(chk) chk.disabled = !on;
-    if(app) app.disabled = !on;
-    if(!on){
-      const desc = document.getElementById("updDesc");
-      if(desc) desc.textContent =
-        "本套件版由群晖套件中心统一升级，已关闭进程内自更新，下方按钮不可用。";
-    }
+    // 仓库地址跟着后端返回的 repo 走，保证与「最新版本」的实际来源一致
+    const lnk = document.getElementById("lnkReleases");
+    const repoURL = "https://github.com/" + (s.repo || "kosje/agnes-hub-go-DSM") + "/releases";
+    if(lnk){ lnk.href = repoURL; lnk.textContent = repoURL; }
+
+    // 「检查更新 / 立即更新」只在进程内自更新可用时才露出来。
+    // 套件版由套件中心升级，按钮留着只会误导。
+    const btns = document.getElementById("updBtns");
+    if(btns) btns.classList.toggle("hide", !canApply);
 
     if(err || last.error){
       box.innerHTML = `<div class="banner warn">${esc(err || last.error)}</div>`;
       return;
     }
-    // 套件版是用 -no-selfupdate 启动的：进程内替换二进制会让套件的实际内容与
-    // INFO 里登记的 checksum 对不上，下次升级必然冲突。所以这里必须如实说明
-    // 「由套件中心升级」，不能笼统显示「已是最新」—— 那会让用户以为没得升。
-    if(!on){
-      box.innerHTML = `<div class="banner info">本套件版由群晖套件中心统一升级，
-        已关闭进程内自更新。请在「套件中心 → 社群」检查更新。</div>`;
+    if(!canCheck){
+      box.innerHTML = `<div class="banner info">未配置更新仓库，无法查询最新版本。</div>`;
       return;
     }
     if(!avail){
-      box.innerHTML = `<div class="banner good">当前已是最新版本，无需更新。</div>`;
+      box.innerHTML = s.suite_managed
+        ? `<div class="banner info">已是最新版本。本套件版由群晖套件中心统一升级，
+             请在「套件中心 → 社群」检查更新。</div>`
+        : `<div class="banner good">当前已是最新版本，无需更新。</div>`;
       return;
     }
     const notes = (last.changelog||"").trim();
     box.innerHTML = `<div class="banner warn">
         发现新版本 <b>${esc(last.latest_version)}</b>（当前 ${esc(cur)}）。
-        点「立即更新」会下载对应平台的二进制并替换，随后程序自动退出并重启。
+        ${canApply ? "点「立即更新」会下载对应平台的二进制并替换，随后程序自动退出并重启。"
+                   : "请在「套件中心 → 社群」升级。"}
       </div>
       ${notes? `<pre class="scroll" style="background:#fafbfc;border:1px solid var(--line);
         border-radius:10px;padding:12px;margin:0">${esc(notes)}</pre>`:""}`;
   };
 
   const load = async ()=>{
-    try{ paint(await api("/api/update/status")); }
-    catch(e){ kpi.innerHTML = `<div class="kpi"><div class="k">错误</div><div class="v">—</div></div>`;
+    try{
+      const s = await api("/api/update/status");
+      paint(s);
+      // 还没有检查结果（或上次查失败）时主动查一次 —— 否则「最新版本 / 发布时间」
+      // 会一直停在「—」。有缓存就不重复联网，避免反复打开本页把 GitHub 配额打满。
+      const last = s.last_check || {};
+      if(s.checkable !== false && (!last.latest_version || last.error)){
+        paint(await api("/api/update/check"));
+      }
+    }catch(e){ kpi.innerHTML = `<div class="kpi"><div class="k">错误</div><div class="v">—</div></div>`;
               box.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`; }
   };
 

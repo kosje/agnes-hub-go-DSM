@@ -173,7 +173,9 @@ func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 		CurrentVersion:    cur,
 		LatestVersion:     tag,
 		IsUpdateAvailable: isNewer && asset != nil,
-		ReleaseDate:       release.PublishedAt.Format("2006-01-02"),
+		// 带上时分：控制台「发布时间」要能看出这次检查拿到的到底是不是刚发的版本。
+		// 用服务器本地时区，用户看到的就是自己 NAS 上的时间。
+		ReleaseDate:       release.PublishedAt.Local().Format("2006-01-02 15:04"),
 		Changelog:         truncate(release.Body, 500),
 		Assets:            release.Assets,
 	}

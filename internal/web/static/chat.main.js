@@ -324,7 +324,7 @@ async function sendChat(){
     if(!full)bubble.textContent="（无内容返回）";
     // 持久化到服务端聊天记录
     try{
-      await api("/api/chat-logs",{method:"POST",body:JSON.stringify({model:state.model||"agnes-auto",prompt:text,reply:full,status:"completed"})});
+      await api("/api/chat-logs",{method:"POST",body:JSON.stringify({model:state.model||"agnes-auto",prompt:text,reply:stripInlineImages(full),status:"completed"})});
       await loadHistory();
     }catch(e){ console.error("save chat log failed", e); }
   }catch(e){
@@ -644,9 +644,22 @@ function populateModelSelects(){
 }
 
 /* ==================== UTILS ==================== */
+// stripInlineImages 把正文里的 base64 图片压成一行提示。
+//
+// 服务端为了让图片能在浏览器里显示，会把生成结果回取并内联成
+// data:image/...;base64,... —— 单张图动辄 1~3 MB，转成 base64 还要再涨三分之一。
+// 这段正文如果原样 POST 到 /api/chat-logs，服务端的 JSON 存储会被瞬间撑爆
+// （几十条记录就能上百 MB），而对话记录列表本来也不显示缩略图。
+// 所以入库前压掉，只留一行说明；聊天窗口当次显示不受影响。
+const INLINE_IMG_RE=/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi;
+function stripInlineImages(src){
+  return String(src==null?"":src).replace(INLINE_IMG_RE,"(图片已内联显示，未存入记录)");
+}
+
 // 轻量 Markdown 渲染：先整体 HTML 转义防 XSS，再做块级/行内解析。
 // 支持：标题、有序/无序列表、引用、分割线、围栏代码块、行内代码、
 // 粗体/斜体/删除线、链接、图片。链接仅放行 http/https/相对路径。
+// 图片额外放行 data:image/ —— 服务端内联的图片走的就是这条路。
 function renderMarkdown(src){
   if(src==null) return "";
   let s=esc(src);

@@ -1661,9 +1661,14 @@ func (s *Server) updateStatus() map[string]any {
 	if s.Updater != nil && s.Updater.Repo() != "" {
 		repo = s.Updater.Repo()
 	}
+	// enabled     —— 能否「应用更新」（进程内替换二进制）。套件版恒为 false。
+	// checkable   —— 能否向 GitHub 查最新版本。套件版仍为 true，只是查到之后
+	//                不在这里装，而是引导用户去套件中心。
 	out := map[string]any{
 		"current_version": cur,
-		"enabled":         s.Updater != nil,
+		"enabled":         s.Updater != nil && !s.SuiteManaged,
+		"checkable":       s.Updater != nil,
+		"suite_managed":   s.SuiteManaged,
 		"repo":            repo,
 	}
 	if s.Updater == nil {
@@ -1694,8 +1699,9 @@ func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
 			"current_version": s.Version,
 			"enabled":         false,
+			"checkable":       false,
 			"repo":            s.ReleaseRepo,
-			"error":           "自更新未启用",
+			"error":           "未配置更新仓库，无法查询最新版本",
 		}, nil)
 		return
 	}
@@ -1718,6 +1724,15 @@ func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
 		s.deny(w)
+		return
+	}
+	if s.SuiteManaged {
+		// 套件 INFO 里登记了 package.tgz 的 checksum。进程内换掉二进制会让
+		// 「实际内容」与「已安装版本」对不上，下次套件中心校验或升级必然冲突。
+		writeJSON(w, 200, map[string]any{
+			"success": false,
+			"error":   "本套件版由群晖套件中心统一升级，已关闭进程内自更新；请到「套件中心 → 社群」升级",
+		}, nil)
 		return
 	}
 	if s.Updater == nil {
@@ -1777,8 +1792,9 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 	// 注意这里必须把已经解析好的 body 传过去：readBody 是直接消费 r.Body 的，
 	// 再读一次只会拿到空 map，提示词会丢 —— 那样上游会以「prompt 不能为空」拒绝。
 	// chatShape=true：调用方是对话入口，响应要回译成 chat 形态。
+	// inlineImages=true：对话窗口按 Markdown 渲染，图片必须是可直接加载的地址。
 	if decision.Modality != intent.Text {
-		s.serveChatMedia(w, r, body, &decision, true)
+		s.serveChatMedia(w, r, body, &decision, true, true)
 		return
 	}
 
@@ -1907,7 +1923,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 			out.result.Close()
 			return
 		case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
-			writeSSEComment(w, flusher, "baipiao-hub chat proxy keepalive")
+			writeSSEComment(w, flusher, "agnes-hub chat proxy keepalive")
 		case <-ctx2.Done():
 			return
 		}
@@ -1975,9 +1991,12 @@ func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
-	// 控制台「生图 / 生视频」页直接打这个路由：端点即意图，响应保持官方形态。
+	// 对话页 / 控制台「生图 · 生视频」页直接打这个路由：端点即意图，响应保持官方形态。
 	// preDecision 传 nil —— 让 serveChatMedia 自己按端点判定模态。
-	s.serveChatMedia(w, r, body, nil, false)
+	//
+	// inlineImages=true：调用方是自家网页。上游给的图片地址浏览器多半加载不出来，
+	// 必须由服务端回取后以 base64 内联，否则页面上就是一张裂图。
+	s.serveChatMedia(w, r, body, nil, false, true)
 }
 
 // chatUpstreamPath 把控制台路由映射回上游路径。
@@ -2003,8 +2022,13 @@ func chatUpstreamPath(p string) string {
 //
 // chatShape 决定响应形态：true 时把上游的 images / videos 结构回译成 chat 响应，
 // 让「对话页选 agnes-auto 说一句画图」也能正常出图。
+//
+// inlineImages 决定要不要把图片内联成 base64 data URI。只有自家网页（对话页 /
+// 控制台）才置 true —— 上游返回的 url 常带鉴权、或落在浏览器够不到的 CDN 上，
+// 直接塞进 <img src> / Markdown 只会渲染成裂图。程序化客户端（裸 /v1）必须保持
+// false：它们要的是可自行下载的上游地址，而不是几 MB 的 base64。
 func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
-	body map[string]any, preDecision *intent.Result, chatShape bool) {
+	body map[string]any, preDecision *intent.Result, chatShape, inlineImages bool) {
 
 	settings := s.Store.SettingsSnapshot()
 	requested := strings.TrimSpace(asStr(body["model"]))
@@ -2134,17 +2158,45 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 	// 不回译的话，前端按 choices[0].message.content 取值会拿到空串，
 	// 明明图已经生成好了，界面却显示「（无内容返回）」。
 	if chatShape {
-		s.serveChatShapedMedia(w, decision, result, raw, headers, wantsStream)
+		s.serveChatShapedMedia(w, r, decision, result, raw, headers, wantsStream)
 		return
 	}
-	writeJSON(w, result.Status, decodeOrRaw(raw), headers)
+
+	// 官方形态。程序化客户端要真实的上游地址，不能塞 base64；
+	// 只有自家网页（inlineImages=true）才把 data[].url 换成服务端回取的 data URI，
+	// 否则对话页的「生图」标签页拿 item.url 直接当 <img src> 用，只会是裂图。
+	payload := decodeOrRaw(raw)
+	if inlineImages && decision.Modality == intent.Image {
+		if m, ok := payload.(map[string]any); ok {
+			if items := mapList(m["data"]); len(items) > 0 {
+				m["data"] = toAnySlice(s.inlineImageDataURIs(r.Context(), items))
+			}
+		}
+	}
+	writeJSON(w, result.Status, payload, headers)
+}
+
+// toAnySlice 把 []map[string]any 转成 []any。
+//
+// 上游响应里的 data 字段本来就是 []any（每个元素是 object），改写后要放回原处，
+// 保持同一个动态类型，避免个别调用方按 []any 断言时拿到 nil。
+func toAnySlice(items []map[string]any) []any {
+	out := make([]any, len(items))
+	for i, it := range items {
+		out[i] = it
+	}
+	return out
 }
 
 // serveChatShapedMedia 把生图 / 生视频的上游结果回译成 chat 响应。
 //
 // 复用与裸 /v1 代理（serveAutoImage / serveAutoVideo）同一套翻译函数，
 // 保证「对话页生图」与「程序化客户端生图」的正文完全一致。
-func (s *Server) serveChatShapedMedia(w http.ResponseWriter, decision intent.Result,
+//
+// 与裸 /v1 的唯一差别：这里的图片一律先由服务端回取成 base64 再拼 Markdown。
+// 调用方是网页对话窗口，正文要能直接被 <img> 渲染；上游 URL 带鉴权或落在
+// 浏览器够不到的 CDN 上时，照抄 URL 只会得到一张裂图。
+func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, decision intent.Result,
 	result *relay.Result, raw []byte, headers map[string]string, stream bool) {
 
 	if decision.Modality == intent.Video {
@@ -2175,11 +2227,17 @@ func (s *Server) serveChatShapedMedia(w http.ResponseWriter, decision intent.Res
 
 	data := decodeMap(raw)
 	items := mapList(data["data"])
+	// 回取上游图片并内联成 data URI —— ImageContent 会把它拼进 Markdown，
+	// 前端 renderMarkdown 放行 data:image/，于是浏览器零依赖即可显示。
+	items = s.inlineImageDataURIs(r.Context(), items)
 	content, images := intent.ImageContent(items, decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") +
 			" 未被生图端点接受，已忽略。"
 	}
+	// data 刻意回显上游原始响应（url 是上游地址，未内联），images 才是给界面用的
+	// 内联视图。两者都塞 base64 会让响应凭空翻倍（一张 3 MB 的图 → 6 MB），
+	// 而 chat 形态的调用方读的是 choices[0].message.content，data 只用于排查。
 	envelope := intent.ChatEnvelope(decision, result.ModelUsed, content,
 		map[string]any{"data": data["data"], "images": images})
 	if stream {

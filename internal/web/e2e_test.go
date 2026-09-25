@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -31,10 +32,29 @@ type mockAgnes struct {
 	accepted    atomic.Int64
 	byPath      sync.Map // path -> *atomic.Int64
 	lastModel   sync.Map // path -> string
+	// imageURL 是生图接口返回的 url。留空时用默认的不可达地址
+	// （cdn.example.test），需要验证「服务端回取图片」的用例再把它指向真实服务。
+	imageURL string
 }
 
 func newMockAgnes(minInterval time.Duration) *mockAgnes {
 	return &mockAgnes{minInterval: minInterval, lastAt: map[string]time.Time{}}
+}
+
+// setImageURL 指定生图接口要返回的图片地址。
+func (m *mockAgnes) setImageURL(u string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.imageURL = u
+}
+
+func (m *mockAgnes) getImageURL() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.imageURL == "" {
+		return "https://cdn.example.test/mock-1.png"
+	}
+	return m.imageURL
 }
 
 func (m *mockAgnes) count(path string) *atomic.Int64 {
@@ -104,7 +124,7 @@ func (m *mockAgnes) handler() http.Handler {
 			}
 			writeJSONRaw(w, 200, map[string]any{
 				"created": time.Now().Unix(),
-				"data":    []map[string]any{{"url": "https://cdn.example.test/mock-1.png", "revised_prompt": "mock"}},
+				"data":    []map[string]any{{"url": m.getImageURL(), "revised_prompt": "mock"}},
 			})
 		case strings.Contains(path, "/v1/videos"):
 			if _, ok := payload["prompt"].(string); !ok {
@@ -202,6 +222,30 @@ func (h *harness) post(path string, payload map[string]any) (*http.Response, map
 	var out map[string]any
 	_ = json.Unmarshal(raw, &out)
 	return resp, out
+}
+
+// postSSE 发一个流式请求，把原始响应体当字符串返回。
+//
+// 对话页固定发 stream=true，SSE 不能用 json.Unmarshal 解析，单独给一个入口。
+func (h *harness) postSSE(path string, payload map[string]any) string {
+	h.t.Helper()
+	buf, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+path, bytes.NewReader(buf))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("流式请求 %s 失败：%v", path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		h.t.Fatalf("流式请求 %s 应 200，实际 %d：%s", path, resp.StatusCode, raw)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		h.t.Fatalf("Content-Type 应为 text/event-stream，实际 %q", ct)
+	}
+	return string(raw)
 }
 
 func chatBody(text string) map[string]any {
