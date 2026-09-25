@@ -109,6 +109,7 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("DELETE /api/video-jobs/{id}", s.apiDeleteVideoJob)
 	m.HandleFunc("DELETE /api/image-jobs/{id}", s.apiDeleteImageJob)
 	m.HandleFunc("POST /api/video-jobs/clear", s.apiClearVideoJobs)
+	m.HandleFunc("POST /api/video-jobs/{id}/refetch", s.apiRefetchVideoJob)
 	m.HandleFunc("POST /api/image-jobs/clear", s.apiClearImageJobs)
 	m.HandleFunc("GET /api/chat-logs", s.apiChatLogs)
 	m.HandleFunc("POST /api/chat-logs", s.apiCreateChatLog)
@@ -958,6 +959,52 @@ func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"jobs": s.Store.JobsSnapshot()}, nil)
+}
+
+// apiRefetchVideoJob 去上游把某个已完成任务的产出取回本地。
+//
+// 用途：本地落盘功能上线**之前**完成的任务没有 url 字段，控制台里点不开
+// （「产出」列只能显示 —）。重新问一次上游就能拿到产出地址，落盘后写回记录。
+func (s *Server) apiRefetchVideoJob(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w)
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	job, ok := s.Store.JobByID(id)
+	if !ok {
+		writeErr(w, &apiError{Status: 404, Type: "not_found", Message: "找不到这个视频任务"})
+		return
+	}
+	if strings.TrimSpace(job.VideoID) == "" {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request",
+			Message: "这条记录没有上游 video_id，无法回上游查询"})
+		return
+	}
+	account := s.Store.AccountByID(job.AccountID)
+	if account == nil {
+		writeErr(w, &apiError{Status: 400, Type: "bad_request",
+			Message: "任务对应的账号已不存在，无法回上游查询"})
+		return
+	}
+	body := s.pollUpstream(r.Context(), account, job)
+	if body == nil {
+		writeErr(w, &apiError{Status: 502, Type: "upstream_error",
+			Message: "回上游查询失败（网络或上游异常）"})
+		return
+	}
+	url := extractVideoURL(body)
+	if url == "" {
+		writeJSON(w, 200, map[string]any{"ok": false, "status": job.Status,
+			"error": "上游暂未给出产出地址（任务可能仍在生成中，稍后再试）"}, nil)
+		return
+	}
+	job.URL = s.localizeVideoURL(r.Context(), url, publicBaseURL(r, s.Store.SettingsSnapshot()))
+	if job.Status != "failed" {
+		job.Status = "completed"
+	}
+	s.Store.PutJob(job)
+	writeJSON(w, 200, map[string]any{"ok": true, "status": job.Status, "video_url": job.URL}, nil)
 }
 
 func (s *Server) apiImageJobs(w http.ResponseWriter, r *http.Request) {
