@@ -126,6 +126,8 @@ func (s *Server) consoleRoutes() {
 	// 向上游问「你到底给了哪些模型」——用来区分「上游停了模型」与「本地清单填错」。
 	m.HandleFunc("POST /api/models/upstream", s.apiUpstreamModels)
 	m.HandleFunc("GET /api/rpm-table", s.apiRPMTable)
+	// 媒体基地址自检：回显「按当前这次请求推算出的基地址」，专治反向代理部署。
+	m.HandleFunc("GET /api/media-base", s.apiMediaBase)
 
 	m.HandleFunc("GET /api/update/status", s.apiUpdateStatus)
 	m.HandleFunc("GET /api/update/check", s.apiUpdateCheck)
@@ -999,6 +1001,7 @@ func (s *Server) apiRefetchVideoJob(w http.ResponseWriter, r *http.Request) {
 			"error": "上游暂未给出产出地址（任务可能仍在生成中，稍后再试）"}, nil)
 		return
 	}
+	job.SourceURL = url
 	job.URL = s.localizeVideoURL(r.Context(), url, publicBaseURL(r, s.Store.SettingsSnapshot()))
 	if job.Status != "failed" {
 		job.Status = "completed"
@@ -1251,6 +1254,7 @@ func applySettings(st *config.Settings, p map[string]any) {
 	// 否则「显式关掉上限」会被默认值覆盖回去。
 	i("video_cache_max_mb", &st.VideoCacheMaxMB)
 	s2("public_base_url", &st.PublicBaseURL)
+	s2("client_media_url", &st.ClientMediaURL)
 
 	// chat_password is handled separately in apiSetSettings to avoid accessing s here
 	i("retry_max", &st.RetryMax)
@@ -2242,7 +2246,7 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 	if m, ok := payload.(map[string]any); ok {
 		if inlineImages && decision.Modality == intent.Image {
 			if items := mapList(m["data"]); len(items) > 0 {
-				m["data"] = toAnySlice(s.localizeImageURLs(r.Context(), items, publicBaseURL(r, settings)))
+				m["data"] = toAnySlice(s.localizeImageURLs(r, items, settings))
 			}
 		}
 		// 网页端就是靠这个 job_id 去轮询 /api/chat/v1/videos/<id>。
@@ -2314,8 +2318,9 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 		if job.Error != "" {
 			out["error"] = job.Error
 		}
-		if job.URL != "" {
-			out["video_url"] = job.URL
+		// 已完成的记录再查时也要按调用方给地址：客户端要上游的、网页要本地的。
+		if u := s.callerMediaURL(r, settings, job.SourceURL, job.URL); u != "" {
+			out["video_url"] = u
 		}
 		writeJSON(w, 200, out, nil)
 		return
@@ -2333,13 +2338,14 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if url := extractVideoURL(body); url != "" {
 		job.Status = "completed"
-		// 把上游产出取回本地：浏览器不一定够得到上游的 CDN 地址，直接塞进
-		// <video src> 可能是个转不动的播放器。顺带也就做了长期缓存 ——
-		// 体积有 VideoCacheMaxMB 兜底，不会把 NAS 填满。
+		job.SourceURL = url
+		// 落盘一份本地副本：控制台与聊天记录长期回看靠它（浏览器与网关同源，一定可达）。
 		job.URL = s.localizeVideoURL(r.Context(), url, publicBaseURL(r, settings))
 		s.Store.PutJob(job)
 		out["status"] = "completed"
-		out["video_url"] = job.URL
+		// 但回给调用方的地址要看调用方是谁 —— 外部客户端加载不了指向 NAS 的
+		// http 地址，给它上游地址（公网 https）才显示得出来。见 callerMediaURL。
+		out["video_url"] = s.callerMediaURL(r, settings, url, job.URL)
 		writeJSON(w, 200, out, nil)
 		return
 	}
@@ -2411,7 +2417,7 @@ func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, de
 	items := mapList(data["data"])
 	// 回取上游图片落盘，换成本地地址 —— ImageContent 会把它拼进 Markdown，
 	// 前端 renderMarkdown 放行相对路径，于是浏览器直接向本机要图。
-	items = s.localizeImageURLs(r.Context(), items, publicBaseURL(r, settings))
+	items = s.localizeImageURLs(r, items, settings)
 	content, images := intent.ImageContent(items, decision.Prompt.Text)
 	if len(decision.DroppedFields) > 0 {
 		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") +

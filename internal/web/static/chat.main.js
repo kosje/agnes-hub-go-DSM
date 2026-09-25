@@ -2,8 +2,18 @@
 
 // 工具函数（与 chat.html 内联脚本等价，避免重复声明）
 const API_URL = "";
+// X-Agnes-Hub-Surface 是网关自家网页表明身份的请求头。
+//
+// 为什么需要它：/api/chat/v1/* 同时服务于本页和外部 AI 客户端，而两者对
+// 「生成的图片/视频该用什么地址」的要求正好相反 ——
+//   本页与网关同源，本地地址一定可达（这正是落盘的意义）；
+//   外部客户端在别的网络位置、甚至跑在 https 页面里，指向 NAS 的 http 地址
+//   经常加载不出来（实测会退化成显示图片的 alt 文本）。
+// 服务端按这个头决定回哪种地址。
+const SURFACE_HEADERS = { "X-Agnes-Hub-Surface": "web" };
 async function api(p, o = {}) {
-  const opts = { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...o };
+  const opts = { credentials: "same-origin", headers: { "Content-Type": "application/json", ...SURFACE_HEADERS }, ...o };
+  if (o.headers) opts.headers = { ...SURFACE_HEADERS, ...o.headers };
   const r = await fetch(API_URL + p, opts);
   const t = await r.text();
   let d = null; try { d = t ? JSON.parse(t) : null; } catch (e) { d = { raw: t }; }

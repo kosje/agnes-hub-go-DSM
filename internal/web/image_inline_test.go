@@ -165,7 +165,7 @@ func TestChatImageRouteServesSavedFile(t *testing.T) {
 	h := newHarness(t, 0, 1)
 	servePNGUpstream(t, h)
 
-	_, body := h.post("/api/chat/v1/chat/completions", map[string]any{
+	_, body := h.postWeb("/api/chat/v1/chat/completions", map[string]any{
 		"model":    "agnes-auto",
 		"messages": []any{map[string]any{"role": "user", "content": "画一幅山水画。"}},
 		"stream":   false,
@@ -203,7 +203,7 @@ func TestChatImageIsLinkedLocally(t *testing.T) {
 	servePNGUpstream(t, h)
 	upstream := h.mock.getImageURL()
 
-	resp, body := h.post("/api/chat/v1/chat/completions", map[string]any{
+	resp, body := h.postWeb("/api/chat/v1/chat/completions", map[string]any{
 		"model":    "agnes-auto",
 		"messages": []any{map[string]any{"role": "user", "content": "画一幅山水画，比例 9:16。"}},
 		"stream":   false,
@@ -240,7 +240,7 @@ func TestChatImageStreamIsLinkedLocally(t *testing.T) {
 	h := newHarness(t, 0, 1)
 	servePNGUpstream(t, h)
 
-	raw := h.postSSE("/api/chat/v1/chat/completions", map[string]any{
+	raw := h.postSSEWeb("/api/chat/v1/chat/completions", map[string]any{
 		"model":    "agnes-auto",
 		"messages": []any{map[string]any{"role": "user", "content": "画一幅山水画。"}},
 		"stream":   true,
@@ -257,7 +257,7 @@ func TestWebImageTabGetsLocalURL(t *testing.T) {
 	h := newHarness(t, 0, 1)
 	servePNGUpstream(t, h)
 
-	resp, body := h.post("/api/chat/v1/images/generations", map[string]any{
+	resp, body := h.postWeb("/api/chat/v1/images/generations", map[string]any{
 		"model": "agnes-image-2.5-flash", "prompt": "一只在窗台晒太阳的橘猫", "n": 1, "size": "1024x1024",
 	})
 	if resp.StatusCode != 200 {

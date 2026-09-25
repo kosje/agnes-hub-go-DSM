@@ -270,15 +270,51 @@ func (h *harness) post(path string, payload map[string]any) (*http.Response, map
 	return resp, out
 }
 
+// postWeb 发一个带「来自网关自家网页」标记的请求。
+//
+// 服务端据此回**本地**媒体地址；不带这个标记（外部 AI 客户端）则回上游地址 ——
+// 客户端往往加载不了指向 NAS 的 http 地址，见 callerMediaURL。
+func (h *harness) postWeb(path string, payload map[string]any) (*http.Response, map[string]any) {
+	h.t.Helper()
+	buf, _ := json.Marshal(payload)
+	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+path, strings.NewReader(string(buf)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	req.Header.Set(surfaceHeader, "web")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("请求 %s 失败：%v", path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	return resp, out
+}
+
 // postSSE 发一个流式请求，把原始响应体当字符串返回。
 //
 // 对话页固定发 stream=true，SSE 不能用 json.Unmarshal 解析，单独给一个入口。
 func (h *harness) postSSE(path string, payload map[string]any) string {
 	h.t.Helper()
+	return h.postSSEWith(path, payload, false)
+}
+
+// postSSEWeb 发流式请求并带上「来自网关自家网页」标记（对话页就是这种）。
+func (h *harness) postSSEWeb(path string, payload map[string]any) string {
+	h.t.Helper()
+	return h.postSSEWith(path, payload, true)
+}
+
+func (h *harness) postSSEWith(path string, payload map[string]any, web bool) string {
+	h.t.Helper()
 	buf, _ := json.Marshal(payload)
 	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+path, bytes.NewReader(buf))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	if web {
+		req.Header.Set(surfaceHeader, "web")
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatalf("流式请求 %s 失败：%v", path, err)
