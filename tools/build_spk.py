@@ -98,7 +98,7 @@ PACKAGE_ARCHES = {
 }
 
 # 每次发布 SPK 都必须递增。仍可用 SPK_BUILD 临时覆盖。
-DEFAULT_SPK_BUILD = "1"
+DEFAULT_SPK_BUILD = "2"
 
 DESCRIPTION = (
     "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定"
@@ -283,7 +283,7 @@ def spk_version(go_version):
 
 
 # ---------------------------------------------------------------------------
-# 图标：纯标准库裁切 + 缩放
+# 图标：纯标准库 PNG 编解码 + 矢量精度重绘
 # ---------------------------------------------------------------------------
 
 def _png_decode_rgba(path):
@@ -369,94 +369,6 @@ def _png_encode_rgba(path, w, h, px):
         f.write(data)
 
 
-def _box_resize(src_w, src_h, src, dst_w, dst_h):
-    """面积平均缩放（box filter），按 alpha 预乘后加权，避免透明边缘出现色边。
-
-    同时适用于放大和缩小：每个目标像素取源图上对应的矩形区域做面积加权平均。
-    """
-    out = bytearray(dst_w * dst_h * 4)
-    sx = src_w / dst_w
-    sy = src_h / dst_h
-    for ty in range(dst_h):
-        y0, y1 = ty * sy, (ty + 1) * sy
-        iy0, iy1 = int(y0), min(int(y1 - 1e-9) + 1, src_h)
-        for tx in range(dst_w):
-            x0, x1 = tx * sx, (tx + 1) * sx
-            ix0, ix1 = int(x0), min(int(x1 - 1e-9) + 1, src_w)
-            ar = ag = ab = aa = 0.0
-            total = 0.0
-            for yy in range(iy0, iy1):
-                wy = min(y1, yy + 1) - max(y0, yy)
-                if wy <= 0:
-                    continue
-                base = yy * src_w * 4
-                for xx in range(ix0, ix1):
-                    wx = min(x1, xx + 1) - max(x0, xx)
-                    if wx <= 0:
-                        continue
-                    wgt = wx * wy
-                    i = base + xx * 4
-                    a = src[i + 3]
-                    aa += a * wgt
-                    ar += src[i] * a * wgt
-                    ag += src[i + 1] * a * wgt
-                    ab += src[i + 2] * a * wgt
-                    total += wgt
-            o = (ty * dst_w + tx) * 4
-            if total <= 0 or aa <= 0:
-                out[o] = out[o + 1] = out[o + 2] = out[o + 3] = 0
-            else:
-                out[o] = int(round(ar / aa))
-                out[o + 1] = int(round(ag / aa))
-                out[o + 2] = int(round(ab / aa))
-                out[o + 3] = int(round(aa / total))
-    return out
-
-
-def _bilinear_resize(src_w, src_h, src, dst_w, dst_h):
-    """双线性放大。按预乘 alpha 插值，避免透明边缘混出暗边。
-
-    为什么不用 _box_resize 放大：整数倍放大时面积平均会退化成最近邻，
-    源图 64→256 会得到 4 像素见方的方块台阶。图标源只有 64×64，
-    放大必须走插值才能平滑。
-    """
-    out = bytearray(dst_w * dst_h * 4)
-    for ty in range(dst_h):
-        sy = (ty + 0.5) * src_h / dst_h - 0.5
-        y0 = max(0, min(src_h - 1, int(sy)))
-        y1 = min(src_h - 1, y0 + 1)
-        fy = max(0.0, min(1.0, sy - y0))
-        for tx in range(dst_w):
-            sx = (tx + 0.5) * src_w / dst_w - 0.5
-            x0 = max(0, min(src_w - 1, int(sx)))
-            x1 = min(src_w - 1, x0 + 1)
-            fx = max(0.0, min(1.0, sx - x0))
-
-            ar = ag = ab = aa = 0.0
-            for px_, py_, wgt in ((x0, y0, (1 - fx) * (1 - fy)),
-                                  (x1, y0, fx * (1 - fy)),
-                                  (x0, y1, (1 - fx) * fy),
-                                  (x1, y1, fx * fy)):
-                if wgt <= 0:
-                    continue
-                i = (py_ * src_w + px_) * 4
-                a = src[i + 3] / 255.0
-                ar += src[i] * a * wgt
-                ag += src[i + 1] * a * wgt
-                ab += src[i + 2] * a * wgt
-                aa += src[i + 3] * wgt
-
-            o = (ty * dst_w + tx) * 4
-            if aa <= 0:
-                out[o] = out[o + 1] = out[o + 2] = out[o + 3] = 0
-            else:
-                out[o] = min(255, int(round(ar * 255.0 / aa)))
-                out[o + 1] = min(255, int(round(ag * 255.0 / aa)))
-                out[o + 2] = min(255, int(round(ab * 255.0 / aa)))
-                out[o + 3] = min(255, int(round(aa)))
-    return out
-
-
 def _png_colortype(path):
     """读 PNG 的 IHDR 取颜色类型：6=RGBA，2=RGB（无 alpha 通道）。"""
     with open(path, "rb") as f:
@@ -464,114 +376,239 @@ def _png_colortype(path):
     return struct.unpack(">IIBBBBB", head[16:29])[3]
 
 
-def _key_out_black(w, h, px, threshold=16):
-    """把纯黑背景抠成透明（in-place 返回新的 bytearray）。
+# ---------------------------------------------------------------------------
+# App 图标：从上游 logo 里量出白色字形，再按矢量精度重绘
+#
+# 上游 assets/ICON.PNG 是「黑底 + 浅紫圆盘 + 纯白字形」的 RGB 图，没有 alpha 通道。
+# 直接当图标用有两个问题：
+#   1. 黑底在 DSM 浅色界面上就是一个黑方块；
+#   2. 把黑底抠掉之后剩下「浅紫圆盘 + 白字形」—— 白字形压在浅紫圆盘上对比度极低，
+#      再垫一层深色方底还会形成两层轮廓互相打架（v1.0.11-0001 就是这个效果）。
+#
+# 所以这里不做「抠图 + 缩放」，改成：
+#   · 用白色阈值从源图里量出字形的真实几何（外框、边框厚度、两条分隔线的位置）；
+#   · 按这个几何在目标尺寸上重新栅格化，得到矢量级清晰、任何尺寸都不糊的字形；
+#   · 垫一层品牌蓝渐变圆角方底，三个格子填淡蓝，字形居中。
+# 几何是从图里量出来的，所以上游换 logo 也能自适应；量不出来就直接报错，不会静默出图。
+# ---------------------------------------------------------------------------
 
-    上游的 assets/ICON.PNG 与 ICON_256.PNG 是「黑底 + logo」的 RGB 图，没有
-    alpha 通道 —— 直接拿来当图标，套件中心里会显示成一个黑方块。
-    这里按亮度键控：max(r,g,b) 小于阈值就判为背景。
+# 白色字形与浅紫圆盘的分界阈值。实测源图里圆盘最亮的 min(r,g,b)=207、字形是纯白
+# min=240，224 正好落在两者之间的空档里，分离是干净的。
+GLYPH_WHITE_THRESHOLD = 224
 
-    实测该图背景是纯 0、logo 最暗也有 160，中间没有过渡像素，所以简单阈值就够；
-    边缘的抗锯齿交给后续 _box_resize 的面积平均去生成。
-    """
-    out = bytearray(px)
-    for i in range(0, w * h * 4, 4):
-        if max(out[i], out[i + 1], out[i + 2]) < threshold:
-            out[i + 3] = 0
-    return out
+# 字形占图标边长的比例。源图原本是 48/64=75%，但去掉圆盘后字形会直接顶到方底边缘、
+# 显得局促，60% 观感最平衡。
+GLYPH_SCALE = 0.60
 
+# 字形外框圆角的相对量（相对边框厚度）。实测源图外框是直角，但边缘带抗锯齿的圆润感，
+# 按边框厚度的 0.6 倍给一点圆角更接近原图观感。
+GLYPH_CORNER = 0.6
 
-# App 图标底色：取自 logo 自身的深蓝色系（上 rgb(48,70,140) → 下 rgb(20,28,65)）。
-# 上游 logo 是「浅紫渐变圆 + 白色元素」，本来就是配黑底设计的，直接透明化后在
-# DSM 的浅色界面上白色元素会完全消失。补一层微带呼吸内边距和平滑抗锯齿的圆角方底既保住对比，
-# 又完全符合 DSM 桌面 / 套件中心 App 图标规范。
-ICON_BG_TOP = (48, 70, 140)
-ICON_BG_BOTTOM = (20, 28, 65)
+# App 图标底色：品牌蓝垂直渐变（取自 assets/logo_baipiao.png 的 rgb(47,76,156) 系）。
+ICON_BG_TOP = (58, 92, 178)
+ICON_BG_BOTTOM = (30, 50, 118)
+# 三个格子的填充色：比底色亮一档，保住原图「三格面板」的层次。
+ICON_CELL = (126, 168, 236)
+# DSM 图标是圆角方形，0.22 是群晖自家套件的常见圆角比例。
 ICON_CORNER_RADIUS = 0.22
 
 
-def _app_icon(w, h, px):
-    """把透明底的 logo 合成到带平滑抗锯齿的圆角方形底色上，产出可直接使用的 App 图标。"""
-    pad = max(1, int(round(min(w, h) * 0.035)))
-    eff_w = w - pad * 2
-    eff_h = h - pad * 2
-    rad = max(1.0, min(eff_w, eff_h) * ICON_CORNER_RADIUS)
+def _detect_glyph(src_png):
+    """从上游 logo 里量出白色字形的几何。
 
-    out = bytearray(w * h * 4)
+    返回 dict：x0/y0/x1/y1 是字形外框（源图像素，闭区间），border 是边框厚度，
+    dividers 是两条分隔线（闭区间），cells 是被分隔线切出的三个格子（半开区间）。
+    """
+    w, h, px = _png_decode_rgba(src_png)
+    thr = GLYPH_WHITE_THRESHOLD
+
+    def white(x, y):
+        i = (y * w + x) * 4
+        return min(px[i], px[i + 1], px[i + 2]) >= thr
+
+    xs0 = xs1 = ys0 = ys1 = None
     for y in range(h):
         for x in range(w):
-            if x < pad or x >= w - pad or y < pad or y >= h - pad:
+            if not white(x, y):
                 continue
+            if xs0 is None or x < xs0:
+                xs0 = x
+            if xs1 is None or x > xs1:
+                xs1 = x
+            if ys0 is None or y < ys0:
+                ys0 = y
+            if ys1 is None or y > ys1:
+                ys1 = y
+    if xs0 is None:
+        sys.exit("[ERROR] %s 里找不到白色字形（阈值 min(r,g,b)>=%d）"
+                 % (src_png, thr))
 
-            rx = x - pad
-            ry = y - pad
-            t = ry / max(1, eff_h - 1)
-            br = int(round(ICON_BG_TOP[0] + (ICON_BG_BOTTOM[0] - ICON_BG_TOP[0]) * t))
-            bg = int(round(ICON_BG_TOP[1] + (ICON_BG_BOTTOM[1] - ICON_BG_TOP[1]) * t))
-            bb = int(round(ICON_BG_TOP[2] + (ICON_BG_BOTTOM[2] - ICON_BG_TOP[2]) * t))
+    gw = xs1 - xs0 + 1
+    gh = ys1 - ys0 + 1
 
-            cx = cy = None
-            if rx < rad and ry < rad:
-                cx, cy = rad, rad
-            elif rx >= eff_w - rad and ry < rad:
-                cx, cy = eff_w - rad - 1, rad
-            elif rx < rad and ry >= eff_h - rad:
-                cx, cy = rad, eff_h - rad - 1
-            elif rx >= eff_w - rad and ry >= eff_h - rad:
-                cx, cy = eff_w - rad - 1, eff_h - rad - 1
+    # 边框厚度：取字形中部那一行，从左边数连续白像素的个数
+    my = ys0 + gh // 2
+    border = 0
+    while border < gw and white(xs0 + border, my):
+        border += 1
+    if border <= 0 or border * 4 >= gw:
+        sys.exit("[ERROR] %s 字形边框厚度量不出来（得到 %d），图标几何不合法"
+                 % (src_png, border))
 
-            corner_alpha = 1.0
-            if cx is not None:
-                d = math.hypot(rx - cx, ry - cy)
-                if d > rad + 0.5:
-                    continue
-                elif d > rad - 0.5:
-                    corner_alpha = max(0.0, min(1.0, rad + 0.5 - d))
+    # 分隔线：取字形中部那一列，从上往下找连续白像素段。第一段是上边框、最后一段是
+    # 下边框，中间的就是分隔线。
+    mx = xs0 + gw // 2
+    runs = []
+    start = None
+    for y in range(ys0, ys1 + 1):
+        if white(mx, y):
+            if start is None:
+                start = y
+        elif start is not None:
+            runs.append((start, y - 1))
+            start = None
+    if start is not None:
+        runs.append((start, ys1))
+    if len(runs) < 4:
+        sys.exit("[ERROR] %s 字形结构异常：中部竖切只找到 %d 段白色"
+                 "（期望 上边框 + 2 条分隔线 + 下边框）" % (src_png, len(runs)))
 
-            i = (y * w + x) * 4
-            a = px[i + 3] / 255.0
-            out[i] = int(round(px[i] * a + br * (1 - a)))
-            out[i + 1] = int(round(px[i + 1] * a + bg * (1 - a)))
-            out[i + 2] = int(round(px[i + 2] * a + bb * (1 - a)))
-            out[i + 3] = int(round(255 * corner_alpha))
-    return out
+    dividers = runs[1:-1]
+    cells = []
+    top = ys0 + border
+    for a, b in dividers:
+        cells.append((top, a))
+        top = b + 1
+    cells.append((top, ys1 + 1 - border))
+    return {"x0": xs0, "y0": ys0, "x1": xs1, "y1": ys1,
+            "border": border, "dividers": dividers, "cells": cells}
+
+
+def _rrect_span(yc, x0, y0, x1, y1, radius):
+    """圆角矩形在 y=yc 这一行的水平跨度 [left, right]；不在矩形内返回 None。"""
+    if yc < y0 or yc > y1:
+        return None
+    if radius <= 0:
+        return x0, x1
+    if yc < y0 + radius:
+        d = (y0 + radius) - yc
+    elif yc > y1 - radius:
+        d = yc - (y1 - radius)
+    else:
+        return x0, x1
+    if d > radius:
+        return None
+    dx = math.sqrt(max(0.0, radius * radius - d * d))
+    return x0 + radius - dx, x1 - radius + dx
+
+
+def _raster_shapes(size, shapes):
+    """把若干形状的并集栅格化成抗锯齿灰度掩码（bytearray，0..255）。
+
+    逐行求出每个形状在该行的水平跨度，再按像素算跨度覆盖度累加 —— 比超采样快，
+    边缘是精确抗锯齿的，放大到 256 也不会糊。sign<0 表示从并集里挖掉。
+    """
+    mask = bytearray(size * size)
+    for y in range(size):
+        yc = y + 0.5
+        cov = [0.0] * size
+        for x0, y0, x1, y1, radius, sign in shapes:
+            span = _rrect_span(yc, x0, y0, x1, y1, radius)
+            if span is None:
+                continue
+            left, right = span
+            if right <= 0 or left >= size:
+                continue
+            for x in range(max(0, int(math.floor(left))),
+                           min(size - 1, int(math.ceil(right)) - 1) + 1):
+                ov = min(right, x + 1.0) - max(left, float(x))
+                if ov > 0:
+                    cov[x] += sign * ov
+        base = y * size
+        for x in range(size):
+            v = cov[x]
+            if v <= 0.0:
+                continue
+            mask[base + x] = 255 if v >= 1.0 else int(round(v * 255.0))
+    return mask
+
+
+def _render_app_icon(size, geo):
+    """合成一张最终的 App 图标：品牌蓝渐变圆角方底 + 淡蓝三格 + 白色字形。
+
+    绘制顺序是「圆角方底 -> 三格填色 -> 白字形」。格子填的是字形内区的整块矩形而不是
+    三个小洞，这样字形边框的抗锯齿边是跟格子色混的，不会在框内沿留出一条暗缝。
+    """
+    x0, y0, x1, y1 = geo["x0"], geo["y0"], geo["x1"], geo["y1"]
+    gw = x1 - x0 + 1
+    gh = y1 - y0 + 1
+    border = geo["border"]
+
+    # 源图坐标 -> 目标画布坐标：字形等比缩放到 GLYPH_SCALE 高，水平垂直居中
+    k = (size * GLYPH_SCALE) / gh
+    ox = (size - gw * k) / 2.0
+    oy = (size - gh * k) / 2.0
+
+    def TX(sx):
+        return ox + (sx - x0) * k
+
+    def TY(sy):
+        return oy + (sy - y0) * k
+
+    # 圆角方底
+    base = _raster_shapes(size, [(0.0, 0.0, float(size), float(size),
+                                  size * ICON_CORNER_RADIUS, 1.0)])
+    # 三格填色 = 字形内区（分隔线随后被白字形盖掉）
+    cells = _raster_shapes(size, [(TX(x0 + border), TY(y0 + border),
+                                   TX(x0 + gw - border), TY(y0 + gh - border),
+                                   0.0, 1.0)])
+    # 白字形 = 外框 - 内挖空 + 分隔线
+    corner = border * GLYPH_CORNER * k
+    glyph_shapes = [
+        (TX(x0), TY(y0), TX(x0 + gw), TY(y0 + gh), corner, 1.0),
+        (TX(x0 + border), TY(y0 + border),
+         TX(x0 + gw - border), TY(y0 + gh - border), 0.0, -1.0),
+    ]
+    for a, b in geo["dividers"]:
+        glyph_shapes.append((TX(x0 + border), TY(a),
+                             TX(x0 + gw - border), TY(b + 1), 0.0, 1.0))
+    glyph = _raster_shapes(size, glyph_shapes)
+
+    px = bytearray(size * size * 4)
+    for y in range(size):
+        t = min(1.0, (y + 0.5) / size)
+        bg = tuple(ICON_BG_TOP[i] + (ICON_BG_BOTTOM[i] - ICON_BG_TOP[i]) * t
+                   for i in range(3))
+        base_row = y * size
+        for x in range(size):
+            a = base[base_row + x] / 255.0
+            if a <= 0.0:
+                continue
+            col = list(bg)
+            ca = cells[base_row + x] / 255.0
+            if ca > 0.0:
+                col = [col[i] * (1.0 - ca) + ICON_CELL[i] * ca for i in range(3)]
+            ga = glyph[base_row + x] / 255.0
+            if ga > 0.0:
+                col = [col[i] * (1.0 - ga) + 255.0 * ga for i in range(3)]
+            o = (base_row + x) * 4
+            px[o] = int(round(col[0]))
+            px[o + 1] = int(round(col[1]))
+            px[o + 2] = int(round(col[2]))
+            px[o + 3] = int(round(a * 255.0))
+    return px
 
 
 def make_icon_set(src_png, targets):
-    """从图标源文件生成任意尺寸的方形图标。
+    """从上游 logo 生成任意尺寸的方形 App 图标。
 
-    源图应为正方形（当前 assets/ICON_256.PNG 是 256×256）。仍保留
-    「取 min(宽,高) 从 (0,0) 裁切」的规则，以防换成横幅图时不至于出错。
-
-    targets 是 [(边长, 输出路径), ...]。群晖 SPK 要 64/256，
-    套件中心的缩略图要 72/256，桌面图标要 256，所以尺寸做成参数而不是写死。
+    targets 是 [(边长, 输出路径), ...]。群晖 SPK 要 64/256，套件中心缩略图要 72/256，
+    桌面图标成套要 16/24/32/48/64/72/128/256，所以尺寸做成参数而不是写死。
     """
-    w, h, px = _png_decode_rgba(src_png)
-    keyed = _png_colortype(src_png) == 2
-    if keyed:
-        # RGB 源没有 alpha，黑色是事实上的背景色，抠掉
-        px = _key_out_black(w, h, px)
-    side = min(w, h)
-    if side < 16:
-        sys.exit("[ERROR] %s 尺寸过小（%dx%d），无法生成图标" % (src_png, w, h))
-
-    # 裁出左上角 side×side 的方形
-    crop = bytearray(side * side * 4)
-    for y in range(side):
-        s = y * w * 4
-        crop[y * side * 4:(y + 1) * side * 4] = px[s:s + side * 4]
-
+    geo = _detect_glyph(src_png)
     for size, dst in targets:
-        if size > side:
-            # 放大必须插值：源图只有 side×side，整数倍面积平均会退化成最近邻
-            scaled = _bilinear_resize(side, side, crop, size, size)
-        else:
-            scaled = _box_resize(side, side, crop, size, size)
-        if keyed:
-            # 源图无 alpha、靠键控去背 —— 必须补底，否则在浅色界面上不可辨
-            scaled = _app_icon(size, size, scaled)
-        _png_encode_rgba(dst, size, size, scaled)
-    return w, h, side
+        _png_encode_rgba(dst, size, size, _render_app_icon(size, geo))
+    return geo
 
 
 def make_icons(src_png, out_64, out_256):
@@ -881,8 +918,9 @@ def main():
     go_version = read_version()
     spk_ver = spk_version(go_version)
     # 图标源用 assets/ICON.PNG（64×64）。别用 ICON_256.PNG：实测它就是 ICON.PNG
-    # 用最近邻放大 4 倍的结果（逐像素零差异），本身没有任何额外信息，拿它当源
-    # 只会把 4 像素的方块台阶原样带进产物。放大到 256 时由 _bilinear_resize 平滑处理。
+    # 用最近邻放大 4 倍的结果（逐像素零差异），本身没有任何额外信息。
+    # 字形几何是从源图里量出来的，再按矢量精度重绘到各个尺寸，所以源图分辨率
+    # 只影响几何测量精度，不影响产物的清晰度。
     icon_src = os.path.join(ROOT, "assets", "ICON.PNG")
     if not os.path.exists(icon_src):
         sys.exit("[ERROR] 缺少图标源文件 assets/ICON.PNG")
