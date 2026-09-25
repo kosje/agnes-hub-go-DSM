@@ -1519,10 +1519,13 @@ func probePayload(modality string, account *config.Account, settings config.Sett
 			"prompt": "a small blue circle icon", "size": "1K",
 		}
 	case "video":
-		return "/v1/videos", map[string]any{
-			"model":  pick(manifest.Video, pool.FallbackModel["video"]),
-			"prompt": "a one second clip of a blue circle",
-		}
+		// 必须走 BuildVideoBody：视频分 2.5 / v2.0 两个家族，参数口径互不兼容。
+		// 2.5 系列缺 mode 会被上游直接拒掉（`mode is required`），
+		// 而 v2.0 的老参数（width/num_frames）发给 2.5 同样是 400。
+		model := pick(manifest.Video, pool.FallbackModel["video"])
+		return "/v1/videos", intent.BuildVideoBody(
+			intent.Result{Prompt: intent.Prompt{Text: "a one second clip of a blue circle"}},
+			model, autoIntentConfig(settings), nil)
 	default:
 		return "/v1/chat/completions", map[string]any{
 			"model":      pick(manifest.Text, settings.ProbeModel),
@@ -2100,9 +2103,10 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 		decision.DroppedFields = intent.DroppedFields(body, intent.ImageFieldWhitelist)
 		bodyFor = s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Image, model)
 	} else if decision.Modality == intent.Video {
-		upstreamBody = intent.BuildVideoBody(decision, model, cfg, body)
-		decision.DroppedFields = intent.DroppedFields(body, intent.VideoFieldWhitelist)
-		bodyFor = s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Video, model)
+		// 视频必须按「最终选中的模型」重建请求体 —— 2.5 与 v2.0 参数互不兼容，
+		// 各账号清单里挂的家族可能不同，见 videoBodyFor 的说明。
+		decision.DroppedFields = intent.DroppedFields(body, intent.VideoFieldsFor(model))
+		bodyFor = s.videoBodyFor(settings, decision, poolClass, model, body)
 	} else {
 		// 兜底：作为文本处理
 		bodyFor = func(a *config.Account) ([]byte, string) {

@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -138,18 +139,38 @@ var (
 	agentGuards = []string{"tools", "tool_choice", "functions", "function_call", "response_format"}
 )
 
-// ImageFieldWhitelist / VideoFieldWhitelist 是允许透传给上游的字段。
+// ImageFieldWhitelist 是生图请求允许透传给上游的字段。
 var (
 	ImageFieldWhitelist = []string{
 		"size", "response_format", "quality", "style", "seed", "negative_prompt",
 		"image", "images", "image_url", "strength", "aspect_ratio", "width", "height",
 		"prompt_extend", "watermark",
 	}
-	VideoFieldWhitelist = []string{
-		"height", "width", "num_frames", "frame_rate", "duration", "seed",
-		"negative_prompt", "resolution", "ratio", "image", "images", "image_url",
-		"first_frame_image", "last_frame_image",
+
+	// VideoFieldWhitelist25 是 Agnes Video 2.5 系列接受的字段（model / prompt / mode 除外）。
+	//
+	// 口径来自上游文档：时长用 seconds（字符串 "4"~"12"），分辨率用 size 档位
+	// （720P/1080P/1K/2K），画幅用 aspect_ratio；关键帧用 first_frame / last_frame，
+	// 参考素材用 images / audios / videos。
+	//
+	// **不要往这里加 width / height / num_frames / frame_rate** —— 文档明确说这些是
+	// 「不可配置字段」，2.5 收到就 400。
+	VideoFieldWhitelist25 = []string{
+		"seconds", "size", "aspect_ratio", "seed", "n",
+		"first_frame", "last_frame", "images", "audios", "videos",
+		"negative_prompt",
 	}
+
+	// VideoFieldWhitelistV20 是 Agnes Video V2.0 接受的字段。
+	//
+	// 与 2.5 完全不兼容：这一代用 width/height/num_frames/frame_rate 控制画面与时长，
+	// mode 可选（ti2vid / keyframes）。上游已公告该模型于 2026-09-25 下线。
+	VideoFieldWhitelistV20 = []string{
+		"width", "height", "num_frames", "frame_rate", "seed",
+		"negative_prompt", "image", "images", "image_url",
+		"first_frame_image", "last_frame_image", "extra_body",
+	}
+
 	// 这些键即便不在白名单里也不算「被丢弃」——它们是 chat 形态的固有字段
 	ignorableKeys = map[string]bool{
 		"model": true, "messages": true, "prompt": true, "stream": true,
@@ -659,7 +680,7 @@ func normalizeSize(v any, fallback string) string {
 func BuildImageBody(res Result, model string, cfg Config, source map[string]any) map[string]any {
 	out := map[string]any{"model": model, "prompt": res.Prompt.Text}
 	for _, k := range ImageFieldWhitelist {
-		if v, ok := source[k]; ok && v != nil && asString(v) != "" {
+		if v, ok := source[k]; ok && !isEmptyField(v) {
 			out[k] = v
 		}
 	}
@@ -676,14 +697,102 @@ func BuildImageBody(res Result, model string, cfg Config, source map[string]any)
 	return out
 }
 
+// Agnes Video 2.5 的三种生成模式。mode 在 2.5 系列是**必填**字段。
+const (
+	VideoModeText      = "text"
+	VideoModeKeyframe  = "keyframe"
+	VideoModeReference = "reference"
+)
+
+// IsVideo25 判断该视频模型是否按 2.5 系列的口径发请求。
+//
+// 判定顺序刻意「先认 2.5、再认 2.0、认不出当 2.5」：
+//   - 名字里有 2.5 → 2.5 系列（agnes-video-2.5 / agnes-video-2.5-flash）；
+//   - 名字里有 2.0 → v2.0（agnes-video-v2.0，注意它同时含 "2.0" 但不含 "2.5"）；
+//   - 都认不出（自定义别名）→ 按 2.5 处理。
+//
+// 最后一条是权衡的结果：对认不出来的名字，带上 mode 比不带更容易成功 ——
+// 2.5 缺 mode 必然 400，而 v2.0 对多余的 mode 只是可选字段。
+func IsVideo25(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(m, "2.5"), strings.Contains(m, "2_5"):
+		return true
+	case strings.Contains(m, "2.0"), strings.Contains(m, "2_0"):
+		return false
+	default:
+		return true
+	}
+}
+
+// VideoFieldsFor 返回该模型实际接受的透传字段白名单。
+//
+// 用途是把「被丢弃的字段」如实报给调用方。以前只有一份 v2.0 的白名单，
+// 往 2.5 发请求时会把 mode / seconds / size / aspect_ratio 这些**上游真正需要**
+// 的字段报成「已忽略」—— 既误导用户，也让真正的丢弃（比如 width）淹没在噪音里。
+func VideoFieldsFor(model string) []string {
+	if IsVideo25(model) {
+		return VideoFieldWhitelist25
+	}
+	return VideoFieldWhitelistV20
+}
+
 // BuildVideoBody 把意图翻成上游 /v1/videos 请求体。
 //
-// 刻意不注入 height/width/num_frames/frame_rate 默认值：这些字段直接决定视频
+// 必须按模型家族分两套口径 —— 这两代视频模型的参数互不兼容，混用必吃 400：
+//
+//	2.5 系列：mode 必填（text/keyframe/reference）；时长 seconds、分辨率 size、
+//	          画幅 aspect_ratio；**禁止** width/height/num_frames/frame_rate。
+//	v2.0    ：width/height/num_frames/frame_rate 控制一切，mode 可选。
+//
+// 以前只有一份「v2.0 味」的白名单、而且里面根本没有 mode，于是：
+//  1. 选 2.5 必然收到 `mode is required`；
+//  2. 就算补上 mode，白名单里的 width/num_frames 一并发过去还会再吃一个 400。
+//
+// 刻意不注入 width/height/num_frames/frame_rate 默认值：这些字段直接决定视频
 // 时长与算力消耗，凭空注入等于替用户花钱。
 func BuildVideoBody(res Result, model string, cfg Config, source map[string]any) map[string]any {
 	out := map[string]any{"model": model, "prompt": res.Prompt.Text}
-	for _, k := range VideoFieldWhitelist {
-		if v, ok := source[k]; ok && v != nil && asString(v) != "" {
+	if IsVideo25(model) {
+		buildVideoBody25(out, res, source)
+	} else {
+		buildVideoBodyV20(out, res, cfg, source)
+	}
+	return out
+}
+
+// buildVideoBody25 按 Agnes Video 2.5 的口径组装请求体。
+func buildVideoBody25(out map[string]any, res Result, source map[string]any) {
+	for _, k := range VideoFieldWhitelist25 {
+		if v, ok := source[k]; ok && !isEmptyField(v) {
+			out[k] = v
+		}
+	}
+	// 2.5 只认 seconds（字符串 "4"~"12"），不认 duration —— 照抄 v2.0 的
+	// duration 会被当成未知字段。这里做一次映射，顺手把数字转成字符串。
+	if _, ok := out["seconds"]; !ok {
+		if v, ok := source["duration"]; ok && v != nil {
+			if s := normalizeSeconds25(v); s != "" {
+				out["seconds"] = s
+			}
+		}
+	}
+	// 把调用方给的图片放到正确的字段上：已有首/尾帧就不动，否则进参考素材。
+	if len(res.Prompt.Images) > 0 && !hasAnyKey(out, "first_frame", "last_frame", "images") {
+		out["images"] = res.Prompt.Images
+	}
+	// mode 必填。显式给了且与素材不冲突就用，否则按素材推断。
+	// 注意从 source 读而不是从 out 读 —— mode 刻意不在白名单里（它是必填字段，
+	// 由这里统一决定），从 out 读会永远读不到调用方的显式声明。
+	out["mode"] = resolveVideoMode25(out, res, source)
+	// 上游对「mode 与媒体字段不匹配」是直接 400，所以按最终 mode 清一遍。
+	sanitizeMode25Fields(out)
+}
+
+// buildVideoBodyV20 按 Agnes Video V2.0 的口径组装请求体。
+func buildVideoBodyV20(out map[string]any, res Result, cfg Config, source map[string]any) {
+	for _, k := range VideoFieldWhitelistV20 {
+		if v, ok := source[k]; ok && !isEmptyField(v) {
 			out[k] = v
 		}
 	}
@@ -696,7 +805,97 @@ func BuildVideoBody(res Result, model string, cfg Config, source map[string]any)
 			}
 		}
 	}
-	return out
+}
+
+// resolveVideoMode25 决定 2.5 的 mode。
+//
+// 规则：**显式声明只要素材能满足就尊重**，满足不了才按素材纠正。
+//
+// 为什么不一律让素材优先：调用方说 keyframe 又给了 images 时，把 mode 改成
+// reference 会把用户明确的意图悄悄换掉。反过来，说 text 却塞了首帧图这种
+// 「素材根本用不上」的声明，按 text 发出去上游一定 400，只能纠正。
+func resolveVideoMode25(out map[string]any, res Result, source map[string]any) string {
+	hasKeyframe := hasAnyKey(out, "first_frame", "last_frame")
+	hasRef := hasAnyKey(out, "images", "audios", "videos") || len(res.Prompt.Images) > 0
+
+	switch strings.ToLower(strings.TrimSpace(asString(source["mode"]))) {
+	case VideoModeText:
+		if !hasKeyframe && !hasRef {
+			return VideoModeText
+		}
+	case VideoModeKeyframe:
+		if hasKeyframe {
+			return VideoModeKeyframe
+		}
+	case VideoModeReference:
+		if hasRef {
+			return VideoModeReference
+		}
+	}
+
+	// 没声明、或声明与素材冲突：按素材推断。
+	switch {
+	case hasKeyframe && hasRef:
+		// 两类素材都给了。keyframe 是更「精确」的诉求（要求成片首尾就是这两张图），
+		// 优先它；参考素材会被 sanitizeMode25Fields 清掉。
+		return VideoModeKeyframe
+	case hasKeyframe:
+		return VideoModeKeyframe
+	case hasRef:
+		return VideoModeReference
+	default:
+		return VideoModeText
+	}
+}
+
+// sanitizeMode25Fields 删掉与当前 mode 冲突的媒体字段。
+//
+// 上游文档给的对应关系（冲突即 400）：
+//
+//	text      不允许 first_frame / last_frame / images / audios / videos
+//	keyframe  不允许 images / audios / videos
+//	reference 不允许 first_frame / last_frame
+func sanitizeMode25Fields(out map[string]any) {
+	switch asString(out["mode"]) {
+	case VideoModeText:
+		dropKeys(out, "first_frame", "last_frame", "images", "audios", "videos")
+	case VideoModeKeyframe:
+		dropKeys(out, "images", "audios", "videos")
+	case VideoModeReference:
+		dropKeys(out, "first_frame", "last_frame")
+	}
+}
+
+// normalizeSeconds25 把时长归一成 2.5 要求的字符串秒数。
+func normalizeSeconds25(v any) string {
+	switch n := v.(type) {
+	case string:
+		return strings.TrimSpace(n)
+	case float64:
+		return strconv.Itoa(int(n))
+	case int:
+		return strconv.Itoa(n)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case json.Number:
+		return n.String()
+	}
+	return ""
+}
+
+func hasAnyKey(m map[string]any, keys ...string) bool {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && !isEmptyField(v) {
+			return true
+		}
+	}
+	return false
+}
+
+func dropKeys(m map[string]any, keys ...string) {
+	for _, k := range keys {
+		delete(m, k)
+	}
 }
 
 // DroppedFields 找出被丢弃的字段（透明化：告诉用户哪些字段没被上游端点接受）。
@@ -855,12 +1054,42 @@ func asString(v any) string {
 		return s.String()
 	case float64:
 		return fmt.Sprintf("%v", s)
+	case float32:
+		return fmt.Sprintf("%v", s)
+	case int:
+		return fmt.Sprintf("%d", s)
+	case int32:
+		return fmt.Sprintf("%d", s)
+	case int64:
+		return fmt.Sprintf("%d", s)
 	case bool:
 		return fmt.Sprintf("%v", s)
 	case nil:
 		return ""
 	}
 	return ""
+}
+
+// isEmptyField 判断一个待透传的字段值是否「空」。
+//
+// 不能拿 asString 判空：它只认标量，遇到 JSON 数组 / 对象会返回空串。
+// 而 readBody 是把请求体 Unmarshal 进 map[string]any 的，JSON 数组到这里就是
+// []any —— 于是 `"images": ["https://..."]` 这种**最正常的参考素材写法**
+// 会被当成空值静默丢掉，用户看到的现象是「图生视频/参考生成莫名其妙不生效」。
+func isEmptyField(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(x) == ""
+	case []any:
+		return len(x) == 0
+	case []string:
+		return len(x) == 0
+	case map[string]any:
+		return len(x) == 0
+	}
+	return false
 }
 
 func minInt(a, b int) int {

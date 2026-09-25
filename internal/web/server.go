@@ -715,6 +715,36 @@ func (s *Server) mediaBodyFor(base map[string]any, settings config.Settings, dec
 	}
 }
 
+// videoBodyFor 生成「按最终选中的模型重建」的视频请求体。
+//
+// 为什么不复用 mediaBodyFor：那个函数是「先把 body 建好、再按账号换个 model 名字」。
+// 对生图没问题（图片模型参数口径一致），对视频则会出事 —— 视频分 2.5 / v2.0
+// 两个家族，参数互不兼容，而不同账号的清单里可能挂着不同家族。换名字不换参数，
+// 等于把 2.5 的 mode/seconds 发给 v2.0，或把 v2.0 的 width/num_frames 发给 2.5，
+// 两边都是 400。所以这里把 BuildVideoBody 挪进闭包，按 chosen 重新建一次。
+func (s *Server) videoBodyFor(settings config.Settings, decision intent.Result,
+	poolClass, fallbackModel string, body map[string]any) func(*config.Account) ([]byte, string) {
+
+	cfg := autoIntentConfig(settings)
+	explicit := strings.TrimSpace(decision.ModelRequested) != "" &&
+		!isAutoModel(decision.ModelRequested, settings)
+	if explicit {
+		model := pool.ResolveModel(decision.ModelRequested, settings.ModelAliases)
+		buf, _ := json.Marshal(intent.BuildVideoBody(decision, model, cfg, body))
+		return func(*config.Account) ([]byte, string) { return buf, model }
+	}
+	pref := intent.PreferredModels(cfg, intent.Video)
+	return func(a *config.Account) ([]byte, string) {
+		declared := s.Hub.DeclaredModels(a, poolClass)
+		chosen := intent.ChooseModel(declared, pref)
+		if chosen == "" {
+			chosen = fallbackModel
+		}
+		buf, _ := json.Marshal(intent.BuildVideoBody(decision, chosen, cfg, body))
+		return buf, chosen
+	}
+}
+
 // ---------------------------------------------------------------------------
 // agnes-auto → 生图
 // ---------------------------------------------------------------------------
@@ -859,12 +889,10 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 		writeErr(w, e)
 		return
 	}
-	cfg := autoIntentConfig(settings)
-	upstreamBody := intent.BuildVideoBody(decision, model, cfg, body)
-	decision.DroppedFields = intent.DroppedFields(body, intent.VideoFieldWhitelist)
+	decision.DroppedFields = intent.DroppedFields(body, intent.VideoFieldsFor(model))
 
 	sessionKey := s.Hub.SessionKey(headerMap(r), item.Key)
-	bodyFor := s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Video, model)
+	bodyFor := s.videoBodyFor(settings, decision, poolClass, model, body)
 
 	result, err := relay.Do(r.Context(), s.Hub, s.Client, relay.Options{
 		SessionKey: sessionKey, PoolClass: poolClass, Pinned: item.PinnedAccount,
@@ -923,7 +951,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	// 对「用 chat 客户端发一句话要视频」的用户，等待能让体验完整；
 	// 但等待会占住一条连接，所以默认关闭、由控制台决定。
 	videoURL := ""
-	if cfg.VideoWaitSec > 0 && videoID != "" {
+	if cfg := autoIntentConfig(settings); cfg.VideoWaitSec > 0 && videoID != "" {
 		videoURL = s.waitForVideo(r.Context(), result.Account, job, cfg.VideoWaitSec)
 	}
 

@@ -131,6 +131,26 @@ func (m *mockAgnes) handler() http.Handler {
 				writeJSONRaw(w, 400, map[string]any{"code": "invalid_request", "message": "prompt 不能为空"})
 				return
 			}
+			// 复刻真实上游对 Agnes Video 2.5 的校验（这正是当初「生视频一直 400」的成因）：
+			//   · mode 必填 —— 缺了回 `mode is required`；
+			//   · width / height / num_frames / frame_rate 属于「不可配置字段」，
+			//     一出现就 400（这些是老一代 v2.0 的参数）。
+			// 判定直接按模型名里的 "2.5" 写，刻意不复用 intent.IsVideo25 ——
+			// 模拟上游要独立复刻上游的规则，不能跟着被测代码的假设走。
+			if strings.Contains(model, "2.5") {
+				if m, _ := payload["mode"].(string); strings.TrimSpace(m) == "" {
+					writeJSONRaw(w, 400, map[string]any{
+						"code": "invalid_request", "message": "mode is required"})
+					return
+				}
+				for _, k := range []string{"width", "height", "num_frames", "frame_rate"} {
+					if _, ok := payload[k]; ok {
+						writeJSONRaw(w, 400, map[string]any{"code": "invalid_request",
+							"message": "parameter " + k + " is not configurable for this model"})
+						return
+					}
+				}
+			}
 			writeJSONRaw(w, 200, map[string]any{"video_id": "vid-mock-0001", "status": "queued"})
 		case strings.Contains(path, "/agnesapi"):
 			writeJSONRaw(w, 200, map[string]any{"status": "completed",
