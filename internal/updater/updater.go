@@ -92,6 +92,13 @@ type Config struct {
 	// NoRelaunch 只影响 Windows：置 true 时替换完成后不自动把新版本拉起来，
 	// 交给调用方（服务管理器 / 用户）决定何时重启。默认 false = 自动重启。
 	NoRelaunch bool
+	// SuiteManaged 表示二进制由外部包管理器（群晖套件中心等）负责升级。
+	//
+	// 只影响「有没有更新」的判定口径：套件版的 release 资产是 SPK，不是裸二进制，
+	// pickAsset 永远挑不到。若仍按「必须挑到本平台资产才算有更新」来判，
+	// 结果就是 IsUpdateAvailable 恒为 false —— 控制台永远显示「已是最新」，
+	// 用户根本不知道有没有新版。置 true 后只看版本号，不看资产。
+	SuiteManaged bool
 }
 
 // ---------------------------------------------------------------------------
@@ -167,21 +174,25 @@ func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 
 	// 只挑本平台能用的那个资产；挑不到就不算「有更新」，
 	// 否则点了更新只会在 Apply 阶段失败。
+	//
+	// 套件版例外：它的资产是 SPK（agnes-hub-x86_64-1.0.13.spk），不含裸二进制名，
+	// pickAsset 必然返回 nil。这里只关心「版本号有没有变新」，升级由套件中心完成。
+	needAsset := !u.cfg.SuiteManaged
 	asset := pickAsset(release.Assets, u.cfg.BinaryName, runtime.GOOS, runtime.GOARCH)
 
 	result := &CheckResult{
 		CurrentVersion:    cur,
-		LatestVersion:     tag,
-		IsUpdateAvailable: isNewer && asset != nil,
+		LatestVersion:     displayVersion(tag),
+		IsUpdateAvailable: isNewer && (!needAsset || asset != nil),
 		// 带上时分：控制台「发布时间」要能看出这次检查拿到的到底是不是刚发的版本。
 		// 用服务器本地时区，用户看到的就是自己 NAS 上的时间。
-		ReleaseDate:       release.PublishedAt.Local().Format("2006-01-02 15:04"),
-		Changelog:         truncate(release.Body, 500),
-		Assets:            release.Assets,
+		ReleaseDate: release.PublishedAt.Local().Format("2006-01-02 15:04"),
+		Changelog:   truncate(release.Body, 500),
+		Assets:      release.Assets,
 	}
 	// 只有「确实有新版本、但没提供本平台的包」才值得报错；
 	// 已经是最新版时资产列表里没有本平台的包是正常的，不该弹错误。
-	if isNewer && asset == nil {
+	if isNewer && needAsset && asset == nil {
 		result.Error = fmt.Sprintf("release %s 没有 %s/%s 的资产", tag, runtime.GOOS, runtime.GOARCH)
 	}
 
@@ -361,7 +372,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context) (*GitHubRelease, error
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "baiPiao-hub/"+u.Version())
+	req.Header.Set("User-Agent", "agnes-hub/"+u.Version())
 
 	resp, err := u.client.Do(req)
 	if err != nil {
@@ -422,6 +433,20 @@ func versionGt(v1, v2 string) bool {
 	p1 := parseVersion(n1)
 	p2 := parseVersion(n2)
 	return compareParts(p1, p2) > 0
+}
+
+// displayVersion 把 release tag 变成给用户看的版本号：只去掉开头的 v。
+//
+// 为什么不能直接显示 tag：控制台的「当前版本」来自编译期常量（1.0.13），
+// 而 tag 是 v1.0.13 —— 同一个版本两个写法，用户会以为系统没认出来。
+// 这里刻意**不**复用 stripPrefix：那个函数还会在第一个 '-' 处截断，
+// 是给「比较」用的宽松口径，拿来显示会把 1.0.13-rc1 显示成 1.0.13。
+func displayVersion(tag string) string {
+	s := strings.TrimSpace(tag)
+	if strings.HasPrefix(s, "v") || strings.HasPrefix(s, "V") {
+		s = s[1:]
+	}
+	return s
 }
 
 func stripPrefix(s string) string {

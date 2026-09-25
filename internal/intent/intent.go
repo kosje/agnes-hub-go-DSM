@@ -824,7 +824,7 @@ func SSEFromChat(envelope map[string]any) [][]byte {
 	last["choices"] = []any{map[string]any{"index": 0,
 		"delta": map[string]any{}, "finish_reason": "stop"}}
 	if v, ok := envelope["agnes_hub"]; ok {
-		last["baipiao_hub"] = v
+		last["agnes_hub"] = v
 	}
 	if v, ok := envelope["data"]; ok {
 		last["data"] = v

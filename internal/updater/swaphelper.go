@@ -8,7 +8,7 @@ import (
 
 // 助手内部参数。用不常见的短横线前缀，避免和正常命令行参数冲突。
 const (
-	swapHelperFlag    = "--baipiao-hub-swap-helper"
+	swapHelperFlag    = "--agnes-hub-swap-helper"
 	swapSrcArg        = "--src"
 	swapDstArg        = "--dst"
 	swapNoRelaunchArg = "--no-relaunch"

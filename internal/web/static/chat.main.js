@@ -464,10 +464,14 @@ async function generateVideo(){
       method:"POST",
       body:JSON.stringify({model,prompt})
     });
-    const jobId=resp.job_id||resp.id;
+    const jobId=resp.job_id||resp.video_id||resp.id;
     if(jobId){
       result.innerHTML=`<div class="banner good">✅ 视频已提交生成！任务 ID: ${esc(jobId)}</div>`;
       pollVideo(jobId,result);
+    }else{
+      // 提交没报错但也没给任务号：把原始响应摊出来，否则界面会一直停在 Submitting
+      result.innerHTML=`<div class="banner warn">上游没有返回任务 ID，无法跟踪进度。</div>
+        <pre class="md-pre" style="font-size:11px">${esc(JSON.stringify(resp,null,2))}</pre>`;
     }
   }catch(e){
     result.innerHTML=`<div class="banner bad">❌ ${esc(e.message)}</div>`;
@@ -475,14 +479,26 @@ async function generateVideo(){
 }
 
 async function pollVideo(jobId,resultEl){
+  // 轮询上限：每 3 秒一次、最多 100 次（约 5 分钟）。不加限制的话，
+  // 上游任务卡在 queued 时这个定时器会一直转下去，白白占着页面。
+  const MAX_TRIES=100;
+  let tries=0;
   const poll=async()=>{
+    tries++;
     try{
-      const resp=await api(`/api/chat/v1/videos/${jobId}`);
+      const resp=await api(`/api/chat/v1/videos/${encodeURIComponent(jobId)}`);
       if(resp.status==="completed"&&resp.video_url){
         resultEl.innerHTML+=`<div class="video-wrap"><video controls src="${esc(resp.video_url)}"></video></div>`;
         return;
       }else if(resp.status==="failed"){
         resultEl.innerHTML+=`<div class="banner bad">❌ 生成失败: ${esc(resp.error||"未知错误")}</div>`;
+        return;
+      }else if(resp.status==="unknown"){
+        resultEl.innerHTML+=`<div class="banner warn">⚠️ ${esc(resp.error||"任务不存在")}</div>`;
+        return;
+      }
+      if(tries>=MAX_TRIES){
+        resultEl.innerHTML+=`<div class="banner warn">⚠️ 等待超时，任务可能仍在排队。可到控制台「视频任务」查看最终结果。</div>`;
         return;
       }
       setTimeout(poll,3000);
@@ -646,11 +662,11 @@ function populateModelSelects(){
 /* ==================== UTILS ==================== */
 // stripInlineImages 把正文里的 base64 图片压成一行提示。
 //
-// 服务端为了让图片能在浏览器里显示，会把生成结果回取并内联成
-// data:image/...;base64,... —— 单张图动辄 1~3 MB，转成 base64 还要再涨三分之一。
-// 这段正文如果原样 POST 到 /api/chat-logs，服务端的 JSON 存储会被瞬间撑爆
-// （几十条记录就能上百 MB），而对话记录列表本来也不显示缩略图。
-// 所以入库前压掉，只留一行说明；聊天窗口当次显示不受影响。
+// 正常情况下服务端会把生成的图片落盘，正文里只有一个短短的本地地址
+// （/api/chat/images/<指纹>.png），这段正则不会命中。
+// 留着它是为了兜底：上游有时只回 b64_json，或落盘失败退回原始 data URI ——
+// 那种情况下一张 3 MB 的图会把聊天记录（全 JSON 存储）瞬间撑爆，
+// 而记录列表本来也不显示缩略图，入库前压掉最省事。
 const INLINE_IMG_RE=/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi;
 function stripInlineImages(src){
   return String(src==null?"":src).replace(INLINE_IMG_RE,"(图片已内联显示，未存入记录)");
@@ -658,8 +674,8 @@ function stripInlineImages(src){
 
 // 轻量 Markdown 渲染：先整体 HTML 转义防 XSS，再做块级/行内解析。
 // 支持：标题、有序/无序列表、引用、分割线、围栏代码块、行内代码、
-// 粗体/斜体/删除线、链接、图片。链接仅放行 http/https/相对路径。
-// 图片额外放行 data:image/ —— 服务端内联的图片走的就是这条路。
+// 粗体/斜体/删除线、链接、图片。链接仅放行 http/https/相对路径 ——
+// 服务端落盘的图片走的就是相对路径 /api/chat/images/...。
 function renderMarkdown(src){
   if(src==null) return "";
   let s=esc(src);
