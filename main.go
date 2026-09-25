@@ -31,6 +31,13 @@ import (
 
 var version = "1.0.11"
 
+// releaseRepo 是控制台「版本与自更新」卡片里「查看全部版本」要跳转的 GitHub 仓库
+// （owner/name），非套件版会被自更新仓库覆盖，见 main()。这里是本 DSM 套件分支的仓库：
+// 套件版禁用了自更新、升级由群晖套件中心负责，所以链接必须指向套件自己的 Release，
+// 不能指向上游 —— 上游的 Release 里没有 SPK，用户点进去会一脸懵。
+// 换 fork / 换发布仓库时同步改这一行。
+var releaseRepo = "kosje/agnes-hub-go-DSM"
+
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -89,11 +96,16 @@ func main() {
 	// 检查频率：12 小时。自更新是「有就换」，没必要更勤；
 	// 控制台上也可以随时手动点「检查更新」。
 	updRepo, checkInterval := "my788525/agnes-hub-go", 12*time.Hour
+	// 控制台「查看全部版本」的跳转目标：默认用套件仓库，自更新开着时跟随自更新仓库，
+	// 否则用户点进去看到的版本跟「立即更新」能装上的版本会对不上。
+	relRepo := releaseRepo
 	if *noSelfUpdate {
 		// 群晖套件等场景：二进制由套件中心管理，套件 INFO 里登记了 package.tgz 的 checksum。
 		// 若允许进程内替换二进制，套件的「实际内容」与「已安装版本」就会不一致，
 		// 下次套件中心校验或升级必然冲突 —— 所以这里彻底关掉检查，而不是只忽略检查结果。
 		updRepo, checkInterval = "", 0
+	} else {
+		relRepo = updRepo
 	}
 	updCfg := updater.Config{
 		Repo:          updRepo,
@@ -103,6 +115,7 @@ func main() {
 	}
 	upd := updater.New(updCfg, version, exe, nil)
 	srv.SetUpdater(upd)
+	srv.SetReleaseRepo(relRepo)
 	upd.StartBackground(ctx, checkInterval)
 
 	// 应用完更新后要真的退出：光置一个标志位没人看，

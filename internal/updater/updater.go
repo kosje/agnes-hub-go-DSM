@@ -125,6 +125,10 @@ func New(cfg Config, version, binPath string, logger *log.Logger) *Updater {
 	return u
 }
 
+// Repo 返回配置的 GitHub 仓库（owner/name）。空字符串表示自更新未启用。
+// 控制台用它拼「查看全部版本」的跳转地址，保证链接与自更新实际拉取的仓库一致。
+func (u *Updater) Repo() string { return u.cfg.Repo }
+
 // Version 返回当前版本。加锁是因为应用更新后会在运行期改写它。
 func (u *Updater) Version() string {
 	u.mu.Lock()

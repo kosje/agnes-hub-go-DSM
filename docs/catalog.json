@@ -2,15 +2,15 @@
   "packages": [
     {
       "package": "agnes-hub",
-      "version": "1.0.11-0002",
+      "version": "1.0.11-0003",
       "dname": "Agnes Hub",
       "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关。统一模型 agnes-auto 自动判定文生 / 生图 / 生视频；FIFO 严格节拍限流、软粘性溢出、二维自适应校准、熔断自动复活。数据保存在套件目录内，全 JSON 文件，免 SSH 即可备份迁移。",
       "price": 0,
       "download_count": 0,
       "recent_download_count": 0,
-      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.11-0002.spk",
-      "size": 3512320,
-      "md5": "f7e6723a662716a839807827c4a716bc",
+      "link": "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.11-0003.spk",
+      "size": 4177920,
+      "md5": "090c3b997699659c9f04e7ee56adfb01",
       "thumbnail": [
         "https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-72.png"
       ],
@@ -30,7 +30,7 @@
       "distributor": "kosje",
       "distributor_url": "https://github.com/kosje/agnes-hub-go-DSM",
       "support_url": "https://github.com/kosje/agnes-hub-go-DSM/issues",
-      "changelog": "重做 DSM 图标，彻底解决「套件图标显示不对」的问题。<br>· 图标改为按矢量精度重绘：从上游 logo 里量出白色字形的真实几何（外框、边框厚度、分隔线位置），再按几何重新栅格化，16/24/32/48/64/72/128/256 全尺寸都清晰、无锯齿<br>· 去掉原图的黑底与浅紫圆盘：原 logo 是「黑底 + 浅紫圆盘 + 白字形」的 RGB 图，抠掉黑底后白字形压在浅紫圆盘上对比度极低、还会与方底形成两层轮廓。现在改为品牌蓝渐变圆角方底 + 白色字形 + 淡蓝三格，浅色/深色主题下都清晰<br>· 同步上游 1.0.11：修复 AMD 空响应体、软粘性会话绑定模型判定，新增账号编辑完整弹窗与优先级支持",
+      "changelog": "换用全新的「A」字形图标，并修复控制台更新面板的链接与状态显示。<br>· 图标换成「铬质 A 字 + 星空光环」插画：整幅裁切 + 线性光空间缩放（直接在 sRGB 上缩小会让暗部发灰）+ 轻调色 + DSM 圆角遮罩，16/24/32/48/64/72/128/256 全尺寸都清晰<br>· 小尺寸自适应：16/24/32px 自动往里收一点，保证「A」在小图标里还认得出来<br>· 修复控制台「查看全部版本」指向上游仓库的问题，改为指向本套件仓库，且链接跟随实际升级来源<br>· 套件版如实显示「由套件中心管理」并置灰自更新按钮：套件是用 -no-selfupdate 启动的，原来那句「当前已是最新版本」会让用户以为没得升<br>· 网页顶栏 logo 同步换成新图标（原先还是「黑底 + 浅紫圆盘」的老图，22px 下白字形糊成一团）",
       "thirdparty": true,
       "category": 0,
       "subcategory": 0,

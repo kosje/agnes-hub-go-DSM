@@ -90,10 +90,14 @@ agnes-hub-go/
 │   ├── agnes-hub-<arch>-<版本>.spk   套件本体（catalog 的 link 指向这里）
 │   └── agnes-hub-72.png / -256.png   套件中心列表与详情页图标
 ├── assets/
-│   ├── ICON.PNG                图标源文件（横幅图，build_spk 会裁出方形图标）
-│   └── ICON_256.PNG            同上（当前与 ICON.PNG 内容相同）
+│   └── ICON.PNG                图标源文件（整幅插画，build_spk 按比例裁出方形图标）
 └── data/                       运行期数据（首次启动自动创建，勿提交）
 ```
+
+> 图标只有 `assets/ICON.PNG` 一个源文件：`tools/build_spk.py` 会按 `ICON_CROP_*`
+> 比例裁切、在线性光空间缩放、加圆角遮罩，一次生成 16/24/32/48/64/72/128/256 全套。
+> 换了源图之后记得再跑一次 `python tools/build_spk.py --emit-web-logo` 重生成网页顶栏
+> 的 logo（它是 `go:embed` 进二进制的，必须先于 `go build`）。
 
 ### 修改启动脚本的正确姿势
 

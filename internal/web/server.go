@@ -37,6 +37,10 @@ type Server struct {
 	Updater *updater.Updater
 	// Version 由 main 注入，供 /healthz 与自更新接口显示，避免写死在多处。
 	Version string
+	// ReleaseRepo 是控制台「查看全部版本」要跳转的 GitHub 仓库（owner/name），
+	// 由 main 注入。套件版禁用了自更新，这里指向套件自己的 Release 仓库；
+	// 自更新开启时指向自更新仓库，保证链接与「立即更新」实际会拉取的来源一致。
+	ReleaseRepo string
 	// intentCache 缓存 auto 路径的意图判定（body 哈希 + 规则指纹 → 结论）。
 	// 仅 handleTextish 命中 auto 模型时读写；显式模型名、媒体端点均不走。
 	intentCache *intent.Cache
@@ -55,6 +59,9 @@ func (s *Server) SetClient(c *http.Client) { s.Client = c }
 
 // SetUpdater 注入自更新器（启动后调用）。
 func (s *Server) SetUpdater(u *updater.Updater) { s.Updater = u }
+
+// SetReleaseRepo 注入控制台「查看全部版本」要跳转的仓库（owner/name）。
+func (s *Server) SetReleaseRepo(repo string) { s.ReleaseRepo = repo }
 
 // Updater 返回当前 updater 实例（测试用）。
 func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
