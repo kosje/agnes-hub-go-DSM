@@ -1,6 +1,7 @@
 package intent
 
 import (
+	"strings"
 	"testing"
 
 	"agneshub/internal/pool"
@@ -289,6 +290,34 @@ func TestImageContent(t *testing.T) {
 	}
 	if content == "" {
 		t.Error("应生成 Markdown 内容")
+	}
+}
+
+// TestImageContentGivesDownloadURL 正文里除了内联图片，还要给一条可复制的下载地址。
+//
+// Markdown 的 ![](url) 把地址藏进了语法里，AI 客户端里图片是渲染出来的、
+// 右键常常拿不到原始地址，用户想「另存为」时无处可复制。
+func TestImageContentGivesDownloadURL(t *testing.T) {
+	content, _ := ImageContent([]map[string]any{
+		{"url": "https://hub.example.com/api/chat/images/abc.png", "revised_prompt": "a cat"},
+	}, "画一只猫")
+
+	if !strings.Contains(content, "![") {
+		t.Fatalf("仍要保留内联图片语法：%q", content)
+	}
+	if !strings.Contains(content, "原图下载：https://hub.example.com/api/chat/images/abc.png?download=1") {
+		t.Errorf("应给出带 download=1 的下载地址，实际 %q", content)
+	}
+}
+
+// TestImageContentSkipsDownloadURLForDataURI data URI 不该给下载行。
+//
+// 上游只回 b64_json 时，url 是 data:image/png;base64,... —— 它本身就是内容，
+// 加个 ?download=1 既无意义，又会把那一大串 base64 在正文里再抄一遍。
+func TestImageContentSkipsDownloadURLForDataURI(t *testing.T) {
+	content, _ := ImageContent([]map[string]any{{"b64_json": "AAAA"}}, "画一只猫")
+	if strings.Contains(content, "原图下载") {
+		t.Errorf("data URI 不该给下载行：%q", content)
 	}
 }
 

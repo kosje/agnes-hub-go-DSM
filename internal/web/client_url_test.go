@@ -282,3 +282,215 @@ func TestMediaBaseEndpoint(t *testing.T) {
 		t.Errorf("client_media_url=local 时应给客户端本地绝对地址，实际 %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// auto 档：配了「对外访问地址」就把客户端指到网关
+// ---------------------------------------------------------------------------
+
+// settleSettings 先把一次性迁移跑掉，把 SettingsVersion 推到当前值。
+//
+// 不先跑这一步的话，下面写进去的值会被 migrateSettings 当成「旧配置」再改一遍 ——
+// 测的就不是我们想测的那条路径了。
+func settleSettings(t *testing.T, h *harness) {
+	t.Helper()
+	if err := h.store.UpdateSettings(func(*config.Settings) {}); err != nil {
+		t.Fatalf("settle settings: %v", err)
+	}
+}
+
+// TestAutoClientMediaURLUsesGatewayWhenPublicBaseURLSet 钉住用户这次的真实故障。
+//
+// 用户已把网关反代到 https://agens.jr.tn:52325，也在设置页填了「对外访问地址」，
+// 但客户端拿到的仍是上游 CDN 地址。根因：控制台的「客户端媒体地址」下拉框默认
+// 选中「上游地址」，而它**每次保存设置页都会把当前选中项写回配置** —— 于是只要
+// 动过一次设置页，这个字段就被钉死成 upstream，用户填的对外访问地址等于白填。
+//
+// 现在 auto 档的语义是：配了「对外访问地址」→ 客户端拿网关地址。
+func TestAutoClientMediaURLUsesGatewayWhenPublicBaseURLSet(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	servePNGUpstream(t, h)
+	settleSettings(t, h)
+	if err := h.store.UpdateSettings(func(st *config.Settings) {
+		st.PublicBaseURL = "https://agens.jr.tn:52325"
+		st.ClientMediaURL = "" // auto
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := h.post("/api/chat/v1/chat/completions", map[string]any{
+		"model": "agnes-auto",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "帮我画一张水墨国风佳人图片，比例：9:16。"},
+		},
+		"stream":       false,
+		"aspect_ratio": "9:16",
+	})
+	content := chatContent(t, body)
+
+	want := "https://agens.jr.tn:52325" + imageKind.route
+	if !strings.Contains(content, "]("+want) {
+		t.Fatalf("配了对外访问地址后，客户端应拿到网关地址 %s…，实际：%q",
+			want, truncateStr(content, 300))
+	}
+}
+
+// TestAutoClientMediaURLFallsBackToUpstreamWithoutBase 没配对外访问地址时仍给上游。
+//
+// 这是 auto 的另一半：没填对外地址就没法保证网关地址从客户端够得到，
+// 上游那个公网 https 地址才更稳妥。
+func TestAutoClientMediaURLFallsBackToUpstreamWithoutBase(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	servePNGUpstream(t, h)
+	settleSettings(t, h)
+	if err := h.store.UpdateSettings(func(st *config.Settings) {
+		st.PublicBaseURL = ""
+		st.ClientMediaURL = ""
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := h.post("/api/chat/v1/chat/completions", map[string]any{
+		"model": "agnes-auto",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "画一幅山水画。"},
+		},
+		"stream":       false,
+		"aspect_ratio": "9:16",
+	})
+	content := chatContent(t, body)
+	if !strings.Contains(content, "]("+h.mock.getImageURL()) {
+		t.Fatalf("没配对外访问地址时应回上游地址，实际：%q", truncateStr(content, 300))
+	}
+}
+
+// TestExplicitUpstreamWinsOverPublicBaseURL 显式选「上游地址」时不被 auto 抢走。
+func TestExplicitUpstreamWinsOverPublicBaseURL(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	servePNGUpstream(t, h)
+	settleSettings(t, h)
+	if err := h.store.UpdateSettings(func(st *config.Settings) {
+		st.PublicBaseURL = "https://agens.jr.tn:52325"
+		st.ClientMediaURL = "upstream"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, body := h.post("/api/chat/v1/chat/completions", map[string]any{
+		"model": "agnes-auto",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "画一幅山水画。"},
+		},
+		"stream":       false,
+		"aspect_ratio": "9:16",
+	})
+	content := chatContent(t, body)
+	if !strings.Contains(content, "]("+h.mock.getImageURL()) {
+		t.Fatalf("显式 upstream 应压过 auto，实际：%q", truncateStr(content, 300))
+	}
+}
+
+// TestMediaBasePanelReportsClientView 自检面板必须报告**外部客户端**会收到什么。
+//
+// 面板本身就是一个网页请求（带 X-Agnes-Hub-Surface: web）。1.0.18 的实现直接拿
+// 这次请求去算 url_for_client，于是 webSurface 把结果短路成网关地址 —— 无论
+// 「客户端媒体地址」配成什么，面板都显示「客户端拿到的是网关地址」。
+//
+// 用户正是被这个面板骗了：面板说已生效，客户端拿到的其实还是上游地址。
+func TestMediaBasePanelReportsClientView(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	settleSettings(t, h)
+	if err := h.store.UpdateSettings(func(st *config.Settings) {
+		st.PublicBaseURL = "https://agens.example.com:52325"
+		st.ClientMediaURL = "upstream" // 显式上游，面板必须如实反映
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fetch := func() map[string]any {
+		req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/api/media-base", nil)
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: h.store.SessionToken()})
+		req.Header.Set(surfaceHeader, "web") // 面板就是网页请求
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("自检请求失败：%v", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var out map[string]any
+		_ = json.Unmarshal(raw, &out)
+		return out
+	}
+
+	out := fetch()
+	if got, _ := out["url_for_client"].(string); strings.Contains(got, imageKind.route) {
+		t.Errorf("配成 upstream 时面板不该说客户端会拿到网关地址，实际 %q", got)
+	}
+	if got, _ := out["client_media_mode"].(string); got != "upstream" {
+		t.Errorf("面板应回显生效档位 upstream，实际 %q", got)
+	}
+
+	// 换成 auto：配了对外访问地址 → 客户端该拿网关地址
+	if err := h.store.UpdateSettings(func(st *config.Settings) {
+		st.ClientMediaURL = ""
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out2 := fetch()
+	got, _ := out2["url_for_client"].(string)
+	if !strings.Contains(got, "https://agens.example.com:52325"+imageKind.route) {
+		t.Errorf("auto + 已配对外地址时面板应显示网关地址，实际 %q", got)
+	}
+	if m, _ := out2["client_media_mode"].(string); m != "auto" {
+		t.Errorf("面板应回显生效档位 auto，实际 %q", m)
+	}
+}
+
+// TestMediaDownloadFlagServesAttachment 客户端回复里给的「下载地址」要真的能下载。
+//
+// 同一条媒体地址：不带参数内联渲染（图片要显示），带 ?download=1 直接存盘。
+func TestMediaDownloadFlagServesAttachment(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	servePNGUpstream(t, h)
+
+	_, body := h.postWeb("/api/chat/v1/chat/completions", map[string]any{
+		"model": "agnes-auto",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "画一幅山水画。"},
+		},
+		"stream":       false,
+		"aspect_ratio": "9:16",
+	})
+	content := chatContent(t, body)
+	m := localImageRe.FindStringSubmatch(content)
+	if m == nil {
+		t.Fatalf("正文里应含图片地址：%q", truncateStr(content, 300))
+	}
+
+	// 正文里要给出一条纯文本的下载地址，且带 download=1
+	if !strings.Contains(content, "原图下载：") {
+		t.Errorf("正文应给出可复制的下载地址：%q", truncateStr(content, 400))
+	}
+
+	get := func(url string) *http.Response {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatalf("取媒体失败：%v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	dl := get(h.ts.URL + imageKind.route + m[1] + "?download=1")
+	if cd := dl.Header.Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
+		t.Errorf("?download=1 应回 attachment，实际 %q", cd)
+	}
+	if cd := dl.Header.Get("Content-Disposition"); !strings.Contains(cd, "agnes-") {
+		t.Errorf("下载文件名应可读，实际 %q", cd)
+	}
+
+	// 不带参数时**不能**有 attachment，否则图片没法内联显示
+	inline := get(h.ts.URL + imageKind.route + m[1])
+	if cd := inline.Header.Get("Content-Disposition"); cd != "" {
+		t.Errorf("不带 download 时不该带 Content-Disposition，实际 %q", cd)
+	}
+}

@@ -262,6 +262,12 @@ type AutoIntentSettings struct {
 
 // Settings 是全局设置。
 type Settings struct {
+	// SettingsVersion 是配置结构自身的版本号，只为**一次性迁移**服务。
+	//
+	// 加它的原因：normalizeSettings 每次加载都会跑，如果迁移只按「字段当前值」
+	// 判断，用户手动改回去之后又会在下次重启时被迁移覆盖掉 —— 迁移必须是
+	// 「跑过就不再跑」。所以迁移函数都写成 `if v.SettingsVersion < N`。
+	SettingsVersion      int                `json:"settings_version"`
 	AdminPasswordHash    string             `json:"admin_password_hash"`
 	AdminPasswordSalt    string             `json:"admin_password_salt"`
 	MustChangePassword   bool               `json:"must_change_password"`
@@ -315,10 +321,13 @@ type Settings struct {
 	PublicBaseURL string `json:"public_base_url"`
 	// ClientMediaURL 决定「回给外部客户端」的媒体地址用哪个。
 	//
-	//	空 / "upstream"（默认）：上游产出地址。实测外部客户端只能加载公网 https
-	//	  图片，指向 NAS 的 http 地址会显示不出来，所以这是稳妥的默认值。
-	//	"local"：本机地址（PublicBaseURL/api/chat/...）。适用于把网关放到 https
-	//	  反向代理后面、且客户端确实能访问到网关的部署 —— 这样离线也能看。
+	//	空 / "auto"（默认）：配了「对外访问地址」就用网关地址，没配就用上游地址。
+	//	"upstream"：一律上游产出地址（公网 https，最稳，但离线看不了）。
+	//	"local"：一律网关地址（对外访问地址 + /api/chat/...，没配则按请求头推断）。
+	//
+	// 为什么 auto 要看「对外访问地址」：那个字段是运营者**主动填的**，语义就是
+	// 「客户端从这个地址找我」。填了它却还把客户端指去上游 CDN，等于白填。
+	// 反过来，没填就没法保证网关地址从客户端够得到，这时上游才更稳妥。
 	//
 	// 网关自己的网页不受此项影响，一律用本地地址（与网关同源，一定可达）。
 	ClientMediaURL string `json:"client_media_url"`
@@ -579,6 +588,34 @@ func normalizeSettings(v *Settings) {
 	}
 	if v.VideoMaxCapacity <= 0 {
 		v.VideoMaxCapacity = d.VideoMaxCapacity
+	}
+	migrateSettings(v)
+}
+
+// settingsVersion 是当前配置结构的版本号；每加一条迁移就 +1。
+const settingsVersion = 1
+
+// migrateSettings 跑一次性配置迁移。只在 SettingsVersion 落后时生效，
+// 跑完就把版本号推到当前值 —— 用户之后手动改回去不会再被覆盖。
+func migrateSettings(v *Settings) {
+	if v.SettingsVersion < 1 {
+		// 1.0.19：修「客户端媒体地址」被默认值钉死的问题。
+		//
+		// 1.0.18 及以前，控制台的「客户端媒体地址」下拉框只有「上游地址」和
+		// 「本机地址」两项，且默认选中「上游地址」。而该下拉框**每次保存设置页
+		// 都会把当前选中项写回 settings.json** —— 于是只要用户动过一次设置页
+		// （哪怕只是想改图片保留天数），这个字段就被钉死成 upstream，哪怕它
+		// 从来不是用户的真实选择。
+		//
+		// 判据：**配了「对外访问地址」**。填了它就说明运营者明确告诉过网关
+		// 「客户端从这个地址找我」，此时客户端却被指去上游 CDN，等于白填。
+		// 所以把这种「upstream + 已配对外访问地址」的组合交回 auto 判定。
+		// 用户若确实想要上游地址，在设置页重新选一次即可，不会再被迁移覆盖。
+		if strings.EqualFold(strings.TrimSpace(v.ClientMediaURL), "upstream") &&
+			strings.TrimSpace(v.PublicBaseURL) != "" {
+			v.ClientMediaURL = ""
+		}
+		v.SettingsVersion = 1
 	}
 }
 

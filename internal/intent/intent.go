@@ -1090,7 +1090,27 @@ func ChatEnvelope(res Result, model string, content string, extra map[string]any
 	return out
 }
 
+// downloadURL 给媒体地址加上「直接下载」参数。
+//
+// 不是所有地址都能下载：data URI（上游只回 b64_json 时的兜底）本身就是内容，
+// 相对路径则要看客户端怎么解析 —— 两者都原样返回，调用方据此决定要不要给下载行。
+func downloadURL(u string) string {
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return u
+	}
+	sep := "?"
+	if strings.Contains(u, "?") {
+		sep = "&"
+	}
+	return u + sep + "download=1"
+}
+
 // ImageContent 把上游生图结果拼成 Markdown（任何支持 Markdown 的客户端都能直接显示）。
+//
+// 每张图除了内联渲染，还会**另起一行给出纯文本的下载地址**：Markdown 的
+// `![](url)` 会把地址藏进语法里，用户想「另存为」时无处可复制 —— 尤其在
+// AI 客户端里，图片是渲染出来的，右键菜单常常拿不到原始地址。
+// 下载地址带 download=1，点开即存盘（见 web.handleChatMedia）。
 func ImageContent(items []map[string]any, fallbackPrompt string) (string, []map[string]any) {
 	var blocks []string
 	images := make([]map[string]any, 0, len(items))
@@ -1108,6 +1128,9 @@ func ImageContent(items []map[string]any, fallbackPrompt string) (string, []map[
 		caption = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(caption, "\n", " "), "[", "("), "]", ")")
 		if url != "" {
 			blocks = append(blocks, fmt.Sprintf("![%s](%s)", truncate(caption, 120), url))
+			if dl := downloadURL(url); dl != url {
+				blocks = append(blocks, "原图下载："+dl)
+			}
 		}
 		images = append(images, map[string]any{
 			"index": i, "url": url, "revised_prompt": asString(item["revised_prompt"]),

@@ -78,10 +78,10 @@ var videoKind = mediaKind{
 	maxBytes: 200 << 20,
 	timeout:  5 * time.Minute,
 	extByMIME: map[string]string{
-		"video/mp4":       ".mp4",
-		"video/webm":      ".webm",
-		"video/quicktime": ".mov",
-		"video/x-m4v":     ".m4v",
+		"video/mp4":        ".mp4",
+		"video/webm":       ".webm",
+		"video/quicktime":  ".mov",
+		"video/x-m4v":      ".m4v",
 		"video/x-matroska": ".mkv",
 	},
 	extByURL: map[string]string{
@@ -293,6 +293,43 @@ func webSurface(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get(surfaceHeader)), "web")
 }
 
+// clientMediaMode 归一化 ClientMediaURL：空串与 "auto" 等价。
+func clientMediaMode(settings config.Settings) string {
+	switch strings.ToLower(strings.TrimSpace(settings.ClientMediaURL)) {
+	case "local":
+		return "local"
+	case "upstream":
+		return "upstream"
+	default:
+		return "auto"
+	}
+}
+
+// clientFacingMediaURL 算出「外部 AI 客户端会收到哪个地址」。
+//
+// 与 callerMediaURL 同一套规则，但**刻意不看这次请求是不是来自网关自己的网页**：
+// 自检面板要回答的是「外部客户端收到什么」，而面板本身就是一个网页请求 ——
+// 直接复用 callerMediaURL 会被 webSurface 短路成网关地址，于是无论怎么配，
+// 面板永远显示「客户端拿到的是网关地址」。1.0.18 的自检面板正是这么自欺欺人的。
+func (s *Server) clientFacingMediaURL(settings config.Settings, upstream, local string) string {
+	if local == "" {
+		return upstream
+	}
+	switch clientMediaMode(settings) {
+	case "local":
+		return local
+	case "upstream":
+		return upstream
+	default: // auto
+		// 填了「对外访问地址」＝ 运营者明确说过「客户端从这个地址找我」，
+		// 那就该给网关地址；没填才退回上游（公网 https，够得到但不离线）。
+		if strings.TrimSpace(settings.PublicBaseURL) != "" {
+			return local
+		}
+		return upstream
+	}
+}
+
 // callerMediaURL 决定把哪个地址回给调用方。
 //
 // upstream 是上游原始地址，local 是落盘后的本地地址（空 = 没落盘成功，一律退回上游）。
@@ -306,16 +343,16 @@ func webSurface(r *http.Request) bool {
 //	  （用户看到的就是一串莫名其妙的提示词）。上游产出地址是公网 https，
 //	  实测在客户端里能正常显示。
 //
-// 所以默认按调用方分流；ClientMediaURL=local 可强制一律用本地地址
-// （适用于把网关放到 https 反代后面、客户端也能访问到网关的部署）。
+// 所以默认按调用方分流：网页一律本地；客户端交给 clientFacingMediaURL 判
+// （auto 时配了「对外访问地址」就给网关地址）。
 func (s *Server) callerMediaURL(r *http.Request, settings config.Settings, upstream, local string) string {
 	if local == "" {
 		return upstream
 	}
-	if webSurface(r) || strings.EqualFold(strings.TrimSpace(settings.ClientMediaURL), "local") {
+	if webSurface(r) {
 		return local
 	}
-	return upstream
+	return s.clientFacingMediaURL(settings, upstream, local)
 }
 
 // publicBaseURL 推导「客户端能访问到的」基地址（形如 http://nas:4142）。
@@ -382,7 +419,10 @@ func (s *Server) apiMediaBase(w http.ResponseWriter, r *http.Request) {
 		"source":            mediaBaseSource(r, settings),
 		"sample_image_url":  sample,
 		"client_media_url":  settings.ClientMediaURL,
-		"url_for_client":    s.callerMediaURL(r, settings, "https://上游产出地址/x.png", sample),
+		"client_media_mode": clientMediaMode(settings),
+		// 注意这里传的是 clientFacingMediaURL 而不是 callerMediaURL：
+		// 面板自己就是网页请求，用后者会被 webSurface 短路，永远显示「已生效」。
+		"url_for_client":    s.clientFacingMediaURL(settings, "https://上游产出地址/x.png", sample),
 		"host":              r.Host,
 		"x_forwarded_host":  r.Header.Get("X-Forwarded-Host"),
 		"x_forwarded_proto": r.Header.Get("X-Forwarded-Proto"),
@@ -595,8 +635,32 @@ func (s *Server) handleChatMedia(k mediaKind) http.HandlerFunc {
 		// 内容寻址 → 地址与内容一一对应，可以放心长缓存。
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Content-Type", k.mimeForExt(filepath.Ext(name)))
+		// ?download=1 让浏览器直接存盘而不是内联打开 —— 客户端回复里给出的
+		// 「下载地址」就带这个参数。图片本身仍用不带参数的地址内联渲染，
+		// 两者读的是同一个文件，只是响应头不同。
+		//
+		// 文件名换成可读的形式：地址里那串 32 位十六进制是内容哈希，存下来
+		// 一文件夹 `9f2c…e1.png` 谁也认不出。name 已过 validMediaName，
+		// 只可能由 [0-9a-f] 和允许的后缀组成，塞进响应头是安全的。
+		if isDownloadRequest(r) {
+			base, ext, _ := strings.Cut(name, ".")
+			w.Header().Set("Content-Disposition",
+				"attachment; filename=\"agnes-"+base[:8]+"."+ext+"\"")
+		}
 		http.ServeContent(w, r, name, info.ModTime(), f)
 	}
+}
+
+// isDownloadRequest 判断这次请求是不是要「直接下载」。
+//
+// 用 ?download=1 而不是另开一条路径，是为了让同一个文件既能内联渲染又能下载，
+// 且两边缓存互不干扰（URL 不同即缓存键不同）。
+func isDownloadRequest(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("download"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }
 
 // normalizeMIME 去掉 Content-Type 里的参数（charset 等）并统一小写。

@@ -955,9 +955,10 @@ function viewSettings(){
       ${fld("s_vid_mb","本地视频缓存上限（MB）", s.video_cache_max_mb!=null?s.video_cache_max_mb:2048,"number","落盘的视频产出总占用上限；超出按最旧的先删。0 = 不限制")}
       ${fld("s_baseurl","对外访问地址", s.public_base_url||"","text","生成的图片/视频用绝对地址返回。留空按请求自动推断；但反向代理常把 Host 设成不带端口的形式（NPM 默认 $host），推断出来会少一段端口 —— 那就必须在这里显式填全，如 https://agens.example.com:52325")}
       <div><label>客户端媒体地址</label><select id="s_cmedia">
-        <option value="upstream" ${(s.client_media_url||"upstream")==="upstream"?"selected":""}>上游地址（默认，最稳）</option>
-        <option value="local" ${s.client_media_url==="local"?"selected":""}>本机地址（需能访问到网关）</option>
-      </select><div class="hint">生成的图片/视频回给<b>外部 AI 客户端</b>时用哪个地址。默认给上游地址 —— 客户端往往在别的网络位置、甚至跑在 https 页面里，指向 NAS 的 http 地址会显示不出来（表现为图片位置出现一串文字）。<b>若你已把网关反代到公网 HTTPS</b>（客户端能访问到它），改成「本机地址」即可离线可看。网关自己的网页不受此项影响，一律用本地副本。</div></div>
+        <option value="" ${!s.client_media_url||s.client_media_url==="auto"?"selected":""}>自动（配了「对外访问地址」就用它）</option>
+        <option value="upstream" ${s.client_media_url==="upstream"?"selected":""}>上游地址（最稳，但离线看不了）</option>
+        <option value="local" ${s.client_media_url==="local"?"selected":""}>网关地址（离线可看）</option>
+      </select><div class="hint">生成的图片/视频回给<b>外部 AI 客户端</b>时用哪个地址。<b>「自动」</b>＝填了上面那行「对外访问地址」就给网关地址（离线也能看），没填才退回上游产出地址 —— 填了对外地址却把客户端指去上游 CDN，等于白填。上游地址是公网 https，最稳但离线看不了；网关地址要求客户端真能访问到网关（比如已反代到公网 HTTPS）。网关自己的网页不受此项影响，一律用本地副本。</div></div>
       <div class="hint" style="grid-column:1/-1">生成的图片与视频会落盘到数据目录的 <span class="mono">images/</span> 与 <span class="mono">videos/</span>，正文里只放本地地址 —— 浏览器不一定够得到上游 CDN，落盘也便于长期回看。视频按「条数」和「总字节」两个约束一起淘汰，默认 2 GB。</div>
     </div>
   </div>
@@ -1080,18 +1081,26 @@ function bindMediaBaseCheck(){
       const r = await api("/api/media-base");
       const row = (k,v)=>`<div class="row" style="gap:8px"><span class="muted" style="min-width:120px">${esc(k)}</span><span class="mono" style="font-size:12px;word-break:break-all">${esc(v||"—")}</span></div>`;
       const forClient = (r.url_for_client||"");
-      const usingLocal = forClient.includes("/api/chat/");
+      // 用「地址里带不带 /api/chat/」判断给的是不是网关地址。注意不能再用
+      // client_media_url 的原始值来判断：auto 档的实际结果取决于有没有配
+      // 「对外访问地址」，只有服务端算出来的 url_for_client 才是真相。
+      const usingGateway = forClient.includes("/api/chat/");
+      const mode = r.client_media_mode || "auto";
+      const MODE_LABEL = {"":"自动","auto":"自动","upstream":"上游地址","local":"网关地址"};
+      const modeText = (MODE_LABEL[mode]||mode) + (mode==="auto"
+        ? (usingGateway ? "（已配对外访问地址 → 用网关地址）" : "（未配对外访问地址 → 用上游地址）")
+        : "");
       box.innerHTML = `<div class="card" style="margin:0">
         ${row("基地址", r.base_url)}
         ${row("来源", r.source)}
         ${row("示例图片地址", r.sample_image_url)}
         ${row("客户端将收到", forClient)}
-        ${row("客户端媒体地址", r.client_media_url||"upstream（默认）")}
+        ${row("客户端媒体地址", modeText)}
         <div class="hint">诊断用原始值：Host=${esc(r.host||"—")} · X-Forwarded-Host=${esc(r.x_forwarded_host||"—")} · X-Forwarded-Proto=${esc(r.x_forwarded_proto||"—")} · TLS=${r.tls?"是":"否"}</div>
-        <div class="banner ${usingLocal?"good":"warn"}" style="margin-top:8px">
-          ${usingLocal
-            ? "客户端拿到的是本机地址。请确认这个地址从客户端所在网络能打开（把示例图片地址粘到浏览器试一下）。"
-            : "客户端拿到的是上游产出地址。若希望用本机地址（离线可看），把上面的「客户端媒体地址」改成「本机地址」并保存。"}
+        <div class="banner ${usingGateway?"good":"warn"}" style="margin-top:8px">
+          ${usingGateway
+            ? "客户端拿到的是<b>网关地址</b>。请确认这个地址从客户端所在网络能打开 —— 把上面「客户端将收到」那行粘到浏览器试一下。"
+            : "客户端拿到的是<b>上游产出地址</b>。想改用网关地址（离线也能看），要么在上面把「对外访问地址」填全（含端口），要么把「客户端媒体地址」显式选成「网关地址」并保存。"}
         </div>
       </div>`;
     }catch(e){
