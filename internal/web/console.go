@@ -2419,10 +2419,8 @@ func (s *Server) serveChatShapedMedia(w http.ResponseWriter, r *http.Request, de
 	// 前端 renderMarkdown 放行相对路径，于是浏览器直接向本机要图。
 	items = s.localizeImageURLs(r, items, settings)
 	content, images := intent.ImageContent(items, decision.Prompt.Text)
-	if len(decision.DroppedFields) > 0 {
-		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") +
-			" 未被生图端点接受，已忽略。"
-	}
+	// 被丢弃的字段不再写进正文（见 server.go 同处的说明），
+	// 改由 decision.Headers() 的 X-Agnes-Hub-Dropped-Fields 带回。
 	// data 刻意回显上游原始响应（url 是上游地址，未内联），images 才是给界面用的
 	// 内联视图。两者都塞 base64 会让响应凭空翻倍（一张 3 MB 的图 → 6 MB），
 	// 而 chat 形态的调用方读的是 choices[0].message.content，data 只用于排查。

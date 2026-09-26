@@ -337,3 +337,33 @@ func TestSSEFromChat(t *testing.T) {
 		t.Errorf("最后一帧应为 [DONE]，实际 %q", last)
 	}
 }
+
+// 被丢弃的字段只走响应头，绝不进正文。
+//
+// 这条是防回归：曾经把「字段 xxx 未被生图端点接受，已忽略」追加到回复正文里，
+// 结果那行字跟着图片一起沉进对话记录，用户每生一张图就被念一遍。
+func TestHeadersCarryDroppedFields(t *testing.T) {
+	res := Result{
+		Modality: Image, Source: "content", Score: 0.9,
+		DroppedFields: []string{"stream_options", "cfg_scale"},
+	}
+	h := res.Headers()
+	if got := h["X-Agnes-Hub-Dropped-Fields"]; got != "stream_options,cfg_scale" {
+		t.Errorf("被丢弃字段应写进 X-Agnes-Hub-Dropped-Fields，实际 %q", got)
+	}
+	// 头值必须是 latin-1 安全的：字段名来自 JSON 键，正常都是 ASCII，
+	// 但不能把中文 reason 之类塞进来 —— 这里顺带守住「不含非 ASCII」这条底线。
+	for k, v := range h {
+		for _, c := range v {
+			if c > 127 {
+				t.Errorf("响应头 %s 的值含非 ASCII 字符：%q", k, v)
+			}
+		}
+	}
+
+	// 没有丢弃字段时不得凭空多出这个头，否则客户端会以为出了什么事。
+	clean := Result{Modality: Text, Source: "default"}.Headers()
+	if _, ok := clean["X-Agnes-Hub-Dropped-Fields"]; ok {
+		t.Errorf("没有丢弃字段时不该带该响应头：%v", clean)
+	}
+}

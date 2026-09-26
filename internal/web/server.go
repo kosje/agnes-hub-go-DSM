@@ -856,9 +856,8 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	// 换成本地地址，否则正文里那行 ![prompt](https://...) 在浏览器里只会显示成裂图。
 	// 注意上面对 imgJob.URL 用的是原始 items，聊天记录里保留上游地址（体积小）。
 	content, images := intent.ImageContent(s.localizeImageURLs(r, items, settings), decision.Prompt.Text)
-	if len(decision.DroppedFields) > 0 {
-		content += "\n\n> 说明：字段 " + strings.Join(decision.DroppedFields, ", ") + " 未被生图端点接受，已忽略。"
-	}
+	// 被丢弃的字段不再写进正文（会跟着图片留在对话里，很吵），
+	// 改由 decision.Headers() 的 X-Agnes-Hub-Dropped-Fields 带回。
 	envelope := intent.ChatEnvelope(decision, result.ModelUsed, content,
 		map[string]any{"data": data["data"], "images": images})
 	if stream {

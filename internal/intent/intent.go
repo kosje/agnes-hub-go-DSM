@@ -680,6 +680,15 @@ func (r Result) Headers() map[string]string {
 	if r.ModelRequested != "" {
 		out["X-Agnes-Hub-Model-Requested"] = r.ModelRequested
 	}
+	// 被丢弃的字段走响应头，**不写进正文**。
+	//
+	// 原先是在回复正文里追加一行「说明：字段 stream_options 未被生图端点接受，已忽略。」
+	// —— 本意是透明化，但那行字会跟着图片一起留在对话记录里，用户每生一张图就被念一次。
+	// 而它要传达的信息只对排查的人有用，放响应头（浏览器开发者工具 / API 客户端可见）
+	// 就够了，不打扰正常使用。
+	if len(r.DroppedFields) > 0 {
+		out["X-Agnes-Hub-Dropped-Fields"] = strings.Join(r.DroppedFields, ",")
+	}
 	return out
 }
 
