@@ -1099,17 +1099,22 @@ func ChatEnvelope(res Result, model string, content string, extra map[string]any
 	return out
 }
 
-// mediaAddressLink 把媒体地址变成「显示的就是真实地址」的可点链接。
+// mediaAddressLink 生成「一定显示得对 + 一定点得开」的媒体地址行。
 //
-// 两个刻意的设计，都是被实际反馈推出来的：
+// 这两个约束都是被实际反馈逼出来的：
 //
 //  1. **不加 ?download=1**。1.0.19~1.0.20 加它是为了「点开即存盘」，但用户要的是
 //     点开能在浏览器里看图，强制 attachment 反而多一步。服务端仍然认这个参数
 //     （见 web.handleChatMedia），需要存盘时自己补上即可，只是不再主动给。
-//  2. **写成 Markdown 链接、且把完整地址当作链接文字**。裸 URL 会被客户端自动链接
-//     并「美化」显示 —— 实测 WorkBuddy 会把 `https://` 与 `:52325` 一起吃掉，
-//     显示成 `agens.jr.tn/api/...`，与真实地址对不上，用户以为给错了。
-//     显式给出的链接文字不会被这样改写，显示的就是真实地址。
+//
+//  2. **地址装在行内代码（反引号）里**。AI 客户端会对消息里的 URL 做「美化」：
+//     实测 WorkBuddy 把 `https://` 与 `:52325` 一起吃掉，显示成 `agens.jr.tn/api/...`。
+//     裸 URL 会这样，**连 `[地址](地址)` 这种显式链接文字也照改**（1.0.21 试过，
+//     没用）—— 说明它改的是渲染后的链接，而不是解析前的那段文本。
+//     行内代码不会被当成链接处理，是唯一能原样显示的写法。
+//
+//     代价是代码不可点，所以另补一个「文字不像 URL」的链接当可点入口：即使那个
+//     链接的显示文字也被改写，代码里的地址仍然是对的，不会比之前更差。
 //
 // 非 http(s) 地址（data URI、相对路径）返回空串：前者本身就是内容，
 // 后者要由调用方按自己的基准解析，抄出来只会误导。
@@ -1117,7 +1122,7 @@ func mediaAddressLink(u string) string {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return ""
 	}
-	return "[" + u + "](" + u + ")"
+	return "[在浏览器中打开](" + u + ") · `" + u + "`"
 }
 
 // ImageContent 把上游生图结果拼成 Markdown（任何支持 Markdown 的客户端都能直接显示）。
