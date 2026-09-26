@@ -298,21 +298,25 @@ func TestImageContent(t *testing.T) {
 // Markdown 的 ![](url) 把地址藏进了语法里，AI 客户端里图片是渲染出来的、
 // 右键常常拿不到原始地址，用户想复制地址时无处可拿。
 //
-// 两个钉死的点：① 地址**不带 ?download=1**（用户要的是点开在浏览器里看图，
-// 不是被强制存盘）；② 写成 Markdown 链接、链接文字就是完整地址 ——
-// 裸 URL 会被客户端美化掉 https:// 与端口，显示出来的不是真实地址。
+// 三个钉死的点：
+//   - 地址**不带 ?download=1**（用户要的是点开在浏览器里看图，不是被强制存盘）；
+//   - 地址装在**行内代码**里 —— 客户端会把链接（含显式链接文字）美化掉
+//     https:// 与端口，行内代码不会被当成链接处理，才原样显示；
+//   - 另给一个「在浏览器中打开」的链接补上可点入口。
 func TestImageContentGivesAddressWithoutDownloadParam(t *testing.T) {
+	url := "https://hub.example.com:52325/api/chat/images/abc.png"
 	content, _ := ImageContent([]map[string]any{
-		{"url": "https://hub.example.com:52325/api/chat/images/abc.png", "revised_prompt": "a cat"},
+		{"url": url, "revised_prompt": "a cat"},
 	}, "画一只猫")
 
 	if !strings.Contains(content, "![") {
 		t.Fatalf("仍要保留内联图片语法：%q", content)
 	}
-	want := "原图地址：[https://hub.example.com:52325/api/chat/images/abc.png]" +
-		"(https://hub.example.com:52325/api/chat/images/abc.png)"
-	if !strings.Contains(content, want) {
-		t.Errorf("应给出完整地址的链接行，实际 %q", content)
+	if !strings.Contains(content, "`"+url+"`") {
+		t.Errorf("地址应以行内代码给出（客户端才不会美化它），实际 %q", content)
+	}
+	if !strings.Contains(content, "[在浏览器中打开]("+url+")") {
+		t.Errorf("应同时给一个可点入口，实际 %q", content)
 	}
 	if strings.Contains(content, "download=1") {
 		t.Errorf("地址不该再带 ?download=1：%q", content)
@@ -333,13 +337,15 @@ func TestImageContentSkipsAddressLineForDataURI(t *testing.T) {
 	}
 }
 
-// TestVideoContentLinksAddress 视频地址同样要给「显示即真实」的链接。
+// TestVideoContentLinksAddress 视频地址同样给「显示得对 + 点得开」的一行。
 func TestVideoContentLinksAddress(t *testing.T) {
 	u := "https://hub.example.com:52325/api/chat/videos/abc.mp4"
 	got := VideoContent("agnes-video-2.5-flash", map[string]any{}, u)
-	want := "生成完成：[" + u + "](" + u + ")"
-	if !strings.Contains(got, want) {
-		t.Errorf("视频完成行应为 Markdown 链接，实际 %q", got)
+	if !strings.Contains(got, "`"+u+"`") {
+		t.Errorf("视频地址应以行内代码给出，实际 %q", got)
+	}
+	if !strings.Contains(got, "[在浏览器中打开]("+u+")") {
+		t.Errorf("视频地址应给可点入口，实际 %q", got)
 	}
 	// 非 http(s) 地址（还没落盘时可能是相对路径）原样给出，不要造出坏链接。
 	rel := VideoContent("agnes-video-2.5-flash", map[string]any{}, "/api/chat/videos/abc.mp4")
