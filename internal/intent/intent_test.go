@@ -296,13 +296,15 @@ func TestImageContent(t *testing.T) {
 // TestImageContentGivesDownloadURL 正文里除了内联图片，还要给一条可复制的下载地址。
 //
 // Markdown 的 ![](url) 把地址藏进了语法里，AI 客户端里图片是渲染出来的、
-// 右键常常拿不到原始地址，用户想复制地址时无处可拿。
+// 右键常常拿不到原始地址，用户想「在浏览器里打开」时无处可点。
 //
 // 三个钉死的点：
 //   - 地址**不带 ?download=1**（用户要的是点开在浏览器里看图，不是被强制存盘）；
-//   - 地址装在**行内代码**里 —— 客户端会把链接（含显式链接文字）美化掉
-//     https:// 与端口，行内代码不会被当成链接处理，才原样显示；
-//   - 另给一个「在浏览器中打开」的链接补上可点入口。
+//   - 链接**文字不能是 URL 本身** —— 客户端会把链接的显示文字美化掉
+//     https:// 与端口（1.0.21 用 `[地址](地址)` 被改过），换成「在浏览器中打开」
+//     才躲得过；
+//   - 正文里**不再抄一份裸地址**（1.0.23 去掉）：跟图片 tooltip 重复，而且
+//     裸 URL 本来就会被美化，抄出来只会多一处对不上的地方。
 func TestImageContentGivesAddressWithoutDownloadParam(t *testing.T) {
 	url := "https://hub.example.com:52325/api/chat/images/abc.png"
 	content, _ := ImageContent([]map[string]any{
@@ -312,17 +314,17 @@ func TestImageContentGivesAddressWithoutDownloadParam(t *testing.T) {
 	if !strings.Contains(content, "![") {
 		t.Fatalf("仍要保留内联图片语法：%q", content)
 	}
-	if !strings.Contains(content, "`"+url+"`") {
-		t.Errorf("地址应以行内代码给出（客户端才不会美化它），实际 %q", content)
-	}
 	if !strings.Contains(content, "[在浏览器中打开]("+url+")") {
-		t.Errorf("应同时给一个可点入口，实际 %q", content)
+		t.Errorf("应给出可点入口，实际 %q", content)
+	}
+	if strings.Contains(content, "`"+url+"`") {
+		t.Errorf("不该再抄一份行内代码地址（与图片 tooltip 重复）：%q", content)
 	}
 	if strings.Contains(content, "download=1") {
 		t.Errorf("地址不该再带 ?download=1：%q", content)
 	}
 	if strings.Contains(content, "原图下载") {
-		t.Errorf("不再有「下载」语义，标签应为「原图地址」：%q", content)
+		t.Errorf("不再有「下载」语义：%q", content)
 	}
 }
 
@@ -337,15 +339,15 @@ func TestImageContentSkipsAddressLineForDataURI(t *testing.T) {
 	}
 }
 
-// TestVideoContentLinksAddress 视频地址同样给「显示得对 + 点得开」的一行。
+// TestVideoContentLinksAddress 视频同样给一个可点入口，不抄裸地址。
 func TestVideoContentLinksAddress(t *testing.T) {
 	u := "https://hub.example.com:52325/api/chat/videos/abc.mp4"
 	got := VideoContent("agnes-video-2.5-flash", map[string]any{}, u)
-	if !strings.Contains(got, "`"+u+"`") {
-		t.Errorf("视频地址应以行内代码给出，实际 %q", got)
-	}
 	if !strings.Contains(got, "[在浏览器中打开]("+u+")") {
 		t.Errorf("视频地址应给可点入口，实际 %q", got)
+	}
+	if strings.Contains(got, "`"+u+"`") {
+		t.Errorf("视频地址也不该再抄一份行内代码：%q", got)
 	}
 	// 非 http(s) 地址（还没落盘时可能是相对路径）原样给出，不要造出坏链接。
 	rel := VideoContent("agnes-video-2.5-flash", map[string]any{}, "/api/chat/videos/abc.mp4")
