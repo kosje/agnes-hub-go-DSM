@@ -1,6 +1,43 @@
 基于 [my788525/agnes-hub-go](https://github.com/my788525/agnes-hub-go) **v1.0.11** 构建的群晖 DSM 套件。
 
-### 本次更新（1.0.20）
+### 本次更新（1.0.21）
+
+**图片下面的地址行不再强制下载，并且显示的就是真实地址。**
+
+#### 1. 去掉 `?download=1`，点开即在浏览器里看图
+
+1.0.19 给地址加了 `?download=1`，本意是「点开即存盘」。但实际用起来不对味 ——
+你要的是点开能在浏览器里看，而不是被浏览器拦下来问你存到哪。
+
+现在地址行给的是**不带参数**的原图地址：
+
+```
+原图地址：https://agens.jr.tn:52325/api/chat/images/76c567b8….png
+```
+
+点开就是浏览器的图片视图。**服务端仍然认 `?download=1`**（想存盘时自己补上，
+`Content-Disposition: attachment` 那套逻辑原样保留），只是不再主动塞给你。
+
+#### 2. 地址显示的就是真实地址（这次是真的）
+
+你反馈「原图下载后面跟的链接不是实际链接（无端口）」—— 那一条我查了：
+**网关吐出去的是完整地址**（`https://agens.jr.tn:52325/...`，带 scheme 带端口），
+是**客户端把裸 URL 自动链接后做了美化**，把 `https://` 和 `:52325` 一起吃掉，
+显示成 `agens.jr.tn/api/...`，看起来就跟真实地址对不上。
+
+现在改成**显式 Markdown 链接、链接文字就是完整地址**：
+
+```
+原图地址：[https://agens.jr.tn:52325/api/chat/images/….png](https://agens.jr.tn:52325/api/chat/images/….png)
+```
+
+渲染出来是一行可点的链接，**文字就是完整地址**（显式链接文字不会被美化），
+所以「看到的」和「点开的 / 复制的」从此是同一个值。
+视频的「生成完成」行同样处理。
+
+---
+
+### 上一版（1.0.20）
 
 **两件事：图标外轮廓改成正圆；回复正文里那行「字段已忽略」的说明挪进响应头。**
 
@@ -263,8 +300,8 @@ AI 客户端会在对话尾部追加自己的框架块（`<craft_mode>`、`<syst
 
 ### 手动安装下载
 
-- **x86_64 机型**：[agnes-hub-x86_64-1.0.20.spk](https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.20.spk)
-- **armv8 机型**：[agnes-hub-armv8-1.0.20.spk](https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-armv8-1.0.20.spk)
+- **x86_64 机型**：[agnes-hub-x86_64-1.0.21.spk](https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-x86_64-1.0.21.spk)
+- **armv8 机型**：[agnes-hub-armv8-1.0.21.spk](https://kosje.github.io/agnes-hub-go-DSM/agnes-hub-armv8-1.0.21.spk)
 
 ---
 

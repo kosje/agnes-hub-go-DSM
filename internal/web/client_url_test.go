@@ -445,9 +445,10 @@ func TestMediaBasePanelReportsClientView(t *testing.T) {
 	}
 }
 
-// TestMediaDownloadFlagServesAttachment 客户端回复里给的「下载地址」要真的能下载。
+// TestMediaDownloadFlagServesAttachment 下载能力仍在，只是正文不再主动给带参地址。
 //
-// 同一条媒体地址：不带参数内联渲染（图片要显示），带 ?download=1 直接存盘。
+// 用户要的是「点开就能在浏览器里看图」，所以正文里给的是**不带参数**的原图地址；
+// 但服务端仍认 ?download=1（想存盘的人自己补上），这条守住它别被删掉。
 func TestMediaDownloadFlagServesAttachment(t *testing.T) {
 	h := newHarness(t, 0, 1)
 	servePNGUpstream(t, h)
@@ -466,9 +467,12 @@ func TestMediaDownloadFlagServesAttachment(t *testing.T) {
 		t.Fatalf("正文里应含图片地址：%q", truncateStr(content, 300))
 	}
 
-	// 正文里要给出一条纯文本的下载地址，且带 download=1
-	if !strings.Contains(content, "原图下载：") {
-		t.Errorf("正文应给出可复制的下载地址：%q", truncateStr(content, 400))
+	// 正文里要给出可复制的原图地址，且**不带 download=1**
+	if !strings.Contains(content, "原图地址：") {
+		t.Errorf("正文应给出可复制的原图地址：%q", truncateStr(content, 400))
+	}
+	if strings.Contains(content, "download=1") {
+		t.Errorf("正文不该再出现 ?download=1：%q", truncateStr(content, 400))
 	}
 
 	get := func(url string) *http.Response {

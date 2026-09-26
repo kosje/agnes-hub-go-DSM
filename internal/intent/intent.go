@@ -1099,27 +1099,33 @@ func ChatEnvelope(res Result, model string, content string, extra map[string]any
 	return out
 }
 
-// downloadURL 给媒体地址加上「直接下载」参数。
+// mediaAddressLink 把媒体地址变成「显示的就是真实地址」的可点链接。
 //
-// 不是所有地址都能下载：data URI（上游只回 b64_json 时的兜底）本身就是内容，
-// 相对路径则要看客户端怎么解析 —— 两者都原样返回，调用方据此决定要不要给下载行。
-func downloadURL(u string) string {
+// 两个刻意的设计，都是被实际反馈推出来的：
+//
+//  1. **不加 ?download=1**。1.0.19~1.0.20 加它是为了「点开即存盘」，但用户要的是
+//     点开能在浏览器里看图，强制 attachment 反而多一步。服务端仍然认这个参数
+//     （见 web.handleChatMedia），需要存盘时自己补上即可，只是不再主动给。
+//  2. **写成 Markdown 链接、且把完整地址当作链接文字**。裸 URL 会被客户端自动链接
+//     并「美化」显示 —— 实测 WorkBuddy 会把 `https://` 与 `:52325` 一起吃掉，
+//     显示成 `agens.jr.tn/api/...`，与真实地址对不上，用户以为给错了。
+//     显式给出的链接文字不会被这样改写，显示的就是真实地址。
+//
+// 非 http(s) 地址（data URI、相对路径）返回空串：前者本身就是内容，
+// 后者要由调用方按自己的基准解析，抄出来只会误导。
+func mediaAddressLink(u string) string {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-		return u
+		return ""
 	}
-	sep := "?"
-	if strings.Contains(u, "?") {
-		sep = "&"
-	}
-	return u + sep + "download=1"
+	return "[" + u + "](" + u + ")"
 }
 
 // ImageContent 把上游生图结果拼成 Markdown（任何支持 Markdown 的客户端都能直接显示）。
 //
-// 每张图除了内联渲染，还会**另起一行给出纯文本的下载地址**：Markdown 的
-// `![](url)` 会把地址藏进语法里，用户想「另存为」时无处可复制 —— 尤其在
+// 每张图除了内联渲染，还会**另起一行给出可复制的原图地址**：Markdown 的
+// `![](url)` 会把地址藏进语法里，用户想复制地址时无处可拿 —— 尤其在
 // AI 客户端里，图片是渲染出来的，右键菜单常常拿不到原始地址。
-// 下载地址带 download=1，点开即存盘（见 web.handleChatMedia）。
+// 地址行给出的是**不带参数**的原图地址，点开即在浏览器里显示（见 mediaAddressLink）。
 func ImageContent(items []map[string]any, fallbackPrompt string) (string, []map[string]any) {
 	var blocks []string
 	images := make([]map[string]any, 0, len(items))
@@ -1137,8 +1143,8 @@ func ImageContent(items []map[string]any, fallbackPrompt string) (string, []map[
 		caption = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(caption, "\n", " "), "[", "("), "]", ")")
 		if url != "" {
 			blocks = append(blocks, fmt.Sprintf("![%s](%s)", truncate(caption, 120), url))
-			if dl := downloadURL(url); dl != url {
-				blocks = append(blocks, "原图下载："+dl)
+			if link := mediaAddressLink(url); link != "" {
+				blocks = append(blocks, "原图地址："+link)
 			}
 		}
 		images = append(images, map[string]any{
@@ -1164,7 +1170,13 @@ func VideoContent(model string, job map[string]any, videoURL string) string {
 		lines = append(lines, fmt.Sprintf("- 轮询：`GET %s`", v))
 	}
 	if videoURL != "" {
-		lines = append(lines, "\n生成完成："+videoURL)
+		// 与图片同源处理：写成「显示的就是真实地址」的链接，避免客户端把裸 URL
+		// 美化掉 scheme 与端口（见 mediaAddressLink）。
+		if link := mediaAddressLink(videoURL); link != "" {
+			lines = append(lines, "\n生成完成："+link)
+		} else {
+			lines = append(lines, "\n生成完成："+videoURL)
+		}
 	} else {
 		lines = append(lines, "\n视频为异步生成，请按上面的轮询地址查询结果。")
 	}
