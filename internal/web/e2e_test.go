@@ -687,3 +687,43 @@ func (m *mockAgnes) lastImageModel() string {
 	defer m.mu.Unlock()
 	return m.lastImgModel
 }
+
+// ---------------------------------------------------------------------------
+// 七、被丢弃的字段走响应头，不污染回复正文
+// ---------------------------------------------------------------------------
+
+// 客户端常会带上一些生图端点根本不认的字段（stream_options、cfg_scale…）。
+// 网关会把它们剔掉再转发，这件事必须让排查的人知道，但**不该写进回复正文** ——
+// 正文会跟着图片沉进对话记录，用户每生一张图就被念一次「字段 xxx 已忽略」。
+func TestDroppedFieldsGoToHeaderNotBody(t *testing.T) {
+	h := newHarness(t, 0, 1)
+	payload := chatBody("帮我画一张赛博朋克风格的城市夜景")
+	payload["stream_options"] = map[string]any{"include_usage": true}
+	payload["cfg_scale"] = 7
+
+	resp, body := h.post("/v1/chat/completions", payload)
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %v", resp.StatusCode, body)
+	}
+
+	choices, _ := body["choices"].([]any)
+	if len(choices) == 0 {
+		t.Fatalf("响应缺少 choices：%v", body)
+	}
+	msg, _ := choices[0].(map[string]any)["message"].(map[string]any)
+	content, _ := msg["content"].(string)
+
+	for _, bad := range []string{"未被生图端点接受", "说明：字段", "已忽略"} {
+		if strings.Contains(content, bad) {
+			t.Errorf("被丢弃字段的说明不该出现在正文里（含 %q）：%q", bad, content)
+		}
+	}
+	if !strings.Contains(content, "cdn.example.test") {
+		t.Errorf("正文仍应是图片内容，实际 %q", content)
+	}
+
+	got := resp.Header.Get("X-Agnes-Hub-Dropped-Fields")
+	if got != "cfg_scale,stream_options" {
+		t.Errorf("被丢弃字段应经响应头返回（按字典序），实际 %q", got)
+	}
+}
