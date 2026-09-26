@@ -296,28 +296,55 @@ func TestImageContent(t *testing.T) {
 // TestImageContentGivesDownloadURL 正文里除了内联图片，还要给一条可复制的下载地址。
 //
 // Markdown 的 ![](url) 把地址藏进了语法里，AI 客户端里图片是渲染出来的、
-// 右键常常拿不到原始地址，用户想「另存为」时无处可复制。
-func TestImageContentGivesDownloadURL(t *testing.T) {
+// 右键常常拿不到原始地址，用户想复制地址时无处可拿。
+//
+// 两个钉死的点：① 地址**不带 ?download=1**（用户要的是点开在浏览器里看图，
+// 不是被强制存盘）；② 写成 Markdown 链接、链接文字就是完整地址 ——
+// 裸 URL 会被客户端美化掉 https:// 与端口，显示出来的不是真实地址。
+func TestImageContentGivesAddressWithoutDownloadParam(t *testing.T) {
 	content, _ := ImageContent([]map[string]any{
-		{"url": "https://hub.example.com/api/chat/images/abc.png", "revised_prompt": "a cat"},
+		{"url": "https://hub.example.com:52325/api/chat/images/abc.png", "revised_prompt": "a cat"},
 	}, "画一只猫")
 
 	if !strings.Contains(content, "![") {
 		t.Fatalf("仍要保留内联图片语法：%q", content)
 	}
-	if !strings.Contains(content, "原图下载：https://hub.example.com/api/chat/images/abc.png?download=1") {
-		t.Errorf("应给出带 download=1 的下载地址，实际 %q", content)
+	want := "原图地址：[https://hub.example.com:52325/api/chat/images/abc.png]" +
+		"(https://hub.example.com:52325/api/chat/images/abc.png)"
+	if !strings.Contains(content, want) {
+		t.Errorf("应给出完整地址的链接行，实际 %q", content)
+	}
+	if strings.Contains(content, "download=1") {
+		t.Errorf("地址不该再带 ?download=1：%q", content)
+	}
+	if strings.Contains(content, "原图下载") {
+		t.Errorf("不再有「下载」语义，标签应为「原图地址」：%q", content)
 	}
 }
 
-// TestImageContentSkipsDownloadURLForDataURI data URI 不该给下载行。
+// TestImageContentSkipsAddressLineForDataURI data URI 不该给地址行。
 //
 // 上游只回 b64_json 时，url 是 data:image/png;base64,... —— 它本身就是内容，
-// 加个 ?download=1 既无意义，又会把那一大串 base64 在正文里再抄一遍。
-func TestImageContentSkipsDownloadURLForDataURI(t *testing.T) {
+// 再抄一行出来只会把那一大串 base64 在正文里重复一遍。
+func TestImageContentSkipsAddressLineForDataURI(t *testing.T) {
 	content, _ := ImageContent([]map[string]any{{"b64_json": "AAAA"}}, "画一只猫")
-	if strings.Contains(content, "原图下载") {
-		t.Errorf("data URI 不该给下载行：%q", content)
+	if strings.Contains(content, "原图地址") {
+		t.Errorf("data URI 不该给地址行：%q", content)
+	}
+}
+
+// TestVideoContentLinksAddress 视频地址同样要给「显示即真实」的链接。
+func TestVideoContentLinksAddress(t *testing.T) {
+	u := "https://hub.example.com:52325/api/chat/videos/abc.mp4"
+	got := VideoContent("agnes-video-2.5-flash", map[string]any{}, u)
+	want := "生成完成：[" + u + "](" + u + ")"
+	if !strings.Contains(got, want) {
+		t.Errorf("视频完成行应为 Markdown 链接，实际 %q", got)
+	}
+	// 非 http(s) 地址（还没落盘时可能是相对路径）原样给出，不要造出坏链接。
+	rel := VideoContent("agnes-video-2.5-flash", map[string]any{}, "/api/chat/videos/abc.mp4")
+	if !strings.Contains(rel, "生成完成：/api/chat/videos/abc.mp4") {
+		t.Errorf("相对地址应原样给出，实际 %q", rel)
 	}
 }
 
