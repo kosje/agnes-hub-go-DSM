@@ -257,6 +257,38 @@ func TestNormalizeSettingsFillsMissingFields(t *testing.T) {
 	}
 }
 
+// TestMigrateClientMediaURL 一次性迁移：把被下拉框默认值钉死的 upstream 交回 auto。
+//
+// 背景：1.0.18 及以前，控制台「客户端媒体地址」下拉框只有「上游地址」/「本机地址」
+// 两项且默认选中上游，而它**每次保存设置页都会把当前选中项写回配置** —— 于是只要
+// 动过一次设置页（哪怕只想改图片保留天数），这个字段就被钉死成 upstream。
+// 用户明明填了「对外访问地址」，客户端拿到的却还是上游 CDN 地址。
+func TestMigrateClientMediaURL(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        Settings
+		wantMedia string
+		wantVer   int
+	}{
+		{"upstream + 已配对外地址 → 交回 auto", Settings{ClientMediaURL: "upstream", PublicBaseURL: "https://a.tn:52325"}, "", settingsVersion},
+		{"upstream 但没配对外地址 → 保持不动", Settings{ClientMediaURL: "upstream"}, "upstream", settingsVersion},
+		{"local 不受影响", Settings{ClientMediaURL: "local", PublicBaseURL: "https://a.tn:52325"}, "local", settingsVersion},
+		{"已迁过的不再动（版本号已是最新）", Settings{SettingsVersion: settingsVersion, ClientMediaURL: "upstream", PublicBaseURL: "https://a.tn:52325"}, "upstream", settingsVersion},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := c.in
+			normalizeSettings(&v)
+			if v.ClientMediaURL != c.wantMedia {
+				t.Errorf("client_media_url 应为 %q，实际 %q", c.wantMedia, v.ClientMediaURL)
+			}
+			if v.SettingsVersion != c.wantVer {
+				t.Errorf("settings_version 应为 %d，实际 %d", c.wantVer, v.SettingsVersion)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 下游密钥
 // ---------------------------------------------------------------------------
