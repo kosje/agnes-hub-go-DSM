@@ -221,11 +221,41 @@ function renderShell(){
   }
 }
 async function changePassword(){
+  const o = prompt("输入当前密码"); if(!o) return;
   const a = prompt("输入新密码（至少 6 位）"); if(!a) return;
   const b = prompt("再输入一次确认"); if(a!==b){ alert("两次输入不一致"); return; }
-  try{ await api("/api/password",{method:"POST",body:JSON.stringify({new_password:a})});
-    state.session.must_change_password=false; toast("密码已修改","good"); renderShell(); }
+  try{ await api("/api/password",{method:"POST",body:JSON.stringify({old_password:o,new_password:a})});
+    state.session.must_change_password=false; toast("密码已修改","good"); renderShell(); await refresh(); }
   catch(e){ alert(e.message); }
+}
+/* 仍在用初始密码时，服务端拒绝一切管理接口，只剩这一页可用。 */
+function renderForceChange(){
+  document.getElementById("app").innerHTML = `
+  <div class="login">
+    <div class="card">
+      <h1>请先修改初始密码</h1>
+      <p class="muted">初始密码人尽皆知，改掉之前控制台的其它功能不可用。</p>
+      <div id="toast" class="hide"></div>
+      <label>当前密码</label><input id="fcOld" type="password" autocomplete="current-password">
+      <label>新密码（至少 6 位）</label><input id="fcNew" type="password" autocomplete="new-password">
+      <label>确认新密码</label><input id="fcNew2" type="password" autocomplete="new-password">
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btnFc">修改并进入控制台</button>
+        <button class="sm" id="btnFcOut">退出</button>
+      </div>
+    </div>
+  </div>`;
+  const go = async ()=>{
+    const o=document.getElementById("fcOld").value, a=document.getElementById("fcNew").value, b=document.getElementById("fcNew2").value;
+    if(a!==b){ toast("两次输入的新密码不一致","bad"); return; }
+    try{ await api("/api/password",{method:"POST",body:JSON.stringify({old_password:o,new_password:a})});
+      state.session.must_change_password=false; await boot(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
+  document.getElementById("btnFc").onclick = go;
+  document.getElementById("fcNew2").onkeydown = e=>{ if(e.key==="Enter") go(); };
+  document.getElementById("btnFcOut").onclick = async ()=>{ await api("/api/logout",{method:"POST"}); location.reload(); };
+  document.getElementById("fcOld").focus();
 }
 
 /* ---------------- 总览 ---------------- */
@@ -963,12 +993,16 @@ function viewSettings(){
     </div>
   </div>
   <div class="card">
-    <h2>Chat 密码设置</h2>
+    <h2>Chat 访问密码 <span class="pill ${s.chat_password_set?"ok":"warn"}">${s.chat_password_set?"已设置":"未设置"}</span></h2>
     <div class="grid g2">
-      <div><label>Chat 访问密码 (留空=无需密码)</label><input id="s_chat_pw" type="password" placeholder="输入新密码或留空禁用"></div>
-      <div><label>确认密码</label><input id="s_chat_pw_confirm" type="password" placeholder="再次输入密码"></div>
+      <div><label>新的 Chat 访问密码（至少 6 位）</label><input id="s_chat_pw" type="password" autocomplete="new-password" placeholder="输入新密码"></div>
+      <div><label>确认密码</label><input id="s_chat_pw_confirm" type="password" autocomplete="new-password" placeholder="再次输入密码"></div>
     </div>
-    <div class="hint" style="margin-top:8px">设置后，访问 /chat 页面需要输入密码。清空密码则无需验证即可访问。</div>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" id="btnChatPw">保存 Chat 密码</button>
+      <button class="danger" id="btnChatPwClear">清除 Chat 密码</button>
+    </div>
+    <div class="hint" style="margin-top:8px">设置后，不知道管理员密码的人可以凭这个密码使用 /chat（对话 / 生图 / 生视频），但进不了控制台。未设置时 /chat 只能用管理员密码登录。修改或清除后，已登录的 Chat 会话立即失效。</div>
   </div>
   <div class="card">
     <h2>迁移</h2>
@@ -978,6 +1012,24 @@ function viewSettings(){
       <button id="btnImport" class="primary">导入配置</button>
     </div>
   </div>`;
+}
+function bindChatPasswordEvents(){
+  const set = document.getElementById("btnChatPw");
+  if(!set) return;
+  set.onclick = async ()=>{
+    const a = document.getElementById("s_chat_pw").value, b = document.getElementById("s_chat_pw_confirm").value;
+    if(!a){ toast("请输入新的 Chat 访问密码","bad"); return; }
+    if(a!==b){ toast("两次输入的密码不一致","bad"); return; }
+    try{ await api("/api/settings",{method:"POST",body:JSON.stringify({chat_password:a})});
+      toast("Chat 访问密码已保存","good"); await refresh(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
+  document.getElementById("btnChatPwClear").onclick = async ()=>{
+    if(!confirm("清除后 /chat 只能用管理员密码登录，已登录的 Chat 会话会失效。继续？")) return;
+    try{ await api("/api/settings",{method:"POST",body:JSON.stringify({chat_password_clear:true})});
+      toast("Chat 访问密码已清除","good"); await refresh(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
 }
 function bindSettingsEvents(){
   const save = document.getElementById("btnSaveSettings");
@@ -1013,11 +1065,12 @@ function bindSettingsEvents(){
     catch(e){ toast(e.message,"bad"); }
   };
   const exp = (masked)=>async ()=>{
-    window.open("/api/export","_blank");
-    if(!masked) toast("含密钥的导出请用 /api/export 的结果自行保存","warn");
+    if(!masked && !confirm("将导出全部上游 API Key 与下游密钥的明文，请妥善保管导出文件。继续？")) return;
+    window.open(masked ? "/api/export?redact=1" : "/api/export","_blank");
   };
   document.getElementById("btnExport").onclick = exp(true);
-  document.getElementById("btnExportFull").onclick = exp(true);
+  document.getElementById("btnExportFull").onclick = exp(false);
+  bindChatPasswordEvents();
   document.getElementById("btnImport").onclick = async ()=>{
     const text = prompt("粘贴导出的 JSON（会追加账号，不覆盖现有）"); if(!text) return;
     try{
@@ -1191,8 +1244,7 @@ function bindAboutEvents(){
     }
     if(!avail){
       box.innerHTML = s.suite_managed
-        ? `<div class="banner info">已是最新版本。本套件版由群晖套件中心统一升级，
-             请在「套件中心 → 社群」检查更新。</div>`
+        ? `<div class="banner info">已是最新版本。${esc(s.update_hint||"")}。</div>`
         : `<div class="banner good">当前已是最新版本，无需更新。</div>`;
       return;
     }
@@ -1200,7 +1252,7 @@ function bindAboutEvents(){
     box.innerHTML = `<div class="banner warn">
         发现新版本 <b>${esc(last.latest_version)}</b>（当前 ${esc(cur)}）。
         ${canApply ? "点「立即更新」会下载对应平台的二进制并替换，随后程序自动退出并重启。"
-                   : "请在「套件中心 → 社群」升级。"}
+                   : esc(s.update_hint||"") + "。"}
       </div>
       ${notes? `<pre class="scroll" style="background:#fafbfc;border:1px solid var(--line);
         border-radius:10px;padding:12px;margin:0">${esc(notes)}</pre>`:""}`;
@@ -1251,6 +1303,7 @@ function bindAboutEvents(){
 
 async function boot(){
   if(!state.session || !state.session.logged_in){ renderLogin(false); return; }
+  if(state.session.must_change_password){ renderForceChange(); return; }
   renderShell();
   await refresh();
 }

@@ -239,7 +239,7 @@ func TestMediaBaseEndpoint(t *testing.T) {
 	h := newHarness(t, 0, 1)
 
 	req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/api/media-base", nil)
-	req.AddCookie(&http.Cookie{Name: cookieName, Value: h.store.SessionToken()})
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: h.session})
 	req.Header.Set("X-Forwarded-Host", "agens.example.com:52325")
 	req.Header.Set("X-Forwarded-Proto", "https")
 	resp, err := http.DefaultClient.Do(req)
@@ -267,7 +267,7 @@ func TestMediaBaseEndpoint(t *testing.T) {
 	// 改成 local 后应给本地地址
 	_ = h.store.UpdateSettings(func(st *config.Settings) { st.ClientMediaURL = "local" })
 	req2, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/api/media-base", nil)
-	req2.AddCookie(&http.Cookie{Name: cookieName, Value: h.store.SessionToken()})
+	req2.AddCookie(&http.Cookie{Name: cookieName, Value: h.session})
 	req2.Header.Set("X-Forwarded-Host", "agens.example.com:52325")
 	req2.Header.Set("X-Forwarded-Proto", "https")
 	resp2, err := http.DefaultClient.Do(req2)
@@ -408,7 +408,7 @@ func TestMediaBasePanelReportsClientView(t *testing.T) {
 
 	fetch := func() map[string]any {
 		req, _ := http.NewRequest(http.MethodGet, h.ts.URL+"/api/media-base", nil)
-		req.AddCookie(&http.Cookie{Name: cookieName, Value: h.store.SessionToken()})
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: h.session})
 		req.Header.Set(surfaceHeader, "web") // 面板就是网页请求
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

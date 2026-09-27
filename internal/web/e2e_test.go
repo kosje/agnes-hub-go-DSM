@@ -205,6 +205,8 @@ type harness struct {
 	mock    *mockAgnes
 	apiKey  string
 	baseURL string
+	// session 是管理员会话令牌：/api/ 下的网页接口一律要求登录。
+	session string
 }
 
 func newHarness(t *testing.T, minInterval time.Duration, accountCount int) *harness {
@@ -248,7 +250,7 @@ func newHarness(t *testing.T, minInterval time.Duration, accountCount int) *harn
 	key := store.AddKey("test-key", []string{"*"}, 0, 0, "")
 
 	harness := &harness{t: t, store: store, hub: h, srv: srv, ts: ts, up: up, mock: mock,
-		apiKey: key.Key, baseURL: up.URL + "/v1"}
+		apiKey: key.Key, baseURL: up.URL + "/v1", session: store.NewAdminSession()}
 	t.Cleanup(func() { ts.Close(); up.Close() })
 	return harness
 }
@@ -259,6 +261,7 @@ func (h *harness) post(path string, payload map[string]any) (*http.Response, map
 	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+path, strings.NewReader(string(buf)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	req.AddCookie(h.cookie())
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatalf("请求 %s 失败：%v", path, err)
@@ -280,6 +283,7 @@ func (h *harness) postWeb(path string, payload map[string]any) (*http.Response, 
 	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+path, strings.NewReader(string(buf)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	req.AddCookie(h.cookie())
 	req.Header.Set(surfaceHeader, "web")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -312,6 +316,7 @@ func (h *harness) postSSEWith(path string, payload map[string]any, web bool) str
 	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+path, bytes.NewReader(buf))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	req.AddCookie(h.cookie())
 	if web {
 		req.Header.Set(surfaceHeader, "web")
 	}
@@ -726,4 +731,19 @@ func TestDroppedFieldsGoToHeaderNotBody(t *testing.T) {
 	if got != "cfg_scale,stream_options" {
 		t.Errorf("被丢弃字段应经响应头返回（按字典序），实际 %q", got)
 	}
+}
+
+// cookie 返回管理员会话 cookie，供直接构造请求的用例使用。
+func (h *harness) cookie() *http.Cookie {
+	return &http.Cookie{Name: cookieName, Value: h.session}
+}
+
+// rawGet 带管理员会话发 GET，返回原始响应（调用方负责关闭 Body）。
+func (h *harness) rawGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.AddCookie(h.cookie())
+	return http.DefaultClient.Do(req)
 }

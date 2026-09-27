@@ -52,6 +52,17 @@ PRIMARY_ARCH = "x86_64"
 
 # 套件中心里显示的变更说明（HTML）。发新版时改这里。
 CHANGELOG = (
+    "【1.0.24】安全与稳定性修复，建议所有用户升级<br>"
+    "· /chat 的对话、生图、生视频接口此前无需登录即可调用，能访问端口的任何人都能耗用账号池；"
+    "现已要求管理员或 Chat 会话<br>"
+    "· 会话改为服务端随机令牌（7 天过期，退出 / 改密立即失效），不再能由口令散列推导；"
+    "口令改用 PBKDF2 散列；登录连续输错 5 次锁定 15 分钟；写操作校验同源<br>"
+    "· 新装套件在安装向导里设置管理员密码；仍在用初始密码 admin123 的，登录后必须先改密<br>"
+    "· Chat 访问密码现在可以在「设置」里真正设置 / 清除；未设置时 /chat 只接受管理员密码<br>"
+    "· 超过 30 秒的流式回答不再被截断；额度耗尽（402）的账号自动冷却并换号；"
+    "修复可能导致进程崩溃的账号数据竞争<br>"
+    "· 「导出（不含密钥明文）」现在真的会打码；生成的媒体不再接受 SVG<br>"
+    "<br>"
     "【1.0.23】<br>"
     "· 图片下的地址行只留「在浏览器中打开」一个入口，去掉重复的行内代码地址"
     "（与图片 tooltip 内容重复）<br>"
@@ -267,8 +278,7 @@ LANDING = """<!DOCTYPE html>
 <div class="note">
   <strong>为什么地址里没有架构信息</strong>：群晖 catalog 的条目里没有架构字段 ——
   架构过滤是服务端按请求的 <code>arch</code> 参数做的。本套件源是 GitHub Pages
-  静态托管，做不到按参数返回不同内容，所以一个架构一份文件。本项目只分发
-  <strong>x86_64</strong>（覆盖 DS918+ 等 apollolake 平台的全部 Intel/AMD 机型）。
+  静态托管，做不到按参数返回不同内容，所以一个架构一份文件，按上表选择自己机型对应的地址。
 </div>
 
 <h2>当前版本</h2>
@@ -279,7 +289,7 @@ LANDING = """<!DOCTYPE html>
 
 <h2>安装后</h2>
 <ul>
-  <li>控制台：<code>http://&lt;NAS 地址&gt;:{port}/console</code>，初始密码 <code>admin123</code>，请立即修改</li>
+  <li>控制台：<code>http://&lt;NAS 地址&gt;:{port}/console</code>，用安装向导里设置的管理员密码登录</li>
   <li>客户端接入：<code>http://&lt;NAS 地址&gt;:{port}/v1</code>，模型名 <code>agnes-auto</code></li>
   <li>数据目录：<code>/var/packages/agnes-hub/var/data</code>（含 <code>accounts.json</code>，请自行备份）</li>
 </ul>
@@ -305,6 +315,24 @@ LANDING = """<!DOCTYPE html>
 """
 
 
+def version_key(version):
+    """把 1.0.23 / 1.0.12-0002 这类版本号转成可比较的整数元组。"""
+    parts = []
+    for chunk in version.replace("-", ".").split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def prune_old_spks(out_dir, arch, keep):
+    """删掉 out_dir 里同架构的其它 SPK：Pages 只放最新版，历史版本在 GitHub Release。"""
+    prefix = "%s-%s-" % (APP_ID, arch)
+    for f in sorted(os.listdir(out_dir)):
+        if f.endswith(".spk") and f.startswith(prefix) and f != keep:
+            os.remove(os.path.join(out_dir, f))
+            print("  删除旧包 %s/%s" % (out_dir, f))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dist", default="dist", help="SPK 所在目录（默认 dist/）")
@@ -315,6 +343,8 @@ def main():
                          "仅 --link-from-release 时会用到")
     ap.add_argument("--link-from-release", action="store_true",
                     help="把 link 指向 GitHub Release 而不是 Pages（默认走 Pages）")
+    ap.add_argument("--keep-old", action="store_true",
+                    help="保留 --out 里同架构的历史 SPK（默认删除，历史版本以 GitHub Release 为准）")
     ap.add_argument("--arch", default=PRIMARY_ARCH,
                     help="要纳入 catalog 的架构，逗号分隔；默认 %s，用 all 表示全部"
                          % PRIMARY_ARCH)
@@ -348,12 +378,29 @@ def main():
     thumb_urls = ["%s/%s-72.png" % (PAGES_BASE, APP_ID),
                   "%s/%s-256.png" % (PAGES_BASE, APP_ID)]
 
-    written = []
-    meta = []
+    # 每个架构只发布版本号最大的那一个。
+    #
+    # 旧实现对 dist/ 里的每个文件各写一次 catalog，最后写的（按文件名排序的最后一个）
+    # 胜出；又把每个文件都复制进 docs/。于是 dist/ 里一旦残留旧包：落地页出现成排的
+    # 重复行，docs/ 越积越大；到 1.0.99 → 1.0.100 时字符串排序还会让 catalog 停在旧版，
+    # 套件中心永远提示不出更新。这里按 INFO 里的版本号数值比较来选。
+    latest = {}
     for name in spks:
         path = os.path.join(args.dist, name)
         info = read_spk_info(path)
         arch = distribution_arch(name)
+        cur = latest.get(arch)
+        if cur is None or version_key(info["version"]) > version_key(cur[1]["version"]):
+            latest[arch] = (name, info)
+    older = [n for n in spks if n not in {v[0] for v in latest.values()}]
+    if older:
+        print("跳过较旧的包（每个架构只发布最新版）：%s" % "、".join(older))
+
+    written = []
+    meta = []
+    for arch in sorted(latest):
+        name, info = latest[arch]
+        path = os.path.join(args.dist, name)
         version = info["version"]
         tag = args.tag or ("v%s" % version)
 
@@ -367,6 +414,8 @@ def main():
         else:
             shutil.copy2(path, os.path.join(args.out, name))
             link = "%s/%s" % (PAGES_BASE, name)
+            if not args.keep_old:
+                prune_old_spks(args.out, arch, keep=name)
 
         entry = make_entry(path, link, thumb_urls)
         out_name = catalog_name_for(arch)

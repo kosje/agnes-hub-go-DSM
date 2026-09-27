@@ -55,7 +55,7 @@ type upstreamModelsResult struct {
 // 请求体可选 {"account_id": "..."}；留空则探测全部启用的账号。
 func (s *Server) apiUpstreamModels(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	var req struct {

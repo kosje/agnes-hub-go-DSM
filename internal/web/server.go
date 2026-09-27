@@ -46,15 +46,20 @@ type Server struct {
 	// 「查最新版本号」是只读的，仍然保留，否则控制台的
 	// 「最新版本 / 发布时间」永远只能显示「—」。
 	SuiteManaged bool
+	// PackageManaged 表示由群晖套件中心管理（SuiteManaged 的一种）。只影响控制台
+	// 给出的升级指引：套件版去套件中心，其余到 GitHub Release 手动下载。
+	PackageManaged bool
 	// intentCache 缓存 auto 路径的意图判定（body 哈希 + 规则指纹 → 结论）。
 	// 仅 handleTextish 命中 auto 模型时读写；显式模型名、媒体端点均不走。
 	intentCache *intent.Cache
+	// logins 是网页登录的失败限速表。
+	logins *loginLimiter
 }
 
 // New 构造服务。
 func New(store *config.Store, h *hub.Hub, client *http.Client) *Server {
 	s := &Server{Store: store, Hub: h, Client: client, mux: http.NewServeMux(), rules: intent.DefaultRules(),
-		intentCache: intent.NewCache(0, 0)}
+		intentCache: intent.NewCache(0, 0), logins: newLoginLimiter()}
 	s.routes()
 	return s
 }
@@ -72,11 +77,29 @@ func (s *Server) SetReleaseRepo(repo string) { s.ReleaseRepo = repo }
 // 只关闭「应用更新」，不影响「查最新版本」。
 func (s *Server) SetSuiteManaged(v bool) { s.SuiteManaged = v }
 
+// SetPackageManaged 声明由群晖套件中心管理。
+func (s *Server) SetPackageManaged(v bool) { s.PackageManaged = v }
+
+// manualUpdateHint 是进程内自更新关闭时给用户的升级指引。
+func (s *Server) manualUpdateHint() string {
+	if s.PackageManaged {
+		return "本套件版由群晖套件中心统一升级，请到「套件中心 → 社群」升级"
+	}
+	return "进程内自更新已关闭，请到 GitHub Releases 下载新版后替换程序文件（数据目录保持不动）"
+}
+
 // Updater 返回当前 updater 实例（测试用）。
 func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
 
 // ServeHTTP 实现 http.Handler。
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.sameOrigin(r) {
+		writeJSON(w, 403, map[string]any{"error": map[string]any{"type": "permission_error",
+			"message": "跨来源请求被拒绝（Origin 与网关地址不一致）"}}, nil)
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
 
 func (s *Server) routes() {
 	m := s.mux
@@ -404,20 +427,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	// 每账号 gauge：冷却剩余秒数、连续失败数
 	type acctGauge struct {
-		id                   string
-		name                 string
-		enabled              bool
-		penaltyRemainingSec  float64
-		consecutiveFailures  int
+		id                  string
+		name                string
+		enabled             bool
+		penaltyRemainingSec float64
+		consecutiveFailures int
 	}
 	var gauges []acctGauge
 	for _, a := range s.Store.AccountsSnapshot() {
 		gauges = append(gauges, acctGauge{
-			id:                    a.ID,
-			name:                  a.Name,
-			enabled:               a.Enabled,
-			penaltyRemainingSec:   h.PenaltyRemaining(a.ID).Seconds(),
-			consecutiveFailures:   a.ConsecutiveFailures,
+			id:                  a.ID,
+			name:                a.Name,
+			enabled:             a.Enabled,
+			penaltyRemainingSec: h.PenaltyRemaining(a.ID).Seconds(),
+			consecutiveFailures: a.ConsecutiveFailures,
 		})
 	}
 

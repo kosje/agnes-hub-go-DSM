@@ -241,12 +241,48 @@ case "$1" in
 esac
 '''
 
+# 安装向导：安装时让用户设置管理员密码。
+#
+# 不设向导时每台新装的 NAS 都以公开的初始密码 admin123 起步，局域网里谁先登录谁就
+# 能把控制台改成自己的密码。DSM 把向导里填的值以同名环境变量交给安装脚本。
+WIZARD_INSTALL = [{
+    "step_title": "设置管理员密码",
+    "items": [{
+        "type": "password",
+        "desc": "用于登录 Agnes Hub 控制台（至少 6 位）。安装后也可以在控制台里修改。",
+        "subitems": [
+            {"key": "wizard_admin_password", "desc": "管理员密码",
+             "validator": {"allowBlank": False, "minLength": 6}},
+            {"key": "wizard_admin_password_confirm", "desc": "确认密码",
+             "validator": {"allowBlank": False, "minLength": 6}},
+        ],
+    }],
+}]
+
+# 安装前校验向导输入。DSM 向导本身做不了「两次输入一致」的交叉校验。
+PREINST = '''#!/bin/sh
+if [ -n "${wizard_admin_password:-}" ] && [ "${wizard_admin_password}" != "${wizard_admin_password_confirm:-}" ]; then
+  if [ -n "${SYNOPKG_TEMP_LOGFILE:-}" ]; then
+    echo "两次输入的管理员密码不一致，请重新安装。" > "$SYNOPKG_TEMP_LOGFILE"
+  fi
+  exit 1
+fi
+exit 0
+'''
+
 # 安装后建数据目录。群晖在升级时保留 var/，只有卸载才删除整个套件目录。
 POSTINST = '''#!/bin/sh
 PKG_NAME="%APP_ID%"
 PKG_DIR="${SYNOPKG_PKGDEST:-/var/packages/$PKG_NAME/target}"
 VAR_DIR="${SYNOPKG_PKGVAR:-/var/packages/$PKG_NAME/var}"
 mkdir -p "$VAR_DIR/data" 2>/dev/null || true
+chmod 700 "$VAR_DIR/data" 2>/dev/null || true
+
+# 向导填的管理员密码写成一次性文件（0600），服务首次启动读入后立即删除。
+# 升级流程没有向导，变量为空，这里什么也不做，原有密码保持不变。
+if [ -n "${wizard_admin_password:-}" ]; then
+  (umask 077 && printf "%s" "$wizard_admin_password" > "$VAR_DIR/data/.initial_admin_password")
+fi
 
 # 确保 target/ui 与系统 3rdparty 快捷方式软链接建立，保障 DSM 主菜单图标即时出现
 if [ -d "$PKG_DIR/ui" ] && [ -d /usr/syno/synoman/webman/3rdparty ]; then
@@ -818,7 +854,8 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
            START_STOP_STATUS.replace("%APP_ID%", APP_ID).replace("%PORT%", str(SERVICE_PORT)))
     _write(os.path.join(scripts_dir, "postinst"), POSTINST.replace("%APP_ID%", APP_ID))
     _write(os.path.join(scripts_dir, "postupgrade"), POSTUPGRADE.replace("%APP_ID%", APP_ID))
-    for name in ("preinst", "preuninst", "postuninst", "preupgrade"):
+    _write(os.path.join(scripts_dir, "preinst"), PREINST)
+    for name in ("preuninst", "postuninst", "preupgrade"):
         _write(os.path.join(scripts_dir, name), TRIVIAL)
 
     # 4. conf：privilege 决定运行身份，缺失会被拒绝安装。
@@ -831,6 +868,13 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
     #    不声明不影响功能（防火墙规则由用户在 DSM 里自行放行）。
     with open(os.path.join(conf_dir, "resource"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({}, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+
+    # 4b. 安装向导（外层 WIZARD_UIFILES/install_uifile）
+    wizard_dir = os.path.join(d, "WIZARD_UIFILES")
+    os.makedirs(wizard_dir, exist_ok=True)
+    with open(os.path.join(wizard_dir, "install_uifile"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(WIZARD_INSTALL, f, ensure_ascii=False, indent=2)
         f.write("\n")
 
     # 5. 套件图标（外层 PACKAGE_ICON*.PNG）
@@ -857,6 +901,7 @@ def build_spk(bundle, out_path):
         _add_dir_recursive(tar, os.path.join(bundle, "scripts"), "scripts")
         _add_dir_recursive(tar, os.path.join(bundle, "conf"), "conf")
         _add_dir_recursive(tar, os.path.join(bundle, "ui"), "ui")
+        _add_dir_recursive(tar, os.path.join(bundle, "WIZARD_UIFILES"), "WIZARD_UIFILES")
         _add_file(tar, os.path.join(bundle, "PACKAGE_ICON.PNG"), "PACKAGE_ICON.PNG", mode=0o644)
         _add_file(tar, os.path.join(bundle, "PACKAGE_ICON_256.PNG"), "PACKAGE_ICON_256.PNG", mode=0o644)
     validate_spk(out_path)
@@ -874,7 +919,7 @@ def validate_spk(path):
         "scripts/preinst", "scripts/postinst", "scripts/preuninst",
         "scripts/postuninst", "scripts/preupgrade", "scripts/postupgrade",
         "conf/privilege", "PACKAGE_ICON.PNG", "PACKAGE_ICON_256.PNG",
-        "ui/config",
+        "ui/config", "WIZARD_UIFILES/install_uifile",
     }
     # DSM 桌面图标：缺了不会导致安装失败，但桌面上不会有图标。
     # 图标要成套齐全，DSM 会按场景取不同尺寸。

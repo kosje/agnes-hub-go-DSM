@@ -40,12 +40,10 @@ import (
 // Release tag 又是 v1.0.12-0002，用户根本对不上。而且 updater 的版本比较会在
 // 第一个 '-' 处截断，1.0.12-0002 与 1.0.12 被判成相等，永远显示「已是最新」。
 // 统一成一个号之后这些问题自然消失。
-var version = "1.0.23"
+var version = "1.0.24"
 
-// releaseRepo 是控制台「版本与自更新」卡片里「查看全部版本」要跳转的 GitHub 仓库
-// （owner/name），非套件版会被自更新仓库覆盖，见 main()。这里是本 DSM 套件分支的仓库：
-// 套件版禁用了自更新、升级由群晖套件中心负责，所以链接必须指向套件自己的 Release，
-// 不能指向上游 —— 上游的 Release 里没有 SPK，用户点进去会一脸懵。
+// releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
+// 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
 // 换 fork / 换发布仓库时同步改这一行。
 var releaseRepo = "kosje/agnes-hub-go-DSM"
 
@@ -67,8 +65,10 @@ func main() {
 	host := flag.String("host", env("AGNES_HUB_HOST", "127.0.0.1"), "监听地址（0.0.0.0 表示允许局域网访问）")
 	port := flag.String("port", env("AGNES_HUB_PORT", "4142"), "监听端口")
 	dataDir := flag.String("data", env("AGNES_HUB_DATA", ""), "数据目录（默认 ./data）")
+	// 进程内自更新已整体关闭（见下方「初始化更新检查」），这个开关现在只用来标记
+	// 「由套件中心管理」，决定控制台给出哪种升级指引。群晖 SPK 启动时自动带上。
 	noSelfUpdate := flag.Bool("no-selfupdate", env("AGNES_HUB_NO_SELFUPDATE", "") != "",
-		"禁用内置自更新（由套件中心 / 系统包管理器负责升级时使用）")
+		"标记由套件中心 / 系统包管理器负责升级（群晖套件使用）")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
 	flag.Parse()
 
@@ -102,38 +102,34 @@ func main() {
 	srv := web.New(store, h, relay.BuildClient())
 	srv.Version = version
 
-	// 初始化自更新器
+	// 初始化更新检查：只查、不装。
+	//
+	// 进程内自更新（下载新二进制替换自身）在所有平台上都关闭：
+	//   - 群晖：二进制由套件中心管理，INFO 里登记了 package.tgz 的 checksum，
+	//     进程内替换会让「实际内容」与「已安装版本」对不上；
+	//   - Windows：替换助手是从正要被覆盖的那个 exe 本身启动的，运行中的映像被
+	//     自己锁住，替换注定失败，而旧进程已经退出 —— 每次「更新」都会让服务停掉；
+	//     且旧配置指向第三方仓库、下载后不校验摘要。
+	// 升级改为：群晖走套件中心，Windows 到本仓库 Release 下载后手动替换。
+	//
+	// 「查最新版本号」是只读的、没有副作用，保留：控制台要如实显示
+	// 「最新版本 / 发布时间 / 是否已是最新」。检查频率 12 小时。
 	exe, _ := os.Executable()
-	// 检查频率：12 小时。自更新是「有就换」，没必要更勤。
-	updRepo, checkInterval := "my788525/agnes-hub-go", 12*time.Hour
-	// 控制台「查看全部版本」的跳转目标：默认用套件仓库，自更新开着时跟随自更新仓库，
-	// 否则用户点进去看到的版本跟「立即更新」能装上的版本会对不上。
-	relRepo := releaseRepo
-	if *noSelfUpdate {
-		// 群晖套件等场景：二进制由套件中心管理，套件 INFO 里登记了 package.tgz 的 checksum。
-		// 若允许进程内替换二进制，套件的「实际内容」与「已安装版本」就会不一致，
-		// 下次套件中心校验或升级必然冲突 —— 所以应用更新必须关掉。
-		//
-		// 但「查最新版本号」是只读的、没有任何副作用，必须保留：控制台要如实显示
-		// 「最新版本 / 发布时间 / 是否已是最新」，否则这三格永远是一片「—」，
-		// 用户根本不知道有没有新版。所以这里仍然配 releaseRepo，只是标记为套件托管。
-		updRepo = releaseRepo
-	}
+	checkInterval := 12 * time.Hour
 	updCfg := updater.Config{
-		Repo:          updRepo,
+		Repo:          releaseRepo,
 		BinaryName:    "agnes-hub-go",
 		DataDir:       *dataDir,
 		CheckInterval: checkInterval,
-		// 套件版的 release 资产是 SPK（agnes-hub-x86_64-1.0.13.spk），
-		// 不是裸二进制，pickAsset 永远挑不到 —— 若不告诉 updater，它会判定
-		// 「没有本平台的资产」→ IsUpdateAvailable 恒为 false，控制台永远显示
-		// 「已是最新」，还会弹一条莫名其妙的资产缺失告警。
-		SuiteManaged: *noSelfUpdate,
+		// 本仓库的 release 资产是 SPK，不是裸二进制，pickAsset 永远挑不到 ——
+		// 若不告诉 updater，它会判定「没有本平台的资产」→ 恒显示「已是最新」。
+		SuiteManaged: true,
 	}
 	upd := updater.New(updCfg, version, exe, nil)
 	srv.SetUpdater(upd)
-	srv.SetSuiteManaged(*noSelfUpdate)
-	srv.SetReleaseRepo(relRepo)
+	srv.SetSuiteManaged(true)
+	srv.SetPackageManaged(*noSelfUpdate)
+	srv.SetReleaseRepo(releaseRepo)
 	upd.StartBackground(ctx, checkInterval)
 
 	// 启动后立刻查一次：StartBackground 要等一个周期（12h）才首次检查，
@@ -190,7 +186,7 @@ func main() {
 	fmt.Printf("  数据目录  %s\n", *dataDir)
 	fmt.Printf("  可用账号  %d\n", enabled)
 	if settings.MustChangePassword {
-		fmt.Println("  请使用安装向导设置的管理员密码登录控制台；若未设置，可通过重新安装向导填写新密码覆盖。")
+		fmt.Println("  管理员仍是初始密码 admin123：登录控制台后必须先改密，改之前其它管理功能不可用。")
 	}
 	if *host == "0.0.0.0" || *host == "" || *host == "::" {
 		fmt.Println("  网络监听  IPv4(0.0.0.0) + IPv6(::) 双栈")
@@ -204,7 +200,11 @@ func main() {
 		log.Fatalf("监听失败：%v", err)
 	}
 
+	// Serve 在 Shutdown 一开始就返回，所以 main 必须另外等 Shutdown 本身结束，
+	// 在途请求才有 8 秒收尾，维护循环最后一次统计落盘也不会被进程退出抢先。
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, c := context.WithTimeout(context.Background(), 8*time.Second)
 		defer c()
@@ -226,12 +226,12 @@ func main() {
 	// 等到优雅关闭完成，或首个监听错误。
 	select {
 	case <-ctx.Done():
-		wg.Wait()
 	case e := <-errCh:
 		log.Printf("监听错误：%v", e)
 		cancel()
-		wg.Wait()
 	}
+	wg.Wait()
+	<-shutdownDone
 	fmt.Println("Agnes Hub 已停止。")
 }
 

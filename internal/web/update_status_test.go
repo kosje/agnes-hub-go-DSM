@@ -100,11 +100,15 @@ func TestApplyUpdateRefusedWhenSuiteManaged(t *testing.T) {
 		"1.0.13", "/tmp/agnes-hub-go", nil)
 	store := newTempStore(t)
 	s := &Server{Store: store, Version: "1.0.13",
-		ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd, SuiteManaged: true}
+		ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd, SuiteManaged: true, PackageManaged: true}
 
+	// 初始密码状态下管理接口一律 403，先改掉。
+	if err := store.SetPassword("test-admin-pass"); err != nil {
+		t.Fatal(err)
+	}
 	// 这个接口要求管理员会话，得带上有效 cookie，否则先被鉴权拦成 401
 	req := httptest.NewRequest(http.MethodPost, "/api/update/apply", nil)
-	req.AddCookie(&http.Cookie{Name: cookieName, Value: store.SessionToken()})
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: store.NewAdminSession()})
 	rec := httptest.NewRecorder()
 	s.apiUpdateApply(rec, req)
 
@@ -121,5 +125,34 @@ func TestApplyUpdateRefusedWhenSuiteManaged(t *testing.T) {
 	msg, _ := out["error"].(string)
 	if !strings.Contains(msg, "套件中心") {
 		t.Errorf("错误文案应引导用户去套件中心，实际 %q", msg)
+	}
+}
+
+// Windows 等非套件版：进程内自更新同样关闭（替换助手会锁住自己要替换的 exe，
+// 每次更新都会让服务停掉），且指引用户去 Release 手动下载，而不是去套件中心。
+func TestApplyUpdateRefusedOnStandalone(t *testing.T) {
+	upd := updater.New(updater.Config{Repo: "kosje/agnes-hub-go-DSM", SuiteManaged: true},
+		"1.0.13", "C:/agnes/agnes-hub-go.exe", nil)
+	store := newTempStore(t)
+	if err := store.SetPassword("test-admin-pass"); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Store: store, Version: "1.0.13",
+		ReleaseRepo: "kosje/agnes-hub-go-DSM", Updater: upd, SuiteManaged: true}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/update/apply", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: store.NewAdminSession()})
+	rec := httptest.NewRecorder()
+	s.apiUpdateApply(rec, req)
+
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	msg, _ := out["error"].(string)
+	if out["success"] != false || !strings.Contains(msg, "Releases") {
+		t.Fatalf("非套件版也必须拒绝进程内更新并指引去 Release，实际 %v", out)
+	}
+	st := s.updateStatus()
+	if st["enabled"] != false || st["repo"] != "kosje/agnes-hub-go-DSM" {
+		t.Fatalf("更新状态应为不可应用、指向本仓库，实际 %v", st)
 	}
 }

@@ -55,12 +55,12 @@ var imageKind = mediaKind{
 	maxBytes: 6 << 20,
 	timeout:  30 * time.Second,
 	extByMIME: map[string]string{
-		"image/png":     ".png",
-		"image/jpeg":    ".jpg",
-		"image/webp":    ".webp",
-		"image/gif":     ".gif",
-		"image/bmp":     ".bmp",
-		"image/svg+xml": ".svg",
+		"image/png":  ".png",
+		"image/jpeg": ".jpg",
+		"image/webp": ".webp",
+		"image/gif":  ".gif",
+		"image/bmp":  ".bmp",
+		// 刻意不收 SVG：SVG 能内嵌脚本，同源内联打开即等于在控制台源上执行上游给的代码。
 	},
 }
 
@@ -382,8 +382,9 @@ func publicBaseURL(r *http.Request, settings config.Settings) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if p := firstHeaderValue(r.Header.Get("X-Forwarded-Proto")); p != "" {
-		scheme = strings.ToLower(p)
+	// 只认 http/https：这个值会被拼进返回给页面与客户端的地址，还会落盘到任务记录里。
+	if p := strings.ToLower(firstHeaderValue(r.Header.Get("X-Forwarded-Proto"))); p == "http" || p == "https" {
+		scheme = p
 	}
 	return scheme + "://" + host
 }
@@ -408,7 +409,7 @@ func mediaBaseSource(r *http.Request, settings config.Settings) string {
 //     网关推断出来会少一段端口 —— 这时必须显式填「对外访问地址」。
 func (s *Server) apiMediaBase(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
@@ -635,6 +636,10 @@ func (s *Server) handleChatMedia(k mediaKind) http.HandlerFunc {
 		// 内容寻址 → 地址与内容一一对应，可以放心长缓存。
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Content-Type", k.mimeForExt(filepath.Ext(name)))
+		// 媒体文件来自上游，按不可信内容对待：禁止嗅探成 HTML，即使被当页面打开也
+		// 放进无脚本的沙箱源，碰不到控制台的 cookie 与接口。
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox")
 		// ?download=1 让浏览器直接存盘而不是内联打开 —— 客户端回复里给出的
 		// 「下载地址」就带这个参数。图片本身仍用不带参数的地址内联渲染，
 		// 两者读的是同一个文件，只是响应头不同。

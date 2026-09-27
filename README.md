@@ -11,7 +11,7 @@ Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 - 纯 Go 标准库实现，**零第三方依赖**（规避代理被墙与供应链风险）
 - 单文件可执行程序，无运行时依赖，可直接交叉编译到 Linux NAS
 - 跨平台运行期数据：全 JSON 文件，免 SSH 即可备份 / 迁移
-- **内置自更新**：定时向 GitHub Releases 查新版本，控制台一键更新（见第 7.5 节）
+- **版本检查**：定时向本仓库 GitHub Releases 查新版本并在控制台提示（只查不装，见第 7.5 节）
 
 ### 直接下载
 
@@ -45,8 +45,12 @@ Go 编译 → 以前台方式启动服务。**关闭窗口即停止服务**，�
 > 切换，客户端配置不用改）。若该端口已被占用，bat 会打印出占用记录并给出两条
 > 处理办法，而不是抛出一句难懂的系统英文错误。
 
-首次启动后打开控制台 <http://127.0.0.1:4142/console>，使用安装时设置的管理员密码登录
-（飞牛安装向导中可填管理员密码；本地首次运行会生成一个初始密码，登录后请**立即修改**）。
+首次启动后打开控制台 <http://127.0.0.1:4142/console> 登录：群晖用安装向导里设置的管理员密码；
+Windows 首次运行的初始密码是 `admin123`，登录后**必须先改密**，改之前其它管理功能一律不可用。
+
+> **网页登录与安全**：会话是服务端随机令牌（7 天过期，退出或改密立即失效），连续输错
+> 5 次锁定 15 分钟，写操作校验同源。`/chat` 页默认只能用管理员密码登录；在「设置 →
+> Chat 访问密码」设一个密码后，可以把它交给只需要对话 / 生图 / 生视频的人，他们进不了控制台。
 然后在「账号池」里添加你的 Agnes 账号：
 
 | 字段 | 说明 |
@@ -297,62 +301,33 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agn
 | `-host` | `AGNES_HUB_HOST` | `127.0.0.1` | `0.0.0.0` 表示允许局域网访问 |
 | `-port` | `AGNES_HUB_PORT` | `4142` | 监听端口 |
 | `-data` | `AGNES_HUB_DATA` | 可执行文件旁的 `data` | 数据目录 |
-| `-no-selfupdate` | `AGNES_HUB_NO_SELFUPDATE` | 关闭 | 禁用内置自更新。由套件中心 / 系统包管理器负责升级时必须打开（群晖 SPK 启动时自动带上） |
+| `-no-selfupdate` | `AGNES_HUB_NO_SELFUPDATE` | 关闭 | 标记由套件中心负责升级，控制台据此给出升级指引（群晖 SPK 启动时自动带上）。进程内自更新在所有平台上都已关闭 |
 | `-version` | — | — | 打印版本后退出 |
 
 ---
 
-## 7.5 自更新
+## 7.5 版本检查与升级
 
-程序内置自更新，会定时向本仓库的 GitHub Releases 查询新版本，
-控制台「系统」Tab 也能手动检查并一键更新。
+程序会定时（12 小时）向本仓库的 GitHub Releases 查询最新版本，控制台「系统」Tab
+显示「当前版本 / 最新版本 / 发布时间」，也可以手动检查。
+
+**进程内自更新（下载新二进制替换自身）在所有平台上都已关闭**，只查不装：
+
+- **群晖**：请走套件中心升级（加了第 11 节的套件源即可自动提示）。套件 INFO 里登记了
+  `package.tgz` 的 checksum，进程内替换会让实际内容与已安装版本对不上。
+- **Windows**：到 [Releases](https://github.com/kosje/agnes-hub-go-DSM/releases) 下载新版后，
+  停掉程序、替换 `agnes-hub-go.exe`、再启动；`data` 目录保持不动即可保留全部配置。
+  旧的一键更新会从正要被覆盖的 exe 本身启动替换助手，运行中的映像被自己锁住，
+  替换必然失败而服务已经退出；且旧配置指向第三方仓库、下载后不校验摘要，因此整体移除。
 
 ```text
 GET  /api/update/status   # 当前版本 + 最近一次检查结果（不联网）
 GET  /api/update/check    # 立刻查一次 GitHub Releases
-POST /api/update/apply    # 下载并替换二进制（需管理员会话）
+POST /api/update/apply    # 已停用，恒返回 success=false 与升级指引
 ```
 
-更新流程：**查版本 → 下载匹配本平台/架构的资产 → 尺寸与魔数校验 → 替换 → 重启**。
-
-### 为什么必须是公开仓库
-
-自更新是**匿名**调用 `api.github.com/repos/<repo>/releases/latest` 的，不带任何 token
-（分发出去的二进制里塞 token 等于把仓库读取权限一起发出去）。仓库为 private 时该端点
-返回 404，自更新会静默失效 —— 所以本仓库保持 public。
-
-### 替换正在运行的二进制
-
-这是整个功能里唯一有平台差异的地方：
-
-| 平台 | 做法 | 生效时机 |
-| --- | --- | --- |
-| Linux / macOS | 就地 `rename`。内核持有旧 inode，运行中的进程不受影响 | 下次启动 |
-| Windows | 运行中的 exe 被内核锁定，**无法就地替换**。派生一个「助手」进程：等旧进程退出 → 换文件 → 用新控制台窗口把新版本拉起来 | 自动，无需人工干预 |
-
-Windows 的助手不是批处理，而是**用同一个 exe 加内部参数重新拉起自己**
-（`--agnes-hub-swap-helper`）。这么做有两个原因：
-
-1. 批处理在当前进程还活着的时候就执行，`del` / `move` 必然失败 —— 更新会**看起来成功但什么也没做**；
-2. 批处理是父进程的子进程，父进程一退就被一起带走，没人再执行替换；
-3. 顺带绕开中文路径下 `.bat` 必须存成 GBK、否则被 cmd 按字节切错位的经典坑 ——
-   助手参数走 argv，不存在代码页解析问题。
-
-原始启动参数（`-host` / `-port` / `-data`）会一并透传给重启后的新进程，
-否则更新完新版本会以默认端口起来，看起来就像「更新之后服务不见了」。
-
-> 以 Windows 服务方式运行时，重启由服务管理器负责，应设 `NoRelaunch: true`
-> 避免多起一个进程和 SCM 抢端口。
-
-### 校验
-
-- **尺寸**：小于 32 KB 或大于 50 MB 一律拒绝（挡住被截断的下载和错误页）；
-- **魔数**：按目标平台校验文件头（Windows `MZ`、Linux `ELF`、macOS `Mach-O`）——
-  SHA256 只在调用方事先知道期望值时才起作用，魔数校验才是挡住
-  「把一页 HTML 当成新版本换上、服务再也起不来」的那道闸；
-- **SHA256**：调用方通过 `SHA256Expected` 提供期望值时启用。
-
----
+查询是**匿名**调用 `api.github.com/repos/<repo>/releases/latest` 的，不带任何 token，
+所以本仓库需保持 public，否则版本检查会返回 404。
 
 ## 8. 运行期数据
 
@@ -477,11 +452,13 @@ python tools/build_spk.py
 python tools/build_catalog.py
 ```
 
-`build_spk.py` 默认只出 x86_64 —— 本项目只分发群晖 x86_64 机型。
-`ARCH_TARGETS` 里保留了 armv8，需要时用 `--arch armv8` 或 `--arch all` 打开。
+本项目分发 x86_64 与 armv8 两个架构。两个脚本不带参数时都只处理 x86_64，
+发版时要加 `--arch all`：`python tools/build_spk.py --arch all`、
+`python tools/build_catalog.py --arch all`。
 
-`build_catalog.py` 会把 SPK 复制一份到 `docs/`，catalog 的 `link` 指向这份副本
-（Pages 直出、无跳转）。Release 上仍保留一份作为镜像；想让 `link` 指回 Release
+`build_catalog.py` 每个架构只取**版本号最大**的那个 SPK（按数值比较，不是文件名），
+复制到 `docs/` 并删掉 `docs/` 里同架构的旧包（`--keep-old` 可保留）；catalog 的
+`link` 指向这份副本（Pages 直出、无跳转）。历史版本以 GitHub Release 为准。Release 上仍保留一份作为镜像；想让 `link` 指回 Release
 用 `--link-from-release`，但不推荐，原因见「直接下载」一节。
 
 构建是**可复现**的：同源码同版本号连续构建两次，SPK 的 md5 完全一致
@@ -538,9 +515,8 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 
 **为什么地址里没有架构信息**：群晖 catalog 的条目里没有架构字段 —— 架构过滤是服务端
 按请求的 `arch` 参数做的（见 SynoCommunity/spkrepo 的 `views/nas.py`）。GitHub Pages
-是静态托管，没法按参数返回不同内容，所以一个架构一份 catalog。本项目只分发 x86_64，
-因此只有 `catalog.json` 一份。若以后要加 armv8，用 `build_catalog.py --arch all` 会
-额外产出 `catalog-armv8.json`，两个源地址分别添加即可。
+是静态托管，没法按参数返回不同内容，所以一个架构一份 catalog：x86_64 用 `catalog.json`，armv8 用 `catalog-armv8.json`，
+按机型添加对应的源地址。
 
 > **发新版时三处必须对齐**：SPK 内 `INFO` 的版本号、Release tag、catalog 的 `version`。
 > 套件中心就是拿 catalog 的 `version` 与已安装版本比对来判断有无更新的，
@@ -553,7 +529,8 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 2. 若提示「套件来源不受信任」：到 **套件中心 → 设置 → 常规 → 信任层级** 选「任何发行者」，
    然后重新安装。这是第三方未签名套件的统一门槛，与包本身无关。
 3. 安装完成后套件会自动启动。点套件中心的「打开」，或直接访问
-   `http://<NAS 地址>:4142/console`，初始密码 `admin123`，**请立即修改**。
+   `http://<NAS 地址>:4142/console`，用安装向导里设置的管理员密码登录。
+   （从旧版本升级上来、从未改过密码的，初始密码仍是 `admin123`，登录后必须先改密。）
 4. 客户端接入填 `http://<NAS 地址>:4142/v1`，模型名 `agnes-auto`。
 
 ### 端口与数据
@@ -607,5 +584,4 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 - **多账号提速有前提**：见第 10 节，串行单任务拿不到收益。
 - **未做自启 / 服务化**：Windows 端按约定只提供 bat 按需启动，关闭窗口即停止；
   群晖端交给套件中心托管（含开机自启与启停按钮）。
-- **群晖只支持 x86_64**：armv8 的构建目标在 `build_spk.py` 里保留着，但未纳入分发，
-  也没有实机验证过。armv7（alpine / alpine4k）等 32 位机型不支持。
+- **群晖支持 x86_64 与 armv8**：armv7（alpine / alpine4k）等 32 位机型不支持。

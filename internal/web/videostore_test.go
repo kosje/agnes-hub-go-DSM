@@ -281,6 +281,7 @@ func (h *harness) getJSONWeb(path string) (*http.Response, map[string]any) {
 	if err != nil {
 		h.t.Fatalf("构造请求失败：%v", err)
 	}
+	req.AddCookie(h.cookie())
 	req.Header.Set(surfaceHeader, "web")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -296,7 +297,9 @@ func (h *harness) getJSONWeb(path string) (*http.Response, map[string]any) {
 // getJSON 发 GET 并把响应解析成 map。
 func (h *harness) getJSON(path string) (*http.Response, map[string]any) {
 	h.t.Helper()
-	resp, err := http.Get(h.ts.URL + path)
+	req, _ := http.NewRequest(http.MethodGet, h.ts.URL+path, nil)
+	req.AddCookie(h.cookie())
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatalf("GET %s 失败：%v", path, err)
 	}
@@ -327,7 +330,7 @@ func TestRefetchVideoJobBackfillsLocalCopy(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost,
 		h.ts.URL+"/api/video-jobs/"+job.JobID+"/refetch", nil)
-	req.AddCookie(&http.Cookie{Name: cookieName, Value: h.store.SessionToken()})
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: h.session})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("补取请求失败：%v", err)

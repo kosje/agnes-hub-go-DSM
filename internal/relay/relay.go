@@ -8,7 +8,8 @@
 // 旧实现对生图 / 视频提交这类非幂等请求也做「退避后重试」，一旦上游其实已经
 // 受理（5xx 发生在受理之后），就会重复扣费、重复建任务 —— 这种错误用户看不见，
 // 只会在账单和任务列表里发现。现在的规则是：
-//   - 429：上游是「在受理前拒绝」，重试安全，照常重试并换账号；
+//   - 429 / 402 / 401 / 403：上游是「在受理前拒绝」，重试安全，换账号重试
+//     （402 额度耗尽的账号冷却一段时间，401/403 熔断待复活）；
 //   - 408/5xx：仅当调用方声明幂等（GET 轮询，或显式允许）才重试，否则立即返回。
 package relay
 
@@ -257,9 +258,9 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 			return result, nil
 		}
 
-		// 非幂等请求在「非 429」的失败上必须立即返回：429 是受理前拒绝（重试安全），
-		// 而 5xx 可能发生在上游已受理之后，重试会造成重复副作用。
-		if !opts.Idempotent && result.Status != http.StatusTooManyRequests {
+		// 非幂等请求只在「受理前拒绝」（429 限流 / 402 额度 / 401·403 鉴权）上换号重试，
+		// 其余失败必须立即返回：5xx 可能发生在上游已受理之后，重试会造成重复副作用。
+		if !opts.Idempotent && !RefusedBeforeAccept[result.Status] {
 			h.Metrics.WaitMS.Add(result.WaitMS)
 			return result, nil
 		}
@@ -285,13 +286,14 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	url := UpstreamURL(account, opts.Path)
 
-	// P0: 请求超时保护。为本次请求创建带超时的子 context，防止上游 hang 住耗尽连接池。
+	// 请求超时只管「发出请求 → 收到响应头」这一段，防止上游 hang 住耗尽连接池。
+	//
+	// 不能用 context.WithTimeout 包住整个请求：context 的截止时间会一直作用到读完
+	// 响应体，于是超过 30 s 的流式回答会被拦腰截断（客户端只看到半截、没有 [DONE]），
+	// 慢一点的非流式回答被当成上游失败，再被重试到别的账号上重复计费。
+	// 收到响应头之后，正文的生命周期交给调用方的 ctx（客户端断开即取消）。
 	s := h.Settings()
-	timeoutMS := s.RequestTimeoutMS
-	if timeoutMS <= 0 {
-		timeoutMS = 30000 // 默认 30s
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	reqCtx, cancel := context.WithCancel(ctx)
 
 	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
 	if err != nil {
@@ -311,7 +313,27 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		return nil, false, ctx.Err()
 	}
 
+	// 计时从拿到并发名额之后开始：排队等名额的时间不该吃掉上游的超时预算。
+	// RequestTimeoutMS<=0 表示不限时（与配置项注释一致）。
+	var headerTimer *time.Timer
+	if s.RequestTimeoutMS > 0 {
+		headerTimer = time.AfterFunc(time.Duration(s.RequestTimeoutMS)*time.Millisecond, cancel)
+	}
 	resp, err := client.Do(req)
+	if headerTimer != nil && !headerTimer.Stop() {
+		// 计时器已经触发：reqCtx 已被取消，即使 Do 恰好成功，正文也读不了了。
+		if err == nil {
+			resp.Body.Close()
+		}
+		err = fmt.Errorf("上游 %d ms 内未返回响应", s.RequestTimeoutMS)
+	}
+	if err != nil && ctx.Err() != nil {
+		// 客户端已断开：不是上游的错，不记账号错误、不换号重试（旧实现会让后续
+		// 每次重试都在别的账号上白白占一个限流名额，并记一次假错误）。
+		<-sem
+		cancel()
+		return nil, false, ctx.Err()
+	}
 	if err != nil {
 		<-sem
 		cancel()
@@ -328,17 +350,17 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	status := resp.StatusCode
 
 	if status == 402 {
-		// 402 Payment Required：额度耗尽，不熔断（等待复活即可），但记录错误不重试
+		// 402 Payment Required：额度耗尽。冷却该账号并换号重试 —— 402 是受理前拒绝，
+		// 换号不会造成重复副作用。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		<-sem
 		cancel()
-		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
-		h.Metrics.RequestsError.Add(1)
+		h.OnQuotaExhausted(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
 		return &Result{
 			Status: status, Header: SanitizeHeaders(resp.Header), Body: raw,
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
-		}, false, nil // 402 不重试
+		}, true, nil
 	}
 
 	if AuthFailStatus[status] { // 401 / 403
@@ -407,6 +429,14 @@ func (s *releaseOnClose) Close() error {
 		s.release()
 	}
 	return err
+}
+
+// RefusedBeforeAccept 是上游「没受理就拒绝」的状态码：换号重试不会重复执行请求。
+var RefusedBeforeAccept = map[int]bool{
+	http.StatusUnauthorized:    true,
+	http.StatusPaymentRequired: true,
+	http.StatusForbidden:       true,
+	http.StatusTooManyRequests: true,
 }
 
 func sleepBackoff(ctx context.Context, s config.Settings, attempt int) {

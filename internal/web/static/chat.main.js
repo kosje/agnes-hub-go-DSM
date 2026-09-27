@@ -20,6 +20,8 @@ async function api(p, o = {}) {
   if (!r.ok) { const m = (d && d.error && d.error.message) || ("HTTP " + r.status); throw new Error(m); }
   return d;
 }
+// 图片地址来自上游，只放行 http(s)、站内路径与 data:image —— 挡掉 javascript: 之类的伪协议。
+function safeImgURL(u) { return typeof u === "string" && /^(https?:\/\/|\/(?!\/)|data:image\/)/i.test(u); }
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 function toast(m, k) { const e = document.getElementById("toast"); if (!e) return; e.className = "banner " + (k || "good"); e.textContent = m; e.classList.remove("hide"); clearTimeout(e._t); e._t = setTimeout(() => e.classList.add("hide"), 4000); }
 function fmtDate(ts) { if (!ts) return ""; const d = new Date(ts * 1000); return d.toLocaleDateString("zh-CN") + " " + d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }
@@ -28,117 +30,58 @@ function timeAgo(ts) { const s = Math.floor(Date.now() / 1000) - ts; if (s < 60)
 const state = { tab: "chat", session: null, keys: [], accounts: [], activeKey: null, chatLogs: [], curHistoryId: null, messages: [], model: "agnes-3.0-flash", sending: false, imJobId: null };
 
 /* ==================== LOGIN ==================== */
-async function checkSession(){
-  try{
-    const s=await api("/api/session");
-    if(s&&s.logged_in){
-      state.session=s;
-      renderApp();
-      return;
-    }
-  }catch(e){}
-  renderLogin();
-}
-
+// 规则（与服务端一致）：
+//   - 管理员会话可以用 Chat 页；
+//   - 控制台设置了「Chat 访问密码」时，也可凭该密码登录（只能用 Chat，进不了控制台）；
+//   - 没设 Chat 访问密码时，只能用管理员密码登录。
 async function checkChatAuth(){
-  try{
-    const s=await api("/api/chat/session");
-    if(s.authenticated){
-      // 已验证或无需密码，检查管理员会话
-      try{
-        const admin=await api("/api/session");
-        if(admin.logged_in){
-          state.session=admin;
-          renderApp();
-          return;
-        }
-      }catch(e){}
-      // 无管理员会话，显示管理员登录
-      state.chatAuth=true;
-      renderAdminLogin();
-      return;
-    }
-    if(s.requires_password){
-      // 需要 chat 密码
-      state.requiresChatPassword=true;
-      renderChatPasswordLogin();
-      return;
-    }
-  }catch(e){}
-  renderLogin();
+  let s=null;
+  try{ s=await api("/api/chat/session"); }catch(e){}
+  if(s&&s.authenticated){ state.admin=!!s.admin; renderApp(); return; }
+  if(s&&s.must_change_password){ renderMustChange(); return; }
+  renderLoginForm(!!(s&&s.requires_password));
 }
 
-function renderChatPasswordLogin(){
+function renderMustChange(){
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
       <h1>Agnes AI 助手</h1>
-      <p class="muted">AI 对话 · 生图 · 生视频</p>
-      <div id="toast" class="hide"></div>
-      <label>Chat 访问密码</label>
-      <input id="chatPw" type="password" placeholder="请输入 Chat 访问密码">
-      <div style="margin-top:12px"><button class="primary" id="btnChatLogin">登录</button></div>
-      <div class="hint">请输入管理员设置的 Chat 访问密码</div>
+      <p class="muted">管理员仍在使用初始密码</p>
+      <div class="hint">为安全起见，请先到 <a href="/console">控制台</a> 修改初始密码，再回到本页。</div>
     </div>
   </div>`;
-  document.getElementById("btnChatLogin").onclick=async()=>{
-    try{
-      await api("/api/chat/login",{method:"POST",body:JSON.stringify({password:document.getElementById("chatPw").value})});
-      state.chatAuth=true;
-      renderApp();
-    }catch(e){toast(e.message,"bad");}
-  };
-  document.getElementById("chatPw").onkeydown=e=>{if(e.key==="Enter")document.getElementById("btnChatLogin").click();};
-  document.getElementById("chatPw").focus();
 }
 
-function renderAdminLogin(){
+// chatMode=true：用 Chat 访问密码登录；false：用管理员密码登录。设置了 Chat 密码时两种都能切换。
+function renderLoginForm(hasChatPassword, chatMode){
+  if(chatMode===undefined) chatMode=hasChatPassword;
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
       <h1>Agnes AI 助手</h1>
       <p class="muted">AI 对话 · 生图 · 生视频</p>
       <div id="toast" class="hide"></div>
-      <label>管理员密码</label>
-      <input id="adminPw" type="password" placeholder="请输入管理员密码">
-      <div style="margin-top:12px"><button class="primary" id="btnAdminLogin">登录</button></div>
-      <div class="hint">请输入安装时设置的管理员密码</div>
-    </div>
-  </div>`;
-  document.getElementById("btnAdminLogin").onclick=async()=>{
-    try{
-      await api("/api/login",{method:"POST",body:JSON.stringify({password:document.getElementById("adminPw").value})});
-      const admin=await api("/api/session");
-      state.session=admin;
-      renderApp();
-    }catch(e){toast(e.message,"bad");}
-  };
-  document.getElementById("adminPw").onkeydown=e=>{if(e.key==="Enter")document.getElementById("btnAdminLogin").click();};
-  document.getElementById("adminPw").focus();
-}
-
-function renderLogin(){
-  document.getElementById("app").innerHTML=`
-  <div class="login">
-    <div class="card">
-      <h1>Agnes AI 助手</h1>
-      <p class="muted">AI 对话 · 生图 · 生视频</p>
-      <div id="toast" class="hide"></div>
-      <label>访问密码</label>
-      <input id="pw" type="password" placeholder="请输入访问密码">
+      <label>${chatMode?"Chat 访问密码":"管理员密码"}</label>
+      <input id="loginPw" type="password" autocomplete="current-password" placeholder="${chatMode?"请输入 Chat 访问密码":"请输入管理员密码"}">
       <div style="margin-top:12px"><button class="primary" id="btnLogin">登录</button></div>
-      <div class="hint">访问密码由控制台设置；未设置则直接进入</div>
+      <div class="hint">${hasChatPassword
+        ? `<a href="#" id="lnkSwitch">${chatMode?"改用管理员密码登录":"改用 Chat 访问密码登录"}</a>`
+        : "未设置 Chat 访问密码，请使用管理员密码登录"}</div>
     </div>
   </div>`;
-  document.getElementById("btnLogin").onclick=async()=>{
+  const go=async()=>{
+    const pw=document.getElementById("loginPw").value;
     try{
-      await api("/api/login",{method:"POST",body:JSON.stringify({password:document.getElementById("pw").value})});
-      state.session={logged_in:true};
-      renderApp();
+      await api(chatMode?"/api/chat/login":"/api/login",{method:"POST",body:JSON.stringify({password:pw})});
+      checkChatAuth();
     }catch(e){toast(e.message,"bad");}
   };
-  document.getElementById("pw").onkeydown=e=>{if(e.key==="Enter")document.getElementById("btnLogin").click();};
-  document.getElementById("pw").focus();
+  document.getElementById("btnLogin").onclick=go;
+  document.getElementById("loginPw").onkeydown=e=>{if(e.key==="Enter")go();};
+  const sw=document.getElementById("lnkSwitch");
+  if(sw) sw.onclick=e=>{e.preventDefault();renderLoginForm(hasChatPassword,!chatMode);};
+  document.getElementById("loginPw").focus();
 }
 
 /* ==================== APP SHELL ==================== */
@@ -187,7 +130,8 @@ function renderApp(){
   <div id="toast" class="hide"></div>`;
 
   // Load accounts (auto-pool, no manual key selection)
-  Promise.all([api("/api/keys"), api("/api/accounts")]).then(([keysRes, accountsRes])=>{
+  if(!state.admin){ document.getElementById("topbarInfo").textContent=""; }
+  else Promise.all([api("/api/keys"), api("/api/accounts")]).then(([keysRes, accountsRes])=>{
     state.keys=(keysRes.keys||[]).filter(k=>k.enabled);
     state.accounts=accountsRes.accounts||[];
     const info=document.getElementById("topbarInfo");
@@ -430,7 +374,7 @@ async function generateImage(){
       const url=item.url||item.b64_json;
       const div=document.createElement("div");
       if(item.url){
-        div.innerHTML=`<img src="${esc(item.url)}" alt="${esc(prompt)}" class="gen-image" onclick="window.open(this.src)">`;
+        div.innerHTML=safeImgURL(item.url)?`<img src="${esc(item.url)}" alt="${esc(prompt)}" class="gen-image" onclick="window.open(this.src,'_blank','noopener')">`:`<div class="muted">上游返回了不支持的图片地址</div>`;
       }else if(item.b64_json){
         div.innerHTML=`<img src="data:image/png;base64,${esc(item.b64_json)}" alt="${esc(prompt)}" class="gen-image">`;
       }
@@ -553,7 +497,7 @@ function renderHistory(){
   const imgList=document.getElementById("imgHistory");
   const vidList=document.getElementById("vidHistory");
   if(imgList&&state.imgJobs){
-    const items=(state.imgJobs.slice(-20).reverse()).map(j=>`
+    const items=state.imgJobs.slice(0,20).map(j=>`
       <div class="history-item" onclick="showImgJob('${esc(j.job_id)}')">
         <button class="del" title="删除" onclick="event.stopPropagation();deleteImgJob('${esc(j.job_id)}')">×</button>
         <div class="muted">${timeAgo(j.created_at)}</div>
@@ -563,11 +507,11 @@ function renderHistory(){
     imgList.innerHTML=`<div class="hist-head"><span>图片记录 (${state.imgJobs.length})</span><button class="sm" onclick="clearImgJobs()">清空</button></div>`+items;
   }
   if(vidList&&state.vidJobs){
-    const items=(state.vidJobs.slice(-20).reverse()).map(j=>`
+    const items=state.vidJobs.slice(0,20).map(j=>`
       <div class="history-item">
         <button class="del" title="删除" onclick="event.stopPropagation();deleteVidJob('${esc(j.job_id)}')">×</button>
         <div class="muted">${timeAgo(j.created_at)}</div>
-        <div>${esc((j.prompt||"").substring(0,40))}</div>
+        <div>${esc((j.model||"").substring(0,40))}</div>
         <div class="tag ${j.status==='completed'?'ok':j.status==='failed'?'warn':''}">${esc(j.status)}</div>
       </div>`).join("");
     vidList.innerHTML=`<div class="hist-head"><span>视频记录 (${state.vidJobs.length})</span><button class="sm" onclick="clearVidJobs()">清空</button></div>`+items;
@@ -615,13 +559,14 @@ async function clearVidJobs(){
 
 async function showImgJob(jobId){
   try{
-    const resp=await api(`/api/image-jobs/${jobId}`);
+    const resp=(state.imgJobs||[]).find(j=>j.job_id===jobId);
+    if(!resp) throw new Error("记录不存在，请刷新");
     const view=document.getElementById("imageView");
     view.innerHTML=`
       <button class="sm" onclick="switchTab('image')">← 返回</button>
       <h3>图片任务: ${esc(jobId)}</h3>
       <p class="muted">模型: ${esc(resp.model||"?")} · 状态: ${esc(resp.status||"?")}</p>
-      <img src="${esc(resp.url||"")}" style="max-width:100%;border-radius:8px;margin-top:10px">`;
+      <img src="${safeImgURL(resp.url)?esc(resp.url):""}" style="max-width:100%;border-radius:8px;margin-top:10px">`;
   }catch(e){toast(e.message,"bad");}
 }
 

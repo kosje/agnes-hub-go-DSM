@@ -54,9 +54,6 @@ var logoURL = "/logo.png?v=" + logoFingerprint
 // logoURL。放在服务端替换而不是写死在 JS 里，是为了换图标时不必记得手改版本号。
 var chatMainJSServed = []byte(strings.ReplaceAll(string(chatMainJS), "/logo.png", logoURL))
 
-const cookieName = "agnes_hub_session"
-const chatPasswordCookie = "agnes_chat_password"
-
 func (s *Server) consoleRoutes() {
 	m := s.mux
 	m.HandleFunc("GET /console", func(w http.ResponseWriter, r *http.Request) {
@@ -157,141 +154,13 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("GET "+videoKind.route+"{name}", s.handleChatMedia(videoKind))
 }
 
-// ---------------------------------------------------------------------------
-// 会话
-// ---------------------------------------------------------------------------
-
-func (s *Server) authed(r *http.Request) bool {
-	c, err := r.Cookie(cookieName)
-	if err != nil || c.Value == "" {
-		return false
-	}
-	return c.Value == s.Store.SessionToken()
-}
-
-// chatAuthed 检查 chat 页面密码是否验证通过（cookie 或无密码设置）。
-func (s *Server) chatAuthed(r *http.Request) bool {
-	// 先检查是否有 chat 密码 cookie
-	c, err := r.Cookie(chatPasswordCookie)
-	if err == nil && c.Value != "" {
-		return true
-	}
-	// 未设置密码则允许访问
-	settings := s.Store.SettingsSnapshot()
-	return settings.ChatPasswordHash == ""
-}
-
-// authedOrChat 同时接受管理员会话或 Chat 密码会话（图片/视频库接口在两种入口下都要可用）。
-func (s *Server) authedOrChat(r *http.Request) bool {
-	return s.authed(r) || s.chatAuthed(r)
-}
-
-func (s *Server) deny(w http.ResponseWriter) {
-	writeJSON(w, 401, map[string]any{"error": map[string]any{"message": "未登录或会话已失效"}}, nil)
-}
-
-func (s *Server) apiLogin(w http.ResponseWriter, r *http.Request) {
-	body, _, e := readBody(r)
-	if e != nil {
-		writeErr(w, e)
-		return
-	}
-	if !s.Store.VerifyPassword(asStr(body["password"])) {
-		writeJSON(w, 401, map[string]any{"error": map[string]any{"message": "管理员密码错误"}}, nil)
-		return
-	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: s.Store.SessionToken(),
-		Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 86400})
-	writeJSON(w, 200, map[string]any{"ok": true,
-		"must_change_password": s.Store.SettingsSnapshot().MustChangePassword}, nil)
-}
-
-func (s *Server) apiLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1})
-	writeJSON(w, 200, map[string]any{"ok": true}, nil)
-}
-
-func (s *Server) apiSession(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{
-		"logged_in":            s.authed(r),
-		"must_change_password": s.Store.SettingsSnapshot().MustChangePassword,
-	}, nil)
-}
-
-func (s *Server) apiPassword(w http.ResponseWriter, r *http.Request) {
-	if !s.authed(r) {
-		s.deny(w)
-		return
-	}
-	body, _, e := readBody(r)
-	if e != nil {
-		writeErr(w, e)
-		return
-	}
-	pw := asStr(body["new_password"])
-	if len([]rune(pw)) < 6 {
-		writeErr(w, badRequest("新密码至少 6 位"))
-		return
-	}
-	if err := s.Store.SetPassword(pw); err != nil {
-		writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
-		return
-	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: s.Store.SessionToken(),
-		Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 86400})
-	writeJSON(w, 200, map[string]any{"ok": true}, nil)
-}
-
-// ---------------------------------------------------------------------------
-// Chat 页面密码
-// ---------------------------------------------------------------------------
-
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	// 检查 chat 密码验证
-	if !s.chatAuthed(r) {
-		// 需要密码，重定向到带错误参数的登录页
-		http.Redirect(w, r, "/chat?need_password=1", http.StatusSeeOther)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Length", fmt.Sprint(len(chatHTML)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(chatHTML)
-}
-
-func (s *Server) apiChatLogin(w http.ResponseWriter, r *http.Request) {
-	body, _, e := readBody(r)
-	if e != nil {
-		writeErr(w, e)
-		return
-	}
-	pw := asStr(body["password"])
-	if !s.Store.VerifyChatPassword(pw) {
-		writeErr(w, &apiError{Status: 401, Type: "authentication_error", Message: "密码错误"})
-		return
-	}
-	// 设置 chat 密码 cookie（7天过期）
-	http.SetCookie(w, &http.Cookie{Name: chatPasswordCookie, Value: "authenticated",
-		Path: "/chat", HttpOnly: false, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 86400})
-	writeJSON(w, 200, map[string]any{"ok": true}, nil)
-}
-
-func (s *Server) apiChatSession(w http.ResponseWriter, r *http.Request) {
-	hasPassword := s.Store.SettingsSnapshot().ChatPasswordHash != ""
-	isAuthed := s.chatAuthed(r)
-	writeJSON(w, 200, map[string]any{
-		"requires_password": hasPassword,
-		"authenticated":     isAuthed,
-	}, nil)
-}
-
 // apiChatModels 返回聊天页（对话/生图/生视频）可用的模型列表。
 //
 // 除了内置的 agnes 模型与用户别名，还把每个已启用账号在其清单里声明的模型合并进来，
 // 这样 chat 下拉框才能列出 AMD / OpenRouter 等非 agnes 渠道的真实模型，便于直接测试连通性。
 func (s *Server) apiChatModels(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
@@ -345,7 +214,7 @@ func mask(key string) string {
 
 func (s *Server) apiListAccounts(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
@@ -403,7 +272,7 @@ func baseRPMOf(a *config.Account, poolClass string) float64 {
 
 func (s *Server) apiCreateAccount(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -469,7 +338,7 @@ func manifestFromAny(raw map[string]any) *config.ModelManifest {
 
 func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	id := r.PathValue("id")
@@ -547,7 +416,7 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiResetFactors(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	id := r.PathValue("id")
@@ -562,7 +431,7 @@ func (s *Server) apiResetFactors(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	ok := s.Store.DeleteAccount(r.PathValue("id"))
@@ -573,7 +442,7 @@ func (s *Server) apiDeleteAccount(w http.ResponseWriter, r *http.Request) {
 // apiTestAccount 连通性 + 模型权限探测。
 func (s *Server) apiTestAccount(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	account := s.Store.AccountByID(r.PathValue("id"))
@@ -703,7 +572,7 @@ func hintForStatus(status int) string {
 // 是不可接受的。导入会**跳过硬校验失败的整行**并逐行回报原因，而不是整体失败。
 func (s *Server) apiBulkImport(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -771,7 +640,7 @@ func (s *Server) apiBulkImport(w http.ResponseWriter, r *http.Request) {
 // apiBulkUpdate 按分组 / ID 列表批量改配置（启用、停用、清单、并发、RPM 覆盖）。
 func (s *Server) apiBulkUpdate(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -828,7 +697,7 @@ func (s *Server) apiBulkUpdate(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiListKeys(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"keys": s.Store.KeysSnapshot()}, nil)
@@ -836,7 +705,7 @@ func (s *Server) apiListKeys(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiCreateKey(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -851,7 +720,7 @@ func (s *Server) apiCreateKey(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiUpdateKey(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -890,7 +759,7 @@ func (s *Server) apiUpdateKey(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiDeleteKey(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": s.Store.DeleteKey(r.URL.Query().Get("key"))}, nil)
@@ -902,17 +771,18 @@ func (s *Server) apiDeleteKey(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiStats(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	snapshot := s.Hub.Snapshot()
-	snapshot["settings"] = s.Store.SettingsSnapshot()
+	// 旧版本这里下发完整设置（含口令散列与盐），配合可推导的会话令牌可直接伪造管理员 cookie。
+	snapshot["settings"] = s.redactedSettings()
 	writeJSON(w, 200, snapshot, nil)
 }
 
 func (s *Server) apiQueue(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"queue": s.Hub.QueueView()}, nil)
@@ -920,7 +790,7 @@ func (s *Server) apiQueue(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	limit := asInt(r.URL.Query().Get("limit"))
@@ -932,7 +802,7 @@ func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiBindings(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	rows := []map[string]any{}
@@ -948,7 +818,7 @@ func (s *Server) apiBindings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiClearBindings(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	s.Store.ClearBindings()
@@ -957,7 +827,7 @@ func (s *Server) apiClearBindings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"jobs": s.Store.JobsSnapshot()}, nil)
@@ -969,7 +839,7 @@ func (s *Server) apiVideoJobs(w http.ResponseWriter, r *http.Request) {
 // （「产出」列只能显示 —）。重新问一次上游就能拿到产出地址，落盘后写回记录。
 func (s *Server) apiRefetchVideoJob(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	id := strings.TrimSpace(r.PathValue("id"))
@@ -1012,7 +882,7 @@ func (s *Server) apiRefetchVideoJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiImageJobs(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"jobs": s.Store.ImageJobsSnapshot()}, nil)
@@ -1021,7 +891,7 @@ func (s *Server) apiImageJobs(w http.ResponseWriter, r *http.Request) {
 // apiDeleteImageJob 删除单条图片记录。
 func (s *Server) apiDeleteImageJob(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	id := r.PathValue("id")
@@ -1039,7 +909,7 @@ func (s *Server) apiDeleteImageJob(w http.ResponseWriter, r *http.Request) {
 // apiClearImageJobs 清空全部图片记录。
 func (s *Server) apiClearImageJobs(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	s.Store.ClearImageJobs()
@@ -1049,7 +919,7 @@ func (s *Server) apiClearImageJobs(w http.ResponseWriter, r *http.Request) {
 // apiDeleteVideoJob 删除单条视频记录。
 func (s *Server) apiDeleteVideoJob(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	id := r.PathValue("id")
@@ -1067,7 +937,7 @@ func (s *Server) apiDeleteVideoJob(w http.ResponseWriter, r *http.Request) {
 // apiClearVideoJobs 清空全部视频记录。
 func (s *Server) apiClearVideoJobs(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	s.Store.ClearVideoJobs()
@@ -1078,7 +948,7 @@ func (s *Server) apiClearVideoJobs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiChatLogs(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"logs": s.Store.ChatLogsSnapshot()}, nil)
@@ -1086,7 +956,7 @@ func (s *Server) apiChatLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiCreateChatLog(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	var body struct {
@@ -1121,7 +991,7 @@ func (s *Server) apiCreateChatLog(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiDeleteChatLog(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	id := r.PathValue("id")
@@ -1138,7 +1008,7 @@ func (s *Server) apiDeleteChatLog(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiClearChatLogs(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	s.Store.ClearChatLogs()
@@ -1160,20 +1030,19 @@ func randHex(n int) string {
 
 func (s *Server) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
-	settings := s.Store.SettingsSnapshot()
-	settings.AdminPasswordHash = ""
-	settings.AdminPasswordSalt = ""
-	settings.ChatPasswordHash = ""
-	settings.ChatPasswordSalt = ""
-	writeJSON(w, 200, settings, nil)
+	out := map[string]any{}
+	buf, _ := json.Marshal(s.redactedSettings())
+	_ = json.Unmarshal(buf, &out)
+	out["chat_password_set"] = s.Store.HasChatPassword()
+	writeJSON(w, 200, out, nil)
 }
 
 func (s *Server) apiSetSettings(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -1181,26 +1050,32 @@ func (s *Server) apiSetSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
+	// Chat 访问密码：设置用 chat_password，清除必须显式传 chat_password_clear=true ——
+	// 不能把「没填」当成「清除」，否则每次保存其它设置都会把密码冲掉。
+	chatPW, setChatPW := "", false
+	if pw, ok := body["chat_password"]; ok {
+		chatPW = strings.TrimSpace(asStr(pw))
+		if chatPW != "" {
+			if len([]rune(chatPW)) < 6 {
+				writeErr(w, badRequest("Chat 访问密码至少 6 位"))
+				return
+			}
+			setChatPW = true
+		}
+	}
+
 	err := s.Store.UpdateSettings(func(st *config.Settings) { applySettings(st, body) })
 	if err != nil {
 		writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
 		return
 	}
-
-	// 单独处理 chat_password（需要在锁外调用 Store 方法）
-	if pw, ok := body["chat_password"]; ok {
-		pwd := strings.TrimSpace(asStr(pw))
-		if len(pwd) >= 4 {
-			if err := s.Store.SetChatPassword(pwd); err != nil {
-				writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
-				return
-			}
-		} else if pwd == "" {
-			// 清空密码
-			if err := s.Store.SetChatPassword(""); err != nil {
-				writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
-				return
-			}
+	if setChatPW || truthy(body["chat_password_clear"]) {
+		if !setChatPW {
+			chatPW = ""
+		}
+		if err := s.Store.SetChatPassword(chatPW); err != nil {
+			writeErr(w, &apiError{Status: 500, Type: "internal_error", Message: err.Error()})
+			return
 		}
 	}
 
@@ -1320,24 +1195,45 @@ func applySettings(st *config.Settings, p map[string]any) {
 
 func (s *Server) apiExport(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
-	settings := s.Store.SettingsSnapshot()
-	settings.AdminPasswordHash = ""
-	settings.AdminPasswordSalt = ""
+	accounts := s.Store.AccountsSnapshot()
+	keys := s.Store.KeysSnapshot()
+	// ?redact=1：「不含密钥明文」的导出。快照是副本，就地打码不影响内存状态。
+	redact := truthy(r.URL.Query().Get("redact"))
+	if redact {
+		for _, a := range accounts {
+			a.APIKey = mask(a.APIKey)
+		}
+		for _, k := range keys {
+			k.Key = mask(k.Key)
+		}
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="agnes-hub-export.json"`)
 	writeJSON(w, 200, map[string]any{
 		"version":     2,
 		"exported_at": time.Now().Format("2006-01-02 15:04:05"),
-		"accounts":    s.Store.AccountsSnapshot(),
-		"keys":        s.Store.KeysSnapshot(),
-		"settings":    settings,
+		"redacted":    redact,
+		"accounts":    accounts,
+		"keys":        keys,
+		"settings":    s.redactedSettings(),
 	}, nil)
+}
+
+// redactedSettings 返回去掉全部口令散列与盐的设置快照，供任何要下发给浏览器的地方使用。
+func (s *Server) redactedSettings() config.Settings {
+	settings := s.Store.SettingsSnapshot()
+	settings.AdminPasswordHash = ""
+	settings.AdminPasswordSalt = ""
+	settings.ChatPasswordHash = ""
+	settings.ChatPasswordSalt = ""
+	return settings
 }
 
 func (s *Server) apiImport(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -1345,11 +1241,12 @@ func (s *Server) apiImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
-	mode := asStr(body["mode"])
-	if mode == "" {
-		mode = "replace"
+	// 只追加、不覆盖；同一 api_key 的账号已存在则跳过，重复导入不会产生重复账号。
+	existing := map[string]bool{}
+	for _, a := range s.Store.AccountsSnapshot() {
+		existing[a.APIKey] = true
 	}
-	added := 0
+	added, skipped := 0, 0
 	if raw, ok := body["accounts"].([]any); ok {
 		for _, item := range raw {
 			m, ok := item.(map[string]any)
@@ -1357,9 +1254,11 @@ func (s *Server) apiImport(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			apiKey := strings.TrimSpace(asStr(m["api_key"]))
-			if apiKey == "" || strings.Contains(apiKey, "...") {
+			if apiKey == "" || strings.Contains(apiKey, "...") || existing[apiKey] {
+				skipped++
 				continue
 			}
+			existing[apiKey] = true
 			acc := s.Store.AddAccount(asStr(m["name"]), apiKey, asStr(m["access_type"]),
 				asStr(m["base_url"]), nil)
 			s.Store.MutateAccount(acc.ID, func(a *config.Account) bool {
@@ -1383,7 +1282,7 @@ func (s *Server) apiImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.Hub.Reload()
-	writeJSON(w, 200, map[string]any{"ok": true, "accounts_imported": added}, nil)
+	writeJSON(w, 200, map[string]any{"ok": true, "accounts_imported": added, "accounts_skipped": skipped}, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,7 +1291,7 @@ func (s *Server) apiImport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiIntentPreview(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -1452,7 +1351,7 @@ func (s *Server) previewIntent(w http.ResponseWriter, body map[string]any) {
 // 用途：上游悄悄调限额后自动跟上，而不是等任务断了才发现。
 func (s *Server) apiProbe(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	body, _, e := readBody(r)
@@ -1594,7 +1493,7 @@ func probePayload(modality string, account *config.Account, settings config.Sett
 
 func (s *Server) apiRPMTable(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, map[string]any{
@@ -1735,6 +1634,8 @@ func (s *Server) updateStatus() map[string]any {
 		"enabled":         s.Updater != nil && !s.SuiteManaged,
 		"checkable":       s.Updater != nil,
 		"suite_managed":   s.SuiteManaged,
+		"package_managed": s.PackageManaged,
+		"update_hint":     s.manualUpdateHint(),
 		"repo":            repo,
 	}
 	if s.Updater == nil {
@@ -1749,7 +1650,7 @@ func (s *Server) updateStatus() map[string]any {
 // apiUpdateStatus 返回当前版本与最近一次检查结果（不主动联网）。
 func (s *Server) apiUpdateStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	writeJSON(w, 200, s.updateStatus(), nil)
@@ -1758,7 +1659,7 @@ func (s *Server) apiUpdateStatus(w http.ResponseWriter, r *http.Request) {
 // apiUpdateCheck 立即向 GitHub 查一次最新版本。
 func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	if s.Updater == nil {
@@ -1789,7 +1690,7 @@ func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 // Windows 上随后由助手进程完成替换并重启，类 Unix 上由调用方重启。
 func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
-		s.deny(w)
+		s.deny(w, r)
 		return
 	}
 	if s.SuiteManaged {
@@ -1797,7 +1698,7 @@ func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 		// 「实际内容」与「已安装版本」对不上，下次套件中心校验或升级必然冲突。
 		writeJSON(w, 200, map[string]any{
 			"success": false,
-			"error":   "本套件版由群晖套件中心统一升级，已关闭进程内自更新；请到「套件中心 → 社群」升级",
+			"error":   s.manualUpdateHint(),
 		}, nil)
 		return
 	}
@@ -1825,6 +1726,10 @@ func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 
 // handleChatProxy 代理文本对话请求到账号池，无需下游 API Key。
 func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w, r)
+		return
+	}
 	body, _, e := readBody(r)
 	if e != nil {
 		writeErr(w, e)
@@ -1955,9 +1860,9 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	select {
-		case out := <-ch:
-			s.finishChatStream(w, out.result, out.err, decision, opts)
-			return
+	case out := <-ch:
+		s.finishChatStream(w, out.result, out.err, decision, opts)
+		return
 	case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
 	}
 
@@ -1978,15 +1883,14 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 				writeSSEComment(w, flusher, "error: "+out.err.Error())
 				return
 			}
-			raw := out.result.ReadAll()
 			if out.result.Status >= 400 {
-				writeSSEComment(w, flusher, "error: HTTP "+strconv.Itoa(out.result.Status))
+				raw := out.result.ReadAll()
+				_ = json.NewEncoder(&flushSSE{w: w, f: flusher}).Encode(errorPayload(out.result.Status, raw))
 				return
 			}
-			// 转发上游流
-			_ = json.NewEncoder(&flushSSE{w: w, f: flusher}).Encode(decodeOrRaw(raw))
-			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, out.result.Stream)
-			out.result.Close()
+			// 上游回的就是 SSE 帧序列，原样逐块转发。
+			// （旧实现先 ReadAll 把 Stream 置空，再对 nil 做 io.Copy，直接 panic。）
+			copyResultStream(w, flusher, out.result)
 			return
 		case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
 			writeSSEComment(w, flusher, "agnes-hub chat proxy keepalive")
@@ -2025,7 +1929,6 @@ func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, e
 		writeErr(w, relayError(err))
 		return
 	}
-	raw := result.ReadAll()
 	headers := passthroughHeaders(result.Header)
 	for k, v := range decision.Headers() {
 		headers[k] = v
@@ -2038,20 +1941,40 @@ func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, e
 	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 	if result.Status >= 400 {
-		writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
+		writeJSON(w, result.Status, errorPayload(result.Status, result.ReadAll()), headers)
 		return
 	}
-	// stream=true 时，上游返回的 raw 本身就是 SSE 帧序列；直接原样写回并声明 event-stream。
+	// 上游回的是 SSE 帧序列：边收边转发，而不是等整段回答生成完再一次性写出。
 	headers["Content-Type"] = "text/event-stream"
+	headers["Cache-Control"] = "no-cache"
+	headers["X-Accel-Buffering"] = "no"
 	for k, v := range headers {
 		w.Header().Set(k, v)
 	}
 	w.WriteHeader(result.Status)
-	_, _ = w.Write(raw)
+	flusher, _ := w.(http.Flusher)
+	copyResultStream(w, flusher, result)
+}
+
+// copyResultStream 把上游结果写给客户端：仍在流式输出就逐块转发，否则写出已缓冲的正文。
+func copyResultStream(w http.ResponseWriter, flusher http.Flusher, result *relay.Result) {
+	defer result.Close()
+	if result.Stream != nil {
+		_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
+		return
+	}
+	_, _ = w.Write(result.Body)
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 // handleChatMediaProxy 代理图片/视频请求到账号池，无需下游 API Key。
 func (s *Server) handleChatMediaProxy(w http.ResponseWriter, r *http.Request) {
+	if !s.authedOrChat(r) {
+		s.deny(w, r)
+		return
+	}
 	body, _, e := readBody(r)
 	if e != nil {
 		writeErr(w, e)
@@ -2290,7 +2213,11 @@ func (s *Server) recordVideoJob(result *relay.Result, raw []byte) *config.VideoJ
 // 于是视频即使提交成功也永远等不到结果。
 func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 	if !s.authedOrChat(r) {
-		s.deny(w)
+		s.deny(w, r)
+		return
+	}
+	if !s.authedOrChat(r) {
+		s.deny(w, r)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()

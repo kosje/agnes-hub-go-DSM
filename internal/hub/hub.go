@@ -743,13 +743,24 @@ func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) 
 
 	started := time.Now()
 	if penalty := h.PenaltyRemaining(a.ID); penalty > 0 {
+		// 冷却比排队上限还长就别干等：额度耗尽的冷却可达半小时，旧实现会让请求
+		// 一直挂着；而且睡醒后剩余预算可能已 ≤0，Reserve 又把 ≤0 当成「不限时」。
+		if maxWait > 0 && penalty >= maxWait {
+			h.Metrics.QueueTimeout.Add(1)
+			return 0, fmt.Errorf("%w %dms（账号冷却中，还需 %s）", ErrQueueTimeout, limitMS, penalty.Round(time.Second))
+		}
 		select {
 		case <-time.After(penalty):
 		case <-ctx.Done():
 			return time.Since(started), ctx.Err()
 		}
 	}
-	waited, err := h.Pacer(a, poolClass).Reserve(ctx, maxWait-time.Since(started), s.QueueMaxSize)
+	remaining := maxWait - time.Since(started)
+	if maxWait > 0 && remaining <= 0 {
+		h.Metrics.QueueTimeout.Add(1)
+		return time.Since(started), fmt.Errorf("%w %dms", ErrQueueTimeout, limitMS)
+	}
+	waited, err := h.Pacer(a, poolClass).Reserve(ctx, remaining, s.QueueMaxSize)
 	if err != nil {
 		switch {
 		case errors.Is(err, pacer.ErrQueueFull):
@@ -898,6 +909,23 @@ func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 }
 
 // NoteError 记录一次性错误（不熔断），并增加连续失败计数用于长期健康追踪。
+// OnQuotaExhausted 处理 402（额度用尽）。
+//
+// 不熔断（不改 Enabled：额度恢复后账号自然可用，不需要人工干预），但冷却一段时间。
+// 冷却期内粘性绑定与调度器都会绕开它 —— 旧实现只记一笔错误，于是绑定在它上面的
+// 会话每次都被派回同一个账号、每次都拿到 402，即使别的账号完全健康。
+func (h *Hub) OnQuotaExhausted(a *config.Account, reason string) {
+	s := h.Settings()
+	cooldown := time.Duration(s.BreakerReviveSec) * time.Second
+	if cooldown <= 0 {
+		cooldown = 30 * time.Minute
+	}
+	h.mu.Lock()
+	h.penaltyUntil[a.ID] = time.Now().Add(cooldown)
+	h.mu.Unlock()
+	h.NoteError(a, truncate(reason, 160)+fmt.Sprintf("（额度耗尽，%s 内不再调度）", cooldown))
+}
+
 func (h *Hub) NoteError(a *config.Account, reason string) {
 	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
 		acc.Stats.Errors++

@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -421,7 +423,7 @@ func TestUsageLogAppendAndTail(t *testing.T) {
 // 鉴权
 // ---------------------------------------------------------------------------
 
-func TestPasswordHashAndSessionToken(t *testing.T) {
+func TestPasswordAndSessions(t *testing.T) {
 	s := newTestStore(t)
 	if !s.VerifyPassword("admin123") {
 		t.Fatal("初始口令应为 admin123")
@@ -429,7 +431,16 @@ func TestPasswordHashAndSessionToken(t *testing.T) {
 	if s.VerifyPassword("wrong") {
 		t.Fatal("错误口令必须拒绝")
 	}
-	before := s.SessionToken()
+	if !s.MustChangePassword() {
+		t.Fatal("初始口令必须要求改密")
+	}
+	tok := s.NewAdminSession()
+	if !s.ValidAdminSession(tok) {
+		t.Fatal("刚签发的会话必须有效")
+	}
+	if s.ValidAdminSession(tok[:len(tok)-1]+"0") && !strings.HasSuffix(tok, "0") {
+		t.Fatal("篡改过的令牌必须无效")
+	}
 
 	if err := s.SetPassword("new-secret"); err != nil {
 		t.Fatalf("改密失败：%v", err)
@@ -437,11 +448,100 @@ func TestPasswordHashAndSessionToken(t *testing.T) {
 	if !s.VerifyPassword("new-secret") || s.VerifyPassword("admin123") {
 		t.Fatal("改密后应只认新口令")
 	}
-	if s.SessionToken() == before {
-		t.Fatal("改密后会话令牌必须变化，否则旧会话无法失效")
+	if s.ValidAdminSession(tok) {
+		t.Fatal("改密后旧会话必须失效")
 	}
-	if s.Settings.MustChangePassword {
+	if s.MustChangePassword() {
 		t.Error("改密后不应再要求强制改密")
+	}
+
+	tok2 := s.NewAdminSession()
+	s.RevokeAdminSession(tok2)
+	if s.ValidAdminSession(tok2) {
+		t.Fatal("退出登录后会话必须在服务端失效")
+	}
+}
+
+// 会话令牌必须与口令散列无关：拿到 settings.json 也推不出 cookie。
+func TestSessionTokensAreRandom(t *testing.T) {
+	s := newTestStore(t)
+	a, b := s.NewAdminSession(), s.NewAdminSession()
+	if a == "" || a == b {
+		t.Fatalf("会话令牌必须随机且互不相同：%q %q", a, b)
+	}
+	if s.ValidChatSession(a) {
+		t.Fatal("管理员会话不能当 Chat 会话用")
+	}
+}
+
+// RFC 7914 §11 的 PBKDF2-HMAC-SHA256 测试向量。
+func TestPBKDF2Vector(t *testing.T) {
+	got := hex.EncodeToString(pbkdf2SHA256([]byte("passwd"), []byte("salt"), 1, 64))
+	want := "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc" +
+		"49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+	if got != want {
+		t.Fatalf("PBKDF2 结果不符：\n got %s\nwant %s", got, want)
+	}
+}
+
+// 1.0.23 及以前的单轮 sha256 散列要能继续登录，并在登录时升级为 PBKDF2。
+func TestLegacyHashUpgradesOnLogin(t *testing.T) {
+	s := newTestStore(t)
+	s.UpdateSettings(func(st *Settings) {
+		st.AdminPasswordSalt = "abcd"
+		st.AdminPasswordHash = legacyHash("old-pass", "abcd")
+	})
+	if !s.VerifyPassword("old-pass") {
+		t.Fatal("旧格式散列必须仍能校验通过")
+	}
+	if !strings.HasPrefix(s.SettingsSnapshot().AdminPasswordHash, pbkdf2Prefix+"$") {
+		t.Fatal("登录成功后应升级为 PBKDF2 散列")
+	}
+	if !s.VerifyPassword("old-pass") || s.VerifyPassword("wrong") {
+		t.Fatal("升级后口令校验结果必须不变")
+	}
+}
+
+// Chat 未设口令时 VerifyChatPassword 必须拒绝（旧版本在这里一律放行）。
+func TestChatPasswordUnsetRejects(t *testing.T) {
+	s := newTestStore(t)
+	if s.VerifyChatPassword("") || s.VerifyChatPassword("anything") {
+		t.Fatal("未设置 Chat 口令时不能放行任何口令")
+	}
+	if err := s.SetChatPassword("chat-pass"); err != nil {
+		t.Fatal(err)
+	}
+	tok := s.NewChatSession()
+	if !s.VerifyChatPassword("chat-pass") || !s.ValidChatSession(tok) {
+		t.Fatal("设置后应能校验并签发会话")
+	}
+	if err := s.SetChatPassword("other-pass"); err != nil {
+		t.Fatal(err)
+	}
+	if s.ValidChatSession(tok) {
+		t.Fatal("改 Chat 口令后旧 Chat 会话必须失效")
+	}
+}
+
+// DSM 安装向导写下的初始口令：读入后文件必须删除，且不要求再改密。
+func TestWizardInitialPassword(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, initialPasswordFile)
+	if err := os.WriteFile(p, []byte("wizard-pass\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.VerifyPassword("wizard-pass") || s.VerifyPassword("admin123") {
+		t.Fatal("应使用安装向导填写的口令")
+	}
+	if s.MustChangePassword() {
+		t.Fatal("用户亲手设置的口令不应再强制改密")
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatal("初始口令文件读取后必须删除")
 	}
 }
 

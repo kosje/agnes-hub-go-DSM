@@ -105,6 +105,7 @@ func TestChatAutoImageStreamIsSSE(t *testing.T) {
 		h.ts.URL+"/api/chat/v1/chat/completions", bytes.NewReader(buf))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+h.apiKey)
+	req.AddCookie(h.cookie())
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -177,7 +178,7 @@ func TestChatVideoStatusPollsUpstreamNotResubmit(t *testing.T) {
 	beforeVideos := h.mock.hits("/v1/videos")
 	beforePoll := h.mock.hits("/agnesapi")
 
-	resp, err := http.Get(h.ts.URL + "/api/chat/v1/videos/" + jobID)
+	resp, err := h.rawGet(h.ts.URL + "/api/chat/v1/videos/" + jobID)
 	if err != nil {
 		t.Fatalf("查询任务失败：%v", err)
 	}
@@ -209,7 +210,7 @@ func TestChatVideoStatusPollsUpstreamNotResubmit(t *testing.T) {
 // 而不是悄悄转发给上游。
 func TestChatVideoStatusUnknownJob(t *testing.T) {
 	h := newHarness(t, 0, 1)
-	resp, err := http.Get(h.ts.URL + "/api/chat/v1/videos/job-does-not-exist")
+	resp, err := h.rawGet(h.ts.URL + "/api/chat/v1/videos/job-does-not-exist")
 	if err != nil {
 		t.Fatalf("请求失败：%v", err)
 	}

@@ -8,7 +8,6 @@ package config
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -153,30 +152,30 @@ type AccountStats struct {
 
 // Account 是一个上游账号。运行期状态全部放在 hub 里，这里只留需要落盘的字段。
 type Account struct {
-	ID                  string             `json:"id"`
-	Name                string             `json:"name"`
-	APIKey              string             `json:"api_key"`
-	BaseURL             string             `json:"base_url"`
-	AccessType          string             `json:"access_type"`
-	Enabled             bool               `json:"enabled"`
-	Group               string             `json:"group,omitempty"`
-	ClassesEnabled      []string           `json:"classes_enabled"`
-	ModelManifest       ModelManifest      `json:"model_manifest"`
-	RPMOverrides        map[string]float64 `json:"rpm_overrides"`
-	MaxConcurrency      int                `json:"max_concurrency"`
-	LearnedFactor       float64            `json:"learned_factor"`
-	PoolFactors         map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
-	LastRateLimited     float64            `json:"last_rate_limited_at"`
-	CreatedAt           float64            `json:"created_at"`
-	Stats               AccountStats       `json:"stats"`
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	APIKey          string             `json:"api_key"`
+	BaseURL         string             `json:"base_url"`
+	AccessType      string             `json:"access_type"`
+	Enabled         bool               `json:"enabled"`
+	Group           string             `json:"group,omitempty"`
+	ClassesEnabled  []string           `json:"classes_enabled"`
+	ModelManifest   ModelManifest      `json:"model_manifest"`
+	RPMOverrides    map[string]float64 `json:"rpm_overrides"`
+	MaxConcurrency  int                `json:"max_concurrency"`
+	LearnedFactor   float64            `json:"learned_factor"`
+	PoolFactors     map[string]float64 `json:"pool_factors,omitempty"` // (账号 × 池) 二维校准系数
+	LastRateLimited float64            `json:"last_rate_limited_at"`
+	CreatedAt       float64            `json:"created_at"`
+	Stats           AccountStats       `json:"stats"`
 	// DefaultModel 是该账号的「兜底模型」：当下游传入的模型不在本账号 Manifest 时，
 	// 网关会用这个模型名发请求。留空则退回全局 auto 选择。
-	DefaultModel        string             `json:"default_model,omitempty"`
+	DefaultModel string `json:"default_model,omitempty"`
 	// ConsecutiveFailures 连续失败计数（跨会话保留），用于长期健康追踪。
-	ConsecutiveFailures int                `json:"consecutive_failures"`
+	ConsecutiveFailures int `json:"consecutive_failures"`
 	// Priority 调用优先级（数字越大越优先）。同优先级内按「首选区域 → 预计等待 → 在途」排序。
 	// 默认 0。用于手动把某些账号顶到前面（例如更稳的渠道、或想优先吃满的账号）。
-	Priority            int                `json:"priority"`
+	Priority int `json:"priority"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -223,20 +222,20 @@ type VideoJob struct {
 
 // ImageJob 是图片任务映射（下游 request_id → 上游 image_id + 产出 URL + 承载账号）。
 type ImageJob struct {
-	JobID     string  `json:"job_id"`
-	ImageID   string  `json:"image_id"`
-	Model     string  `json:"model"`
-	AccountID string  `json:"account_id"`
-	URL       string  `json:"url,omitempty"`
-	RevisedURL string `json:"revised_url,omitempty"`
-	Size      string  `json:"size,omitempty"`
-	Quality   string  `json:"quality,omitempty"`
-	Style     string  `json:"style,omitempty"`
-	Prompt    string  `json:"prompt"`
-	Status    string  `json:"status"`
-	Error     string  `json:"error,omitempty"`
-	CreatedAt float64 `json:"created_at"`
-	RequestID string  `json:"request_id"`
+	JobID      string  `json:"job_id"`
+	ImageID    string  `json:"image_id"`
+	Model      string  `json:"model"`
+	AccountID  string  `json:"account_id"`
+	URL        string  `json:"url,omitempty"`
+	RevisedURL string  `json:"revised_url,omitempty"`
+	Size       string  `json:"size,omitempty"`
+	Quality    string  `json:"quality,omitempty"`
+	Style      string  `json:"style,omitempty"`
+	Prompt     string  `json:"prompt"`
+	Status     string  `json:"status"`
+	Error      string  `json:"error,omitempty"`
+	CreatedAt  float64 `json:"created_at"`
+	RequestID  string  `json:"request_id"`
 }
 
 // ChatLog 是聊天对话记录（用户问题 + 助手回复），持久化于 chat_logs.json。
@@ -267,23 +266,23 @@ type Settings struct {
 	// 加它的原因：normalizeSettings 每次加载都会跑，如果迁移只按「字段当前值」
 	// 判断，用户手动改回去之后又会在下次重启时被迁移覆盖掉 —— 迁移必须是
 	// 「跑过就不再跑」。所以迁移函数都写成 `if v.SettingsVersion < N`。
-	SettingsVersion      int                `json:"settings_version"`
-	AdminPasswordHash    string             `json:"admin_password_hash"`
-	AdminPasswordSalt    string             `json:"admin_password_salt"`
-	MustChangePassword   bool               `json:"must_change_password"`
-	SafetyFactor         float64            `json:"safety_factor"`
-	PacingWindowSec      float64            `json:"pacing_window_sec"`
-	CalibrationEnabled   bool               `json:"calibration_enabled"`
-	PenaltyCooldownSec   float64            `json:"penalty_cooldown_sec"`
-	PenaltyFactor        float64            `json:"penalty_factor"`
-	MinLearnedFactor     float64            `json:"min_learned_factor"`
-	RecoverAfterSec      float64            `json:"recover_after_sec"`
-	RecoverSuccesses     int                `json:"recover_successes"`
-	QueueMaxWaitMS       int                `json:"queue_max_wait_ms"`
-	QueueMaxSize         int                `json:"queue_max_size"`
-	KeepaliveMS          int                `json:"keepalive_interval_ms"`
-	AffinityMode         string             `json:"affinity_mode"`
-	DefaultImageTier     string             `json:"default_image_tier"`
+	SettingsVersion    int     `json:"settings_version"`
+	AdminPasswordHash  string  `json:"admin_password_hash"`
+	AdminPasswordSalt  string  `json:"admin_password_salt"`
+	MustChangePassword bool    `json:"must_change_password"`
+	SafetyFactor       float64 `json:"safety_factor"`
+	PacingWindowSec    float64 `json:"pacing_window_sec"`
+	CalibrationEnabled bool    `json:"calibration_enabled"`
+	PenaltyCooldownSec float64 `json:"penalty_cooldown_sec"`
+	PenaltyFactor      float64 `json:"penalty_factor"`
+	MinLearnedFactor   float64 `json:"min_learned_factor"`
+	RecoverAfterSec    float64 `json:"recover_after_sec"`
+	RecoverSuccesses   int     `json:"recover_successes"`
+	QueueMaxWaitMS     int     `json:"queue_max_wait_ms"`
+	QueueMaxSize       int     `json:"queue_max_size"`
+	KeepaliveMS        int     `json:"keepalive_interval_ms"`
+	AffinityMode       string  `json:"affinity_mode"`
+	DefaultImageTier   string  `json:"default_image_tier"`
 	// RegionPriority 站点优先级：cn_first（国内优先）或 com_first（国际优先）。
 	// 401/403 凭据被拒时自动切换到另一站点的 BaseURL 重试同一账号。
 	RegionPriority       string             `json:"region_priority,omitempty"`
@@ -330,10 +329,10 @@ type Settings struct {
 	// 反过来，没填就没法保证网关地址从客户端够得到，这时上游才更稳妥。
 	//
 	// 网关自己的网页不受此项影响，一律用本地地址（与网关同源，一定可达）。
-	ClientMediaURL string `json:"client_media_url"`
-	RequestTimeoutMS     int                `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
-	ChatPasswordHash     string             `json:"chat_password_hash,omitempty"`
-	ChatPasswordSalt     string             `json:"chat_password_salt,omitempty"`
+	ClientMediaURL   string `json:"client_media_url"`
+	RequestTimeoutMS int    `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
+	ChatPasswordHash string `json:"chat_password_hash,omitempty"`
+	ChatPasswordSalt string `json:"chat_password_salt,omitempty"`
 }
 
 // DefaultSettings 返回出厂设置。
@@ -373,28 +372,28 @@ func DefaultSettings() Settings {
 			Image: []string{"agnes-image-2.5-flash", "agnes-image-2.1-flash"},
 			Video: []string{"agnes-video-2.5-flash", "agnes-video-2.5", "agnes-video-v2.0"},
 		},
-		RetryMax:            3,
-		RetryBaseBackoffMS:  500,
-		RetryMaxBackoffMS:   8000,
-		ImageConcurrency:    4,
-		VideoMaxInFlight:    2,
-		BreakerReviveSec:    1800,
-		VideoPollPath:       "/agnesapi",
-		VideoPollWithModel:  true,
-		VideoPollIntervalMS: 10000,
-		LogRetentionDays:    7,
-		SessionTTLHours:     72,
-		ProbeModel:          "agnes-2.5-flash",
-		OptimizationMode:    "concurrent_batch",
+		RetryMax:             3,
+		RetryBaseBackoffMS:   500,
+		RetryMaxBackoffMS:    8000,
+		ImageConcurrency:     4,
+		VideoMaxInFlight:     2,
+		BreakerReviveSec:     1800,
+		VideoPollPath:        "/agnesapi",
+		VideoPollWithModel:   true,
+		VideoPollIntervalMS:  10000,
+		LogRetentionDays:     7,
+		SessionTTLHours:      72,
+		ProbeModel:           "agnes-2.5-flash",
+		OptimizationMode:     "concurrent_batch",
 		ImageRecordRetention: 30,
-		ImageMaxCapacity:    500,
-		VideoMaxCapacity:    200,
+		ImageMaxCapacity:     500,
+		VideoMaxCapacity:     200,
 		// 注意：这里刻意**不**在 normalizeSettings 里给它补默认值。
 		// 旧版 settings.json 里没有这个键，反序列化时会保留这里的默认值；
 		// 而用户显式写 0 表示「不限」，一旦在 normalize 里补默认值就永远关不掉了。
-		VideoCacheMaxMB: 2048,
-		RegionPriority:      "cn_first",
-		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
+		VideoCacheMaxMB:  2048,
+		RegionPriority:   "cn_first",
+		RequestTimeoutMS: 30000, // 默认 30s 上游请求超时
 	}
 }
 
@@ -413,6 +412,9 @@ type Store struct {
 	Jobs      map[string]*VideoJob
 	ImageJobs map[string]*ImageJob
 	ChatLogs  map[string]*ChatLog
+
+	adminSessions *sessionTable
+	chatSessions  *sessionTable
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -423,34 +425,46 @@ func NewStore(dir string) (*Store, error) {
 		Bindings: map[string]Binding{},
 		Jobs:     map[string]*VideoJob{},
 		ChatLogs: map[string]*ChatLog{},
+
+		adminSessions: newSessionTable(),
+		chatSessions:  newSessionTable(),
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700：数据目录里有上游密钥与口令散列，同机其他用户/套件不应能读。
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
-	// 处理安装向导传入的初始/覆盖密码（AGNES_ADMIN_PASSWORD 由 cmd/main 在填写了
-	// wizard_admin_password 时注入）。只要该变量非空，就覆盖当前管理员密码。
+	// 初始口令的三个来源，优先级从高到低：
+	//   1. AGNES_ADMIN_PASSWORD 环境变量：运维显式覆盖（如忘记密码），每次启动都生效，
+	//      因此仍要求登录后改密；
+	//   2. DSM 安装向导填写的密码（一次性文件，读后即删）：用户亲手设置的，无需再改；
+	//   3. 都没有且尚无密码：回退到 admin123，服务端强制首次登录改密。
 	if adminPW := os.Getenv("AGNES_ADMIN_PASSWORD"); adminPW != "" {
-		salt := randHex(8)
-		s.Settings.AdminPasswordSalt = salt
-		s.Settings.AdminPasswordHash = HashPassword(adminPW, salt)
-		s.Settings.MustChangePassword = true
+		s.setInitialPassword(adminPW, true)
+		if err := s.saveSettingsLocked(); err != nil {
+			return nil, err
+		}
+	} else if wizardPW := s.consumeInitialPassword(); wizardPW != "" {
+		s.setInitialPassword(wizardPW, false)
 		if err := s.saveSettingsLocked(); err != nil {
 			return nil, err
 		}
 	} else if s.Settings.AdminPasswordHash == "" {
-		// 无向导密码且无现有密码：回退到内部默认（不在任何界面展示）
-		salt := randHex(8)
-		s.Settings.AdminPasswordSalt = salt
-		s.Settings.AdminPasswordHash = HashPassword("admin123", salt)
-		s.Settings.MustChangePassword = true
+		s.setInitialPassword("admin123", true)
 		if err := s.saveSettingsLocked(); err != nil {
 			return nil, err
 		}
 	}
 	return s, nil
+}
+
+func (s *Store) setInitialPassword(pw string, mustChange bool) {
+	salt := randHex(16)
+	s.Settings.AdminPasswordSalt = salt
+	s.Settings.AdminPasswordHash = HashPassword(pw, salt)
+	s.Settings.MustChangePassword = mustChange
 }
 
 func (s *Store) path(name string) string { return filepath.Join(s.Dir, name) }
@@ -664,15 +678,29 @@ func normalizeAccount(a *Account, s Settings) {
 // ---- 原子写 ----
 
 func writeJSON(path string, payload any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	buf, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}
+	// 0600 + 先 fsync 再 rename：文件里有密钥，且 NAS 断电时不能留下半截文件
+	// （半截的 settings.json 会被当成坏文件，管理员密码随之回落到初始值）。
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(buf); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -691,7 +719,7 @@ func readJSON(path string, out any) error {
 	}
 	if err := json.Unmarshal(buf, out); err != nil {
 		// 坏文件不应让服务起不来：备份后按默认值继续
-		_ = os.WriteFile(path+".broken", buf, 0o644)
+		_ = os.WriteFile(path+".broken", buf, 0o600)
 		return nil
 	}
 	return nil
@@ -798,13 +826,18 @@ func cloneListMap(in map[string][]string) map[string][]string {
 	return out
 }
 
-// AccountByID 按 ID 取账号（返回内部指针，改动后需自行落盘）。
+// AccountByID 按 ID 取账号。
+//
+// 返回的是深拷贝：调用方（调度器、relay、控制台）都在锁外读字段，
+// 而 MutateAccount* 会在锁内原地改同一个对象。直接交出内部指针会构成数据竞争，
+// 其中 RPMOverrides 这类 map 一旦「锁外读 + 锁内写」撞上，Go 运行时会直接
+// 以 concurrent map read and map write 终止整个进程。要改账号请走 MutateAccount。
 func (s *Store) AccountByID(id string) *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, a := range s.Accounts {
 		if a.ID == id {
-			return a
+			return a.Clone()
 		}
 	}
 	return nil
@@ -1377,7 +1410,7 @@ func (s *Store) AppendUsage(record map[string]any) {
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
 	}
@@ -1407,75 +1440,6 @@ func (s *Store) TailUsage(n int) []map[string]any {
 		}
 	}
 	return out
-}
-
-// ---- 密码 ----
-
-// HashPassword 口令散列（与 Python 基线一致：sha256(salt+password)）。
-func HashPassword(password, salt string) string {
-	sum := sha256.Sum256([]byte(salt + password))
-	return hex.EncodeToString(sum[:])
-}
-
-// VerifyPassword 校验口令。
-func (s *Store) VerifyPassword(password string) bool {
-	s.mu.RLock()
-	hash, salt := s.Settings.AdminPasswordHash, s.Settings.AdminPasswordSalt
-	s.mu.RUnlock()
-	if hash == "" {
-		return false
-	}
-	return subtleEqual(hash, HashPassword(password, salt))
-}
-
-// SetPassword 改密。
-func (s *Store) SetPassword(password string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	salt := randHex(8)
-	s.Settings.AdminPasswordSalt = salt
-	s.Settings.AdminPasswordHash = HashPassword(password, salt)
-	s.Settings.MustChangePassword = false
-	return s.saveSettingsLocked()
-}
-
-// VerifyChatPassword 校验 chat 页面密码。
-func (s *Store) VerifyChatPassword(password string) bool {
-	s.mu.RLock()
-	hash, salt := s.Settings.ChatPasswordHash, s.Settings.ChatPasswordSalt
-	s.mu.RUnlock()
-	if hash == "" {
-		return true // 未设置密码，允许访问
-	}
-	return subtleEqual(hash, HashPassword(password, salt))
-}
-
-// SetChatPassword 设置/更新 chat 页面密码。空密码表示禁用。
-func (s *Store) SetChatPassword(password string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if strings.TrimSpace(password) == "" {
-		s.Settings.ChatPasswordHash = ""
-		s.Settings.ChatPasswordSalt = ""
-	} else {
-		salt := randHex(8)
-		s.Settings.ChatPasswordSalt = salt
-		s.Settings.ChatPasswordHash = HashPassword(password, salt)
-	}
-	return s.saveSettingsLocked()
-}
-
-// SessionToken 派生会话令牌（改密即全端失效）。
-//
-// 末尾的固定串是「域分隔符」：把会话令牌的用途和其它可能的哈希用途隔开，
-// 避免同一个 salt+hash 组合在别处被复用推导出同一串。它只是个常量，
-// 不参与口令哈希本身 —— 改它只会让已下发的会话 cookie 失效（需重新登录），
-// 不会让任何人改密码。
-func (s *Store) SessionToken() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sum := sha256.Sum256([]byte(s.Settings.AdminPasswordSalt + ":" + s.Settings.AdminPasswordHash + ":agnes-hub"))
-	return hex.EncodeToString(sum[:])
 }
 
 // ---- 设置写入 ----
