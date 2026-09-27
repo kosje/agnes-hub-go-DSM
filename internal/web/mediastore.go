@@ -761,6 +761,19 @@ func validMediaName(k mediaKind, name string) bool {
 	return k.allowsExt("." + ext)
 }
 
+// mediaCSP 是媒体回放响应的内容安全策略。
+//
+// 目标：文件即使被当成页面打开，也不能执行任何脚本 —— default-src 'none' 已经禁掉
+// 全部脚本，不带 allow-scripts 的 sandbox 再禁一道（外加表单、弹窗、插件）。
+//
+// 必须带 allow-same-origin：浏览器直接打开 .mp4 时会自动生成一个内置播放页，
+// 该页继承本策略；只写 sandbox 时它被放进匿名源，自己去取视频的那次请求不再算
+// 'self'，被 media-src 拦下 —— 表现是播放器停在 0:00、点不动（1.0.24~1.0.26 实测如此；
+// 控制台里用 <video> 内嵌播放不受影响，因为策略只作用于被打开的那个页面）。
+// allow-same-origin 不放开脚本，脚本仍被上面两道同时禁止。
+const mediaCSP = "sandbox allow-same-origin; default-src 'none'; img-src 'self' data:; " +
+	"media-src 'self'; style-src 'unsafe-inline'"
+
 // handleChatMedia 回放本地落盘的产出。
 //
 // 刻意**不做会话鉴权**：文件名是内容的 sha256 前 16 字节（128 位），既不可枚举
@@ -768,8 +781,8 @@ func validMediaName(k mediaKind, name string) bool {
 //
 // 之所以必须放开：外部 AI 客户端拿到的只是正文里的一段地址，它没有、也不可能
 // 带上网关的会话 cookie；一旦要求登录，客户端里就永远是一张裂图（实测如此）。
-// 这与 /api/chat/v1/* 那批生成接口的信任模型是一致的 —— 那些接口本来就免鉴权，
-// 而且危害更大（能直接消耗账号配额），媒体回放只是读一份已经生成好的文件。
+// 与生成接口不同：生成会消耗账号配额，所以 /api/chat/v1/* 要求登录；
+// 回放只是读一份已经生成好的文件，地址本身就是凭证。
 //
 // 用 http.ServeContent 而不是自己 io.Copy：它自带 Range 支持，
 // 视频才能拖动进度条、断点续传。
@@ -795,9 +808,9 @@ func (s *Server) handleChatMedia(k mediaKind) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		w.Header().Set("Content-Type", k.mimeForExt(filepath.Ext(name)))
 		// 媒体文件来自上游，按不可信内容对待：禁止嗅探成 HTML，即使被当页面打开也
-		// 放进无脚本的沙箱源，碰不到控制台的 cookie 与接口。
+		// 不许执行任何脚本，碰不到控制台的 cookie 与接口。
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox")
+		w.Header().Set("Content-Security-Policy", mediaCSP)
 		// ?download=1 让浏览器直接存盘而不是内联打开 —— 客户端回复里给出的
 		// 「下载地址」就带这个参数。图片本身仍用不带参数的地址内联渲染，
 		// 两者读的是同一个文件，只是响应头不同。

@@ -268,9 +268,16 @@ func TestMediaServedWithSafetyHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	csp := resp.Header.Get("Content-Security-Policy")
 	if resp.Header.Get("X-Content-Type-Options") != "nosniff" ||
-		!strings.Contains(resp.Header.Get("Content-Security-Policy"), "sandbox") {
-		t.Fatalf("媒体响应应带 nosniff 与沙箱 CSP，实际 %v", resp.Header)
+		!strings.Contains(csp, "sandbox") || !strings.Contains(csp, "default-src 'none'") ||
+		strings.Contains(csp, "allow-scripts") {
+		t.Fatalf("媒体响应应带 nosniff，且 CSP 禁止一切脚本，实际 %v", resp.Header)
+	}
+	// 浏览器直接打开 .mp4 时生成的内置播放页继承此策略：没有 allow-same-origin，
+	// 播放页被放进匿名源，取视频的请求不算 'self'，视频停在 0:00 放不出来。
+	if !strings.Contains(csp, "allow-same-origin") {
+		t.Fatalf("CSP 必须带 allow-same-origin，否则直接打开的视频无法播放，实际 %q", csp)
 	}
 }
 
