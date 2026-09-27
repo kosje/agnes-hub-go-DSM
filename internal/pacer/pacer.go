@@ -58,8 +58,13 @@ func intervalFor(rpm, windowSec float64) time.Duration {
 
 // Reconfigure 运行期调整有效 RPM。
 //
-// 重算间隔的同时把已承诺的 nextFreeAt 夹紧到「现在 + 新间隔 × 当前排队人数」，
-// 避免下调 RPM 后已排队的请求仍要长时间背旧账（否则「校准生效」看起来要等几分钟）。
+// 已经领到槽位的请求各自在睡固定时长，改不了；能调整的只有「下一个空槽」。
+// nextFreeAt 的含义是「最后一个已排定的发送时刻 + 旧间隔」，所以换算成
+// 「最后一个已排定时刻 + 新间隔」：上调 RPM 时新来的请求立刻享受更短的间隔，
+// 下调时也不会紧贴着上一个发出去。
+//
+// 旧实现夹紧到「现在 + 新间隔 × 排队人数」：RPM 上调时会把下一个空槽拉到最后
+// 一个已排定请求之前不到一个间隔，破坏节拍器存在的意义 —— 相邻间隔下限。
 func (p *Pacer) Reconfigure(rpm, windowSec float64) {
 	if windowSec <= 0 {
 		windowSec = 60
@@ -69,15 +74,13 @@ func (p *Pacer) Reconfigure(rpm, windowSec float64) {
 	if p.rpm == rpm && p.windowSec == windowSec {
 		return
 	}
+	old := p.interval
 	p.rpm = rpm
 	p.windowSec = windowSec
 	p.interval = intervalFor(rpm, windowSec)
-	if p.interval <= 0 {
-		return
-	}
-	ceiling := time.Now().Add(p.interval * time.Duration(p.waiting))
-	if p.nextFreeAt.After(ceiling) {
-		p.nextFreeAt = ceiling
+	if p.nextFreeAt.After(time.Now()) {
+		lastScheduled := p.nextFreeAt.Add(-old)
+		p.nextFreeAt = lastScheduled.Add(p.interval)
 	}
 }
 

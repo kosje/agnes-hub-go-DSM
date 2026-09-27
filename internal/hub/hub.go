@@ -65,7 +65,6 @@ type Hub struct {
 	inflight      map[string]int
 	poolFactors   map[string]float64
 	successes     map[string]int
-	reviveAt      map[string]time.Time
 	pendingFactor map[string]bool
 
 	// Arrivals 到达密度环形缓冲区：记录最近 ARRIVAL_WINDOW 内的请求到达时间戳。
@@ -83,9 +82,9 @@ const ARRIVAL_WINDOW = 60 * time.Second
 type arrivalRing struct {
 	mu    sync.Mutex
 	items [512]time.Time
-	n     int    // 有效条目数（≤ 容量）
-	pos   int    // 下一个写入位置
-	total int64  // 总计数（含已滑出窗口的）
+	n     int   // 有效条目数（≤ 容量）
+	pos   int   // 下一个写入位置
+	total int64 // 总计数（含已滑出窗口的）
 }
 
 // Add 记录一次请求到达。
@@ -158,7 +157,6 @@ func New(store *config.Store) *Hub {
 		inflight:      map[string]int{},
 		poolFactors:   map[string]float64{},
 		successes:     map[string]int{},
-		reviveAt:      map[string]time.Time{},
 		pendingFactor: map[string]bool{},
 	}
 	h.Metrics.StartedAt = time.Now()
@@ -381,25 +379,21 @@ func (h *Hub) Declares(a *config.Account, poolClass, model string) bool {
 // 若无人声明则退回「声明了该模态」的全集 —— 宁可让上游给出明确错误，
 // 也不要因为配置漏填就把请求挡在门外。
 func (h *Hub) Candidates(poolClass string, exclude map[string]bool, requiredModel string) []*config.Account {
-	h.mu.Lock()
-	now := time.Now()
-	// 熔断到期自动复活（被动触发，避免依赖后台定时器）
-	var revive []string
-	for id, at := range h.reviveAt {
-		if !at.IsZero() && now.After(at) {
-			revive = append(revive, id)
+	// 熔断到期自动复活（被动触发，避免依赖后台定时器）。复活时间落在账号上，重启后照常生效。
+	accounts := h.store.AccountsSnapshot()
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	revived := false
+	for _, a := range accounts {
+		if !a.Enabled && a.ReviveAt > 0 && nowSec >= a.ReviveAt && h.tryRevive(a.ID) {
+			revived = true
 		}
 	}
-	for _, id := range revive {
-		delete(h.reviveAt, id)
-	}
-	h.mu.Unlock()
-	for _, id := range revive {
-		h.tryRevive(id)
+	if revived {
+		accounts = h.store.AccountsSnapshot()
 	}
 
 	var base []*config.Account
-	for _, a := range h.store.AccountsSnapshot() {
+	for _, a := range accounts {
 		if !a.Enabled || strings.TrimSpace(a.APIKey) == "" {
 			continue
 		}
@@ -425,19 +419,44 @@ func (h *Hub) Candidates(poolClass string, exclude map[string]bool, requiredMode
 	return base
 }
 
-func (h *Hub) tryRevive(id string) {
+func (h *Hub) tryRevive(id string) bool {
+	revived := false
 	h.store.MutateAccount(id, func(a *config.Account) bool {
-		if a.Enabled {
+		// 只复活「熔断停用」的账号：管理员手动停用的 ReviveAt 为 0，不会被拉起来。
+		if a.Enabled || a.ReviveAt == 0 {
 			return false
 		}
 		// 自动复活：置回启用，但**不做清零**——保留已下调的校准系数，
 		// 让该账号以更慢的节拍试探恢复，而不是复活瞬间再撞一次 429。
+		// BreakerTrips 也保留：试探再失败，下次冷却时间翻倍。
 		a.Enabled = true
-		a.Stats.LastError = "熔断冷却结束，已自动复活（低速试探）"
+		a.ReviveAt = 0
+		a.Stats.LastError = fmt.Sprintf("熔断冷却结束，已自动复活试探（此前连续熔断 %d 次）", a.BreakerTrips)
+		revived = true
 		return true
 	})
-	h.Metrics.BreakerRevived.Add(1)
-	h.Reload()
+	if revived {
+		h.Metrics.BreakerRevived.Add(1)
+		h.Reload()
+	}
+	return revived
+}
+
+// maxBreakerTrips 是自动复活的次数上限。按 30 分钟起、逐次翻倍、封顶 24 小时算，
+// 8 次约覆盖 3 天：这么久都鉴权失败，基本就是密钥被吊销了，再试只会周期性地
+// 让一个用户请求吃到失败。
+const maxBreakerTrips = 8
+
+// breakerCooldown 第 trips 次熔断的冷却时长：base × 2^(trips-1)，封顶 24 小时。
+func breakerCooldown(base time.Duration, trips int) time.Duration {
+	d := base
+	for i := 1; i < trips && d < 24*time.Hour; i++ {
+		d *= 2
+	}
+	if d > 24*time.Hour {
+		d = 24 * time.Hour
+	}
+	return d
 }
 
 // StartMaintenance 启动后台维护：熔断复活 + 到期绑定清理 + 因子落盘。
@@ -879,32 +898,42 @@ func (h *Hub) OnSuccess(a *config.Account, poolClass string) {
 // OnAuthFailure 401/403/402 不可重试：立即熔断并安排自动复活。
 //
 // P2 增强：连续失败超过阈值时延长熔断冷却，让账号有更长的恢复窗口。
+//
+// 冷却按连续熔断次数指数退避（见 breakerCooldown），超过 maxBreakerTrips 次不再自动复活。
+// 旧实现的「连续失败越多冷却越长」依赖 ConsecutiveFailures，而鉴权失败路径从不累加它，
+// 结果一把已吊销的密钥会被每 30 分钟复活一次、每次都让一个用户请求失败，永不停止。
 func (h *Hub) OnAuthFailure(a *config.Account, reason string) {
 	s := h.Settings()
-	baseReviveAfter := time.Duration(s.BreakerReviveSec) * time.Second
-	if baseReviveAfter <= 0 {
-		baseReviveAfter = 30 * time.Minute
+	base := time.Duration(s.BreakerReviveSec) * time.Second
+	if base <= 0 {
+		base = 30 * time.Minute
 	}
-	// 连续失败超过阈值时，冷却时间指数增长（上限 2 倍）
-	extended := baseReviveAfter
-	if a.ConsecutiveFailures >= 5 {
-		extended = time.Duration(float64(baseReviveAfter) * 1.5)
-	}
-	if a.ConsecutiveFailures >= 10 {
-		extended = time.Duration(float64(baseReviveAfter) * 2.0)
-	}
-	h.mu.Lock()
-	h.reviveAt[a.ID] = time.Now().Add(extended)
-	h.mu.Unlock()
-	h.Metrics.BreakerOpened.Add(1)
-
-	_ = h.store.MutateAccountNoSave(a.ID, func(acc *config.Account) bool {
-		acc.Enabled = false
+	tripped := false
+	h.store.MutateAccount(a.ID, func(acc *config.Account) bool {
 		acc.Stats.Errors++
-		acc.Stats.LastError = truncate(reason, 200) +
-			fmt.Sprintf("（已熔断，%s 后自动复活低速试探）", extended)
+		// 已经停用（熔断中、手动停用或已放弃）就不再重复计次：并发请求同时撞上
+		// 同一把失效密钥时，一次故障只算一次熔断。
+		if !acc.Enabled {
+			return true
+		}
+		tripped = true
+		acc.Enabled = false
+		acc.BreakerTrips++
+		if acc.BreakerTrips > maxBreakerTrips {
+			acc.ReviveAt = 0
+			acc.Stats.LastError = truncate(reason, 160) + fmt.Sprintf(
+				"（连续 %d 次鉴权失败，已停止自动复活：请检查密钥后在控制台手动启用）", acc.BreakerTrips)
+			return true
+		}
+		cooldown := breakerCooldown(base, acc.BreakerTrips)
+		acc.ReviveAt = float64(time.Now().Add(cooldown).UnixNano()) / 1e9
+		acc.Stats.LastError = truncate(reason, 160) +
+			fmt.Sprintf("（第 %d 次熔断，%s 后自动复活试探）", acc.BreakerTrips, cooldown)
 		return true
 	})
+	if tripped {
+		h.Metrics.BreakerOpened.Add(1)
+	}
 	h.Reload()
 }
 
@@ -941,6 +970,7 @@ func (h *Hub) NoteSuccess(a *config.Account) {
 		acc.Stats.Requests++
 		acc.Stats.LastUsedAt = float64(time.Now().UnixNano()) / 1e9
 		acc.ConsecutiveFailures = 0
+		acc.BreakerTrips = 0 // 复活试探成功：熔断退避从头算
 		return true
 	})
 	h.Metrics.RequestsOK.Add(1)
@@ -1047,7 +1077,7 @@ func (h *Hub) arrivalDensity() map[string]any {
 		"text_rpm":         round2(textRPM),
 		"text_interval_ms": int(textIntervalSec * 1000),
 		// ratio > 1 表示到达更密于节拍 → 多账号真正吃到
-		"ratio": round2(ratio),
+		"ratio":      round2(ratio),
 		"per_second": perSecond,
 	}
 }

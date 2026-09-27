@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -544,4 +545,99 @@ func tweakSettings(t *testing.T, h *Hub, store *config.Store, fn func(*config.Se
 		t.Fatalf("写入设置失败：%v", err)
 	}
 	h.Reload()
+}
+
+func TestBreakerCooldownBackoff(t *testing.T) {
+	base := 30 * time.Minute
+	want := []time.Duration{30 * time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour,
+		8 * time.Hour, 16 * time.Hour, 24 * time.Hour, 24 * time.Hour}
+	for i, w := range want {
+		if got := breakerCooldown(base, i+1); got != w {
+			t.Errorf("第 %d 次熔断冷却应为 %s，实际 %s", i+1, w, got)
+		}
+	}
+}
+
+// 一把已吊销的密钥：冷却逐次翻倍，超过上限后不再自动复活。
+// 旧实现每 30 分钟复活一次、永不停止，每次都让一个用户请求失败。
+func TestBreakerGivesUpAfterRepeatedTrips(t *testing.T) {
+	h, store := newTestHub(t, nil)
+	a := store.AddAccount("已吊销", "sk-dead", "free", "", nil)
+	h.Reload()
+	var lastRevive float64
+	for trip := 1; trip <= maxBreakerTrips; trip++ {
+		h.OnAuthFailure(store.AccountByID(a.ID), "401 invalid api key")
+		got := store.AccountByID(a.ID)
+		if got.Enabled || got.BreakerTrips != trip || got.ReviveAt <= lastRevive {
+			t.Fatalf("第 %d 次熔断后状态不对：enabled=%v trips=%d revive_at=%v", trip, got.Enabled, got.BreakerTrips, got.ReviveAt)
+		}
+		lastRevive = got.ReviveAt
+		// 模拟冷却到期后被复活试探
+		store.MutateAccount(a.ID, func(x *config.Account) bool { x.ReviveAt = 1; return true })
+		if !h.tryRevive(a.ID) {
+			t.Fatalf("第 %d 次冷却到期应能复活", trip)
+		}
+		lastRevive = 0
+	}
+	h.OnAuthFailure(store.AccountByID(a.ID), "401 invalid api key")
+	got := store.AccountByID(a.ID)
+	if got.Enabled || got.ReviveAt != 0 {
+		t.Fatalf("超过 %d 次后应停止自动复活，实际 enabled=%v revive_at=%v", maxBreakerTrips, got.Enabled, got.ReviveAt)
+	}
+	if !strings.Contains(got.Stats.LastError, "手动启用") {
+		t.Errorf("应提示管理员手动处理，实际 %q", got.Stats.LastError)
+	}
+}
+
+// 并发请求同时撞上同一把失效密钥：一次故障只算一次熔断。
+func TestBreakerDoesNotDoubleCount(t *testing.T) {
+	h, store := newTestHub(t, nil)
+	a := store.AddAccount("x", "sk-x", "free", "", nil)
+	h.Reload()
+	stale := store.AccountByID(a.ID) // 请求开始时拿到的账号副本
+	h.OnAuthFailure(stale, "401")
+	h.OnAuthFailure(stale, "401")
+	if got := store.AccountByID(a.ID).BreakerTrips; got != 1 {
+		t.Fatalf("同一次故障应只熔断一次，实际 %d 次", got)
+	}
+}
+
+// 复活计划落盘：进程重启后到期照常复活；成功一次后退避从头算。
+func TestBreakerRevivePersistsAcrossRestart(t *testing.T) {
+	h, store := newTestHub(t, func(s *config.Settings) { s.BreakerReviveSec = 1 })
+	a := store.AddAccount("x", "sk-x", "free", "", nil)
+	h.Reload()
+	h.OnAuthFailure(store.AccountByID(a.ID), "401")
+	store.FlushAccounts()
+
+	reloaded, err := config.NewStore(store.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2 := New(reloaded)
+	time.Sleep(1100 * time.Millisecond)
+	if got := h2.Candidates("text", nil, ""); len(got) != 1 {
+		t.Fatalf("重启后冷却到期应照常复活，实际候选 %d 个", len(got))
+	}
+	h2.NoteSuccess(reloaded.AccountByID(a.ID))
+	if got := reloaded.AccountByID(a.ID).BreakerTrips; got != 0 {
+		t.Fatalf("复活后请求成功应清零退避计数，实际 %d", got)
+	}
+}
+
+// 管理员手动停用的账号不能被熔断计划拉起来。
+func TestManualDisableNotRevived(t *testing.T) {
+	h, store := newTestHub(t, func(s *config.Settings) { s.BreakerReviveSec = 1 })
+	a := store.AddAccount("x", "sk-x", "free", "", nil)
+	h.Reload()
+	h.OnAuthFailure(store.AccountByID(a.ID), "401")
+	// 控制台手动停用会清掉复活计划（console.go 的 apiUpdateAccount 里做）
+	store.MutateAccount(a.ID, func(x *config.Account) bool {
+		x.Enabled, x.ReviveAt, x.BreakerTrips = false, 0, 0
+		return true
+	})
+	time.Sleep(1100 * time.Millisecond)
+	if got := h.Candidates("text", nil, ""); len(got) != 0 {
+		t.Fatalf("手动停用的账号不应被自动复活")
+	}
 }

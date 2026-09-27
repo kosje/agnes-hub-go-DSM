@@ -16,11 +16,13 @@ package relay
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -342,7 +344,7 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		return &Result{
 			Status:  http.StatusBadGateway,
 			Header:  http.Header{"Content-Type": []string{"application/json"}},
-			Body:    errorBody(fmt.Sprintf("上游连接失败：%v", err), "upstream_error"),
+			Body:    errorBody(describeUpstreamError(err), "upstream_error"),
 			Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
 		}, true, nil
 	}
@@ -429,6 +431,32 @@ func (s *releaseOnClose) Close() error {
 		s.release()
 	}
 	return err
+}
+
+// describeUpstreamError 把网络错误归成给调用方看的类别。
+//
+// Go 的错误文本里带完整的上游地址（Post "https://…/v1/chat/completions": dial tcp …），
+// 回给下游等于把号池用的是哪家上游、哪个地址全告诉对方。完整原文仍记在账号的
+// 「最近错误」里（NoteError），管理员在控制台照样看得到。
+func describeUpstreamError(err error) string {
+	var dnsErr *net.DNSError
+	var certErr *tls.CertificateVerificationError
+	var netErr net.Error
+	switch {
+	case errors.As(err, &dnsErr):
+		return "上游连接失败：域名解析失败"
+	case errors.As(err, &certErr):
+		return "上游连接失败：TLS 证书校验失败"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "上游连接失败：连接或响应超时"
+	case strings.Contains(err.Error(), "未返回响应"):
+		return "上游连接失败：" + err.Error() // 我们自己的超时文案，不含地址
+	case strings.Contains(err.Error(), "connection refused"):
+		return "上游连接失败：连接被拒绝"
+	case strings.Contains(err.Error(), "tls:"):
+		return "上游连接失败：TLS 握手失败"
+	}
+	return "上游连接失败：网络错误"
 }
 
 // RefusedBeforeAccept 是上游「没受理就拒绝」的状态码：换号重试不会重复执行请求。

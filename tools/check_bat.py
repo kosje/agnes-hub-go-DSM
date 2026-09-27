@@ -18,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BAT = os.path.join(ROOT, "agnes-hub-go.bat")
 BAT_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bat_src.utf8")
 BIN_NAME = "agnes-hub-go.exe"
-EXE_LINE = '"%BIN%" -host %HOST% -port %PORT% -data "%DATADIR%"'
+EXE_LINE = '"%BINPATH%" -host %HOST% -port %PORT% -data "%DATADIR%"'
 STUB_LINE = "echo [stub] skipped-exe host=%HOST% port=%PORT% datadir=%DATADIR%"
 
 with open(BAT, "r", encoding="gbk") as f:

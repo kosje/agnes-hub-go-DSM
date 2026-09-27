@@ -142,11 +142,18 @@ Model      agnes-auto
 | `POST /v1/responses`、`POST /v1/messages` | 兼容 Anthropic / Responses 形态 |
 | `POST /v1/images/generations` | 显式生图端点（端点即意图） |
 | `POST /v1/videos` | 显式生视频提交（异步任务） |
-| `GET /v1/videos/{job_id}` | 轮询视频任务；下游只见 job_id，网关负责映射上游 video_id |
-| `GET /agnesapi` | /v1 双斜杠坑的兼容入口 |
+| `GET /v1/videos/{job_id}` | 轮询视频任务；下游只见 job_id，网关负责映射上游 video_id。**只有提交该任务的那把密钥能查**（需允许 video 池），别人的任务一律 404 |
+| `GET /agnesapi?video_id=…` | 官方查询形态的兼容入口。只能查经本网关提交、且属于调用方的任务；查询参数取自本地记录，不透传调用方的 query |
 | `GET /v1/models` | 模型目录（含 `agnes-auto` 与全部已知模型 + 别名） |
 | `POST /v1/intent/preview` | **干跑**：只判模态、不调上游、不消耗配额 |
 | `GET /healthz` | 健康检查 |
+| `GET /metrics` | Prometheus 指标。本机抓取免鉴权；从其它机器抓取需带任意有效下游密钥（`Authorization: Bearer <key>`）或管理员登录 |
+
+> **额度**：下游密钥的每日 / 总额度把「正在处理中的请求」也算在内，并发请求不会超额；
+> 只有成功的请求才计费，上游报错（包括连不上）不扣额度。
+>
+> **数据保留**：「设置」里的日志保留天数与图片记录保留天数由后台每 6 小时执行一次，
+> 过期的用量日志行与图片记录会被删除。
 
 ---
 

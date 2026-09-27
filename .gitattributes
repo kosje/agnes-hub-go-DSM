@@ -1,0 +1,11 @@
+# Windows 批处理：必须保持 CRLF（cmd.exe 对 LF 行尾的批处理会出现 goto / 标签解析错乱），
+# 而且它是 GBK 编码的 —— 不能让 Git 按文本做任何换行转换。
+*.bat -text
+*.cmd -text
+
+# 二进制产物：绝不做换行转换，也不做文本 diff。
+*.spk binary
+*.tgz binary
+*.png binary
+*.PNG binary
+*.exe binary

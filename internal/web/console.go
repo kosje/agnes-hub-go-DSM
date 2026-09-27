@@ -234,6 +234,7 @@ func (s *Server) apiListAccounts(w http.ResponseWriter, r *http.Request) {
 			"id": a.ID, "name": a.Name, "group": a.Group,
 			"base_url": a.BaseURL, "access_type": a.AccessType,
 			"enabled": a.Enabled, "class_enabled": a.ClassesEnabled,
+			"revive_at": a.ReviveAt, "breaker_trips": a.BreakerTrips,
 			"model_manifest": a.ModelManifest,
 			"api_key_masked": mask(a.APIKey),
 			"rpm_base":       base, "rpm_effective": eff, "declared": declared,
@@ -347,6 +348,16 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
+	if v, ok := body["access_type"]; ok && !config.StringInSlice(asStr(v), config.AccessTypes) {
+		writeErr(w, badRequest("未知 access_type："+asStr(v)))
+		return
+	}
+	if v, ok := body["base_url"]; ok {
+		if u := strings.TrimSpace(asStr(v)); u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			writeErr(w, badRequest("base_url 必须以 http:// 或 https:// 开头"))
+			return
+		}
+	}
 	found := s.Store.MutateAccount(id, func(a *config.Account) bool {
 		changed := false
 		setStr := func(key string, dst *string) {
@@ -365,6 +376,11 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		setStr("access_type", &a.AccessType)
 		setStr("default_model", &a.DefaultModel)
 		setBool("enabled", &a.Enabled)
+		if _, ok := body["enabled"]; ok {
+			// 管理员亲手启用 / 停用，一律以此为准：清掉熔断的复活计划与退避计数。
+			// 否则手动停用的账号会在冷却到期时被自动拉起来。
+			a.ReviveAt, a.BreakerTrips = 0, 0
+		}
 		if v, ok := body["priority"]; ok {
 			n := asInt(v)
 			if n < 0 {
@@ -670,6 +686,7 @@ func (s *Server) apiBulkUpdate(w http.ResponseWriter, r *http.Request) {
 			dirty := false
 			if v, ok := body["enabled"]; ok {
 				a.Enabled, dirty = truthy(v), true
+				a.ReviveAt, a.BreakerTrips = 0, 0 // 同上：手动操作优先于熔断计划
 			}
 			if v, ok := body["max_concurrency"]; ok {
 				if n := asInt(v); n > 0 {
@@ -727,6 +744,21 @@ func (s *Server) apiUpdateKey(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		writeErr(w, e)
 		return
+	}
+	// 池列表：空列表在存储里等于「允许全部池」（历史语义），管理员清空它的本意却是
+	// 「一个都不允许」—— 结果正好相反。所以直接拒绝，想停用密钥请用 enabled=false。
+	if v, exists := body["classes"]; exists {
+		classes := stringList(v)
+		if len(classes) == 0 {
+			writeErr(w, badRequest("至少要允许一个池；想暂停这把密钥请改用「停用」"))
+			return
+		}
+		for _, c := range classes {
+			if c != "*" && !config.StringInSlice(c, config.PoolClasses) {
+				writeErr(w, badRequest("未知的池："+c))
+				return
+			}
+		}
 	}
 	target := asStr(body["key"])
 	ok := s.Store.MutateKey(target, func(k *config.DownstreamKey) bool {
@@ -1833,8 +1865,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		headers["X-Agnes-Hub-Model"] = result.ModelUsed
 		if result.Account != nil {
-			headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-			headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+			s.accountHeaders(r, headers, result.Account)
 		}
 		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
@@ -1861,7 +1892,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case out := <-ch:
-		s.finishChatStream(w, out.result, out.err, decision, opts)
+		s.finishChatStream(w, r, out.result, out.err, decision, opts)
 		return
 	case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
 	}
@@ -1923,7 +1954,7 @@ func (f *flushSSE) Write(p []byte) (int, error) {
 }
 
 // finishChatStream 处理流式结果并写入响应。
-func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, err error,
+func (s *Server) finishChatStream(w http.ResponseWriter, r *http.Request, result *relay.Result, err error,
 	decision intent.Result, opts relay.Options) {
 	if err != nil {
 		writeErr(w, relayError(err))
@@ -1935,8 +1966,7 @@ func (s *Server) finishChatStream(w http.ResponseWriter, result *relay.Result, e
 	}
 	headers["X-Agnes-Hub-Model"] = result.ModelUsed
 	if result.Account != nil {
-		headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-		headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+		s.accountHeaders(r, headers, result.Account)
 	}
 	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
@@ -2134,8 +2164,7 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 	}
 	headers["X-Agnes-Hub-Model"] = result.ModelUsed
 	if result.Account != nil {
-		headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-		headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+		s.accountHeaders(r, headers, result.Account)
 	}
 	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
@@ -2197,6 +2226,7 @@ func (s *Server) recordVideoJob(result *relay.Result, raw []byte) *config.VideoJ
 		Model:     result.ModelUsed,
 		Status:    "submitted",
 		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
+		Owner:     jobOwnerWeb,
 	}
 	if result.Account != nil {
 		job.AccountID = result.Account.ID

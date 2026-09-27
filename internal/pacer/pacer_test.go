@@ -220,3 +220,19 @@ func TestReset(t *testing.T) {
 		t.Fatalf("Reset 后不应再有积压，实际 %s", w)
 	}
 }
+
+// 上调 RPM 时，下一个空槽也必须与最后一个已排定的发送至少隔一个新间隔。
+// 旧实现把它夹紧到「现在 + 新间隔 × 排队人数」，会让新来的请求紧贴着上一个发出去。
+func TestReconfigureKeepsGapAfterLastScheduled(t *testing.T) {
+	p := New(60, 60) // 间隔 1s
+	for i := 0; i < 5; i++ {
+		go func() { _, _ = p.Reserve(context.Background(), 0, 0) }()
+	}
+	time.Sleep(50 * time.Millisecond)
+	// 5 个已排定：最后一个约在 +4s；下一个空槽约在 +5s
+	p.Reconfigure(63, 60) // 间隔 ≈ 0.952s
+	w := p.ProjectedWait()
+	if w < 4*time.Second+900*time.Millisecond {
+		t.Fatalf("下一个空槽应在最后一个已排定发送之后至少一个新间隔（≈4.95s），实际 %s", w)
+	}
+}

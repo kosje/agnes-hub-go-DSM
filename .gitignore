@@ -1,5 +1,7 @@
 # 编译产物（由 go build 交叉编译生成，只走 GitHub Release，不入库）
-*.exe~        # Go 链接器覆盖运行中的 exe 时留下的备份
+# *.exe~ 是 Go 链接器覆盖运行中的 exe 时留下的备份。
+# 注意 .gitignore 不支持行内注释：原来写成「*.exe~        # ...」时整行都被当成模式，等于没生效。
+*.exe~
 *.exe
 agnes-hub-go
 agnes-hub-go-linux-amd64
@@ -9,6 +11,10 @@ baipiao-hub-linux-arm64
 
 # 运行期数据：含上游 API Key 与管理员口令散列，绝不提交
 data/
+
+# 上游仓库带过来的构建期残留，不属于本项目
+.workbuddy/
+server.err
 
 # 验证脚本的临时产物
 .smoke/

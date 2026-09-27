@@ -26,7 +26,10 @@ func buildListeners(host, port string) ([]net.Listener, error) {
 	}
 
 	var listeners []net.Listener
-	if l, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", port)); err == nil {
+	// 必须是 tcp4：Go 对 "tcp" + 通配地址会直接开一个 IPv6 双栈套接字，
+	// 于是下面带 V6ONLY 的 [::] 必然 bind 失败（address already in use），
+	// 每次启动都打一条假的 IPv6 失败警告。
+	if l, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", port)); err == nil {
 		listeners = append(listeners, l)
 	} else {
 		log.Printf("警告：IPv4(0.0.0.0) 监听失败：%v", err)
@@ -44,7 +47,7 @@ func buildListeners(host, port string) ([]net.Listener, error) {
 			return sockErr
 		},
 	}
-	if l, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort("::", port)); err == nil {
+	if l, err := lc.Listen(context.Background(), "tcp6", net.JoinHostPort("::", port)); err == nil {
 		listeners = append(listeners, l)
 	} else {
 		log.Printf("警告：IPv6(::) 监听失败：%v", err)

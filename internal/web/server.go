@@ -11,9 +11,12 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -211,15 +214,48 @@ func readBody(r *http.Request) (map[string]any, []byte, *apiError) {
 	return body, raw, nil
 }
 
-func (s *Server) gate(item *config.DownstreamKey, poolClass string) *apiError {
-	if msg := s.Store.QuotaExceeded(item); msg != "" {
-		return &apiError{Status: 429, Message: msg, Type: "rate_limit_error", Code: "quota_exceeded"}
-	}
+// gate 检查池权限并占用一个额度名额。成功时返回的 release 必须在请求结束时调用
+// （通常直接 defer），它只释放在途名额，真正的计费仍由成功路径的 ChargeKey 完成。
+func (s *Server) gate(item *config.DownstreamKey, poolClass string) (func(), *apiError) {
 	if !config.KeyAllowsClass(item, poolClass) {
-		return &apiError{Status: 403, Type: "permission_error",
+		return nil, &apiError{Status: 403, Type: "permission_error",
 			Message: fmt.Sprintf("该密钥不允许调用 %s 池", poolClass)}
 	}
-	return nil
+	release, msg := s.Store.ReserveQuota(item.Key)
+	if msg != "" {
+		return nil, &apiError{Status: 429, Message: msg, Type: "rate_limit_error", Code: "quota_exceeded"}
+	}
+	return release, nil
+}
+
+// accountHeaders 只给管理员会话带上承载账号的名称与 ID（控制台 / 自家网页排障用）。
+//
+// 下游密钥的持有者往往是第三方：他们不该知道号池里有几个账号、各叫什么名字
+// （账号名常常就是邮箱或手机号）。旧版本对所有调用方都回这两个头。
+func (s *Server) accountHeaders(r *http.Request, headers map[string]string, a *config.Account) {
+	if a == nil || r == nil || !s.authed(r) {
+		return
+	}
+	headers["X-Agnes-Hub-Account"] = safeHeader(a.Name)
+	headers["X-Agnes-Hub-Account-Id"] = a.ID
+}
+
+// keyOwner 是写进任务记录的调用方标识：密钥的摘要而不是明文，任务文件泄露也拿不到密钥。
+func keyOwner(item *config.DownstreamKey) string {
+	if item == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(item.Key))
+	return "key:" + hex.EncodeToString(sum[:8])
+}
+
+// jobOwnerWeb 标记网关自家网页创建的任务：只有网页会话能查，下游密钥查不到。
+const jobOwnerWeb = "web"
+
+// jobVisibleToKey 判断下游密钥能否查询该视频任务。
+// 没有 Owner 的是 1.0.24 及以前留下的记录，按旧行为放行。
+func jobVisibleToKey(job *config.VideoJob, item *config.DownstreamKey) bool {
+	return job.Owner == "" || job.Owner == keyOwner(item)
 }
 
 func headerMap(r *http.Request) map[string]string {
@@ -418,7 +454,31 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 //   - 只暴露最重要的计数器和 gauge：请求量、成功/错误、队列、熔断状态、
 //     每账号的冷却剩余时间、到达密度等。
 //   - 不使用 prometheus.Client 依赖（保持零外部依赖），自己拼行。
+//
+// metricsAllowed：本机抓取、管理员会话，或任意有效的下游密钥（Bearer）。
+// 指标里有全部账号的 ID、名称与健康状态，旧版本对任何人开放。
+func (s *Server) metricsAllowed(r *http.Request) bool {
+	if ip := net.ParseIP(clientIP(r)); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	if s.authed(r) {
+		return true
+	}
+	_, e := s.downstreamKey(r)
+	return e == nil
+}
+
+// promLabel 按 Prometheus 文本格式转义标签值：账号名里的引号、反斜杠、换行会破坏整份输出。
+func promLabel(v string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(v)
+}
+
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !s.metricsAllowed(r) {
+		writeErr(w, &apiError{Status: 401, Type: "invalid_request_error",
+			Message: "指标接口需要下游密钥（Authorization: Bearer <key>）或管理员登录"})
+		return
+	}
 	h := s.Hub
 	m := &h.Metrics
 	startedAt := h.Metrics.StartedAt.Unix()
@@ -519,7 +579,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			enabledLabel = "1"
 		}
 		sb.WriteString(fmt.Sprintf("agnes_hub_account_penalty_remaining_sec{account_id=\"%s\",account_name=\"%s\",enabled=\"%s\"} %.2f\n",
-			g.id, g.name, enabledLabel, g.penaltyRemainingSec))
+			promLabel(g.id), promLabel(g.name), enabledLabel, g.penaltyRemainingSec))
 	}
 
 	sb.WriteString("# HELP agnes_hub_account_consecutive_failures Consecutive error count per account\n")
@@ -527,7 +587,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# LABELS account_id,account_name\n")
 	for _, g := range gauges {
 		sb.WriteString(fmt.Sprintf("agnes_hub_account_consecutive_failures{account_id=\"%s\",account_name=\"%s\"} %d\n",
-			g.id, g.name, g.consecutiveFailures))
+			promLabel(g.id), promLabel(g.name), g.consecutiveFailures))
 	}
 
 	sb.WriteString("# HELP agnes_hub_request_timeout_ms Configured request timeout\n")
@@ -615,10 +675,12 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 	if !isAutoModel(requested, settings) {
 		poolClass = pool.Classify(requested, body, settings.ModelAliases, settings.DefaultImageTier)
 	}
-	if e := s.gate(item, poolClass); e != nil {
+	release, e := s.gate(item, poolClass)
+	if e != nil {
 		writeErr(w, e)
 		return
 	}
+	defer release()
 
 	var requiredModel string
 	bodyFor := func(a *config.Account) ([]byte, string) { return nil, "" }
@@ -777,15 +839,12 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 
 	// 先按分辨率定池，再选模型
 	preliminary := pool.PoolForModality(intent.Image, body, settings.DefaultImageTier)
-	if msg := s.Store.QuotaExceeded(item); msg != "" {
-		writeErr(w, &apiError{Status: 429, Message: msg, Type: "rate_limit_error", Code: "quota_exceeded"})
+	release, e := s.gate(item, preliminary)
+	if e != nil {
+		writeErr(w, e)
 		return
 	}
-	if !config.KeyAllowsClass(item, preliminary) {
-		writeErr(w, &apiError{Status: 403, Type: "permission_error",
-			Message: fmt.Sprintf("该密钥不允许调用 %s 池", preliminary)})
-		return
-	}
+	defer release()
 
 	model, e := s.pickMediaModel(settings, decision, intent.Image)
 	if e != nil {
@@ -798,6 +857,13 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	decision.DroppedFields = intent.DroppedFields(body, intent.ImageFieldWhitelist)
 
 	poolClass := pool.PoolForModality(intent.Image, upstreamBody, settings.DefaultImageTier)
+	// 默认尺寸补全后池分类可能变了（例如默认档位与默认尺寸不一致），得按最终的池再核一次权限，
+	// 否则一把只允许 image_1k 的密钥可以借默认尺寸打到更贵的档位。
+	if poolClass != preliminary && !config.KeyAllowsClass(item, poolClass) {
+		writeErr(w, &apiError{Status: 403, Type: "permission_error",
+			Message: fmt.Sprintf("该密钥不允许调用 %s 池", poolClass)})
+		return
+	}
 
 	sessionKey := s.Hub.SessionKey(headerMap(r), item.Key)
 	bodyFor := s.mediaBodyFor(upstreamBody, settings, decision, poolClass, intent.Image, model)
@@ -813,8 +879,20 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.Store.ChargeKey(item.Key)
 	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts)
+
+	extra := decision.Headers()
+	s.accountHeaders(r, extra, result.Account)
+	extra["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
+	extra["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
+
+	// 失败的请求不计费、不进图片记录。旧实现先扣额度、先记一条 completed，
+	// 再判断上游状态码 —— 连上游连不上（relay 合成的 502）都会被扣费。
+	if result.Status >= 400 {
+		writeJSON(w, result.Status, errorPayload(result.Status, raw), extra)
+		return
+	}
+	s.Store.ChargeKey(item.Key)
 
 	// 记录图片生成结果（便于控制台查看历史）
 	requestID := config.NewID("img")
@@ -851,22 +929,17 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 			break
 		}
 		if b64, ok := item["b64_json"].(string); ok && b64 != "" {
-			imgJob.URL = "data:image/png;base64," + b64
+			// 落盘后只记本地地址。旧实现把整段 base64（常见几 MB）塞进 image_jobs.json，
+			// 而每次生图都要整份重写这个文件，还是在全局写锁里。
+			if data, err := decodeBase64Loose(b64); err == nil {
+				if local, ok := s.saveMediaBytes(imageKind, data, ""); ok {
+					imgJob.URL = local
+				}
+			}
 			break
 		}
 	}
 	s.Store.PutImageJob(imgJob)
-
-	extra := decision.Headers()
-	extra["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-	extra["X-Agnes-Hub-Account-Id"] = result.Account.ID
-	extra["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
-	extra["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
-
-	if result.Status >= 400 {
-		writeJSON(w, result.Status, errorPayload(result.Status, raw), extra)
-		return
-	}
 
 	// 官方形态：原样返回上游结构，程序化客户端零影响
 	if !chatShape {
@@ -898,14 +971,12 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	body map[string]any, decision intent.Result, settings config.Settings, chatShape, stream bool) {
 
 	poolClass := "video"
-	if msg := s.Store.QuotaExceeded(item); msg != "" {
-		writeErr(w, &apiError{Status: 429, Message: msg, Type: "rate_limit_error", Code: "quota_exceeded"})
+	release, e := s.gate(item, poolClass)
+	if e != nil {
+		writeErr(w, e)
 		return
 	}
-	if !config.KeyAllowsClass(item, poolClass) {
-		writeErr(w, &apiError{Status: 403, Type: "permission_error", Message: "该密钥不允许调用 video 池"})
-		return
-	}
+	defer release()
 	model, e := s.pickMediaModel(settings, decision, intent.Video)
 	if e != nil {
 		writeErr(w, e)
@@ -930,8 +1001,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts)
 
 	extra := decision.Headers()
-	extra["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-	extra["X-Agnes-Hub-Account-Id"] = result.Account.ID
+	s.accountHeaders(r, extra, result.Account)
 	extra["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 
 	if result.Status >= 400 {
@@ -948,6 +1018,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 		AccountID: result.Account.ID,
 		Status:    "submitted",
 		CreatedAt: float64(time.Now().UnixNano()) / 1e9,
+		Owner:     keyOwner(item),
 	}
 	s.Store.PutJob(job)
 	s.Store.ChargeKey(item.Key)
@@ -1026,6 +1097,16 @@ func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job 
 }
 
 func (s *Server) pollUpstream(ctx context.Context, account *config.Account, job *config.VideoJob) map[string]any {
+	status, raw, err := s.pollUpstreamRaw(ctx, account, job)
+	if err != nil || status >= 400 {
+		return nil
+	}
+	return decodeMap(raw)
+}
+
+// pollUpstreamRaw 用任务记录里的上下文（video_id / model_name）向承载账号查询一次。
+// 查询参数只来自本地记录，绝不透传调用方的 query。
+func (s *Server) pollUpstreamRaw(ctx context.Context, account *config.Account, job *config.VideoJob) (int, []byte, error) {
 	settings := s.Store.SettingsSnapshot()
 	path := settings.VideoPollPath
 	if path == "" {
@@ -1033,7 +1114,7 @@ func (s *Server) pollUpstream(ctx context.Context, account *config.Account, job 
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, relay.UpstreamURL(account, path), nil)
 	if err != nil {
-		return nil
+		return 0, nil, err
 	}
 	q := req.URL.Query()
 	q.Set("video_id", job.VideoID)
@@ -1046,14 +1127,11 @@ func (s *Server) pollUpstream(ctx context.Context, account *config.Account, job 
 	}
 	resp, err := s.Client.Do(req)
 	if err != nil {
-		return nil
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		return nil
-	}
-	return decodeMap(raw)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return resp.StatusCode, raw, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,13 +1139,19 @@ func (s *Server) pollUpstream(ctx context.Context, account *config.Account, job 
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleVideoPoll(w http.ResponseWriter, r *http.Request) {
-	if _, e := s.downstreamKey(r); e != nil {
+	item, e := s.downstreamKey(r)
+	if e != nil {
 		writeErr(w, e)
+		return
+	}
+	if !config.KeyAllowsClass(item, "video") {
+		writeErr(w, &apiError{Status: 403, Type: "permission_error", Message: "该密钥不允许调用 video 池"})
 		return
 	}
 	jobID := r.PathValue("job_id")
 	job, ok := s.Store.JobByID(jobID)
-	if !ok {
+	// 别人的任务一律按「不存在」回，不暴露它存在与否。
+	if !ok || !jobVisibleToKey(job, item) {
 		writeErr(w, &apiError{Status: 404, Type: "invalid_request_error", Message: "未知的 job_id：" + jobID})
 		return
 	}
@@ -1086,9 +1170,19 @@ func (s *Server) handleVideoPoll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, data, nil)
 }
 
+// handleAgnesAPI 兼容官方的 GET /agnesapi?video_id=... 查询形态。
+//
+// 只查经本网关提交、且属于调用方的任务，参数取自本地任务记录。旧实现对不认识的
+// video_id 会随手挑一个视频账号、把调用方整串 query 原样带上它的凭据发给上游 ——
+// 任何一把下游密钥（哪怕只允许文本）都能借池里的账号查任意任务、不受节拍限制地打上游。
 func (s *Server) handleAgnesAPI(w http.ResponseWriter, r *http.Request) {
-	if _, e := s.downstreamKey(r); e != nil {
+	item, e := s.downstreamKey(r)
+	if e != nil {
 		writeErr(w, e)
+		return
+	}
+	if !config.KeyAllowsClass(item, "video") {
+		writeErr(w, &apiError{Status: 403, Type: "permission_error", Message: "该密钥不允许调用 video 池"})
 		return
 	}
 	videoID := strings.TrimSpace(r.URL.Query().Get("video_id"))
@@ -1096,44 +1190,23 @@ func (s *Server) handleAgnesAPI(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badRequest("缺少 video_id 参数"))
 		return
 	}
-	var account *config.Account
-	if job, ok := s.Store.JobByVideoID(videoID); ok {
-		account = s.Store.AccountByID(job.AccountID)
+	job, ok := s.Store.JobByVideoID(videoID)
+	if !ok || !jobVisibleToKey(job, item) {
+		writeErr(w, &apiError{Status: 404, Type: "invalid_request_error",
+			Message: "未知的 video_id（只能查询经本网关提交的任务）：" + videoID})
+		return
 	}
+	account := s.Store.AccountByID(job.AccountID)
 	if account == nil {
-		for _, a := range s.Store.AccountsSnapshot() {
-			if a.Enabled && strings.TrimSpace(a.APIKey) != "" && len(s.Hub.DeclaredModels(a, "video")) > 0 {
-				account = a
-				break
-			}
-		}
-	}
-	if account == nil {
-		writeErr(w, &apiError{Status: 503, Type: "upstream_error", Message: "没有可用账号"})
+		writeErr(w, &apiError{Status: 410, Type: "upstream_error", Message: "创建该任务的上游账号已不存在"})
 		return
 	}
-	settings := s.Store.SettingsSnapshot()
-	path := settings.VideoPollPath
-	if path == "" {
-		path = "/agnesapi"
-	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, relay.UpstreamURL(account, path), nil)
+	status, raw, err := s.pollUpstreamRaw(r.Context(), account, job)
 	if err != nil {
-		writeErr(w, badRequest(err.Error()))
+		writeErr(w, &apiError{Status: 502, Type: "upstream_error", Message: "轮询上游失败"})
 		return
 	}
-	req.URL.RawQuery = r.URL.RawQuery
-	for k, v := range relay.ClientHeaders(account, nil, false) {
-		req.Header[k] = v
-	}
-	resp, err := s.Client.Do(req)
-	if err != nil {
-		writeErr(w, &apiError{Status: 502, Type: "upstream_error", Message: "轮询上游失败：" + err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	writeJSON(w, resp.StatusCode, decodeOrRaw(raw), nil)
+	writeJSON(w, status, decodeOrRaw(raw), nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,8 +1279,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		}
 		headers["X-Agnes-Hub-Model"] = result.ModelUsed
 		if result.Account != nil {
-			headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-			headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+			s.accountHeaders(r, headers, result.Account)
 		}
 		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
@@ -1239,7 +1311,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 
 	select {
 	case out := <-ch:
-		s.finishStream(w, item, out.result, out.err, decision, opts, true)
+		s.finishStream(w, r, item, out.result, out.err, decision, opts, true)
 		return
 	case <-time.After(keepalive):
 	case <-ctx.Done():
@@ -1281,8 +1353,8 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 				return
 			}
 			s.Store.ChargeKey(item.Key)
-			writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub account=%s wait_ms=%d attempts=%d model=%s",
-				safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
+			writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub wait_ms=%d attempts=%d model=%s",
+				result.WaitMS, result.Attempts, result.ModelUsed))
 			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
 			result.Close()
 			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
@@ -1296,7 +1368,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 }
 
 // finishStream 已拿到上游响应，按真实状态码回给客户端。
-func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey, result *relay.Result,
+func (s *Server) finishStream(w http.ResponseWriter, r *http.Request, item *config.DownstreamKey, result *relay.Result,
 	err error, decision intent.Result, opts relay.Options, streamMode bool) {
 
 	if err != nil {
@@ -1318,8 +1390,7 @@ func (s *Server) finishStream(w http.ResponseWriter, item *config.DownstreamKey,
 		headers[k] = v
 	}
 	headers["X-Agnes-Hub-Model"] = result.ModelUsed
-	headers["X-Agnes-Hub-Account"] = safeHeader(result.Account.Name)
-	headers["X-Agnes-Hub-Account-Id"] = result.Account.ID
+	s.accountHeaders(r, headers, result.Account)
 	headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 	headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 	headers["Content-Type"] = "text/event-stream"

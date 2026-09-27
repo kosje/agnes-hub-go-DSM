@@ -28,6 +28,17 @@ func newTempStore(t *testing.T) *config.Store {
 	return store
 }
 
+// newLocalUpstreamServer 返回一个把 127.0.0.1 登记为账号上游的 Server。
+//
+// 测试里的「CDN」都是本机 httptest，而回取客户端只对账号自己的上游主机放行
+// 内网 / 本机地址（SSRF 防护），所以得像真实部署里的局域网中转一样先登记。
+func newLocalUpstreamServer(t *testing.T) *Server {
+	t.Helper()
+	store := newTempStore(t)
+	store.AddAccount("local-upstream", "k-local", "free", "http://127.0.0.1/v1", nil)
+	return &Server{Store: store}
+}
+
 // onePixelPNG 是一张合法的 1x1 PNG。
 //
 // 必须用真图：mediaFetchClient 在 Content-Type 不可信时会用 http.DetectContentType
@@ -68,7 +79,7 @@ func TestLocalizeImageURLConservativeFallbacks(t *testing.T) {
 		[]byte("<!doctype html><html><head><title>Attention Required!</title></head></html>"))
 	notFound := serve("text/plain", http.StatusNotFound, []byte("gone"))
 
-	s := &Server{Store: newTempStore(t)}
+	s := newLocalUpstreamServer(t)
 
 	// 原样返回的几种情况
 	for _, c := range []struct{ name, in string }{
@@ -117,7 +128,7 @@ func TestLocalizeImageURLDeduplicates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := &Server{Store: newTempStore(t)}
+	s := newLocalUpstreamServer(t)
 	first := s.localizeImageURL(context.Background(), srv.URL+"/a.png", "")
 	second := s.localizeImageURL(context.Background(), srv.URL+"/b.png", "")
 	if first != second {

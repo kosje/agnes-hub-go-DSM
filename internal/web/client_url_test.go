@@ -198,7 +198,7 @@ func TestPublicBaseURLFromTLS(t *testing.T) {
 
 // TestLocalizeURLHonoursExplicitBase 显式配置要真的作用到落盘地址上。
 func TestLocalizeURLHonoursExplicitBase(t *testing.T) {
-	s := &Server{Store: newTempStore(t)}
+	s := newLocalUpstreamServer(t)
 	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write([]byte{0x89, 'P', 'N', 'G'})

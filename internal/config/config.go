@@ -7,10 +7,12 @@
 package config
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -176,6 +178,13 @@ type Account struct {
 	// Priority 调用优先级（数字越大越优先）。同优先级内按「首选区域 → 预计等待 → 在途」排序。
 	// 默认 0。用于手动把某些账号顶到前面（例如更稳的渠道、或想优先吃满的账号）。
 	Priority int `json:"priority"`
+	// BreakerTrips 是自上次成功以来因鉴权失败（401/403）被熔断的连续次数，
+	// 决定下一次自动复活要等多久（指数退避），超过上限即不再自动复活。
+	BreakerTrips int `json:"breaker_trips,omitempty"`
+	// ReviveAt 是熔断后计划自动复活的时间（unix 秒）。0 表示不会自动复活：
+	// 没熔断、管理员手动停用，或连续熔断次数太多已放弃。落盘是为了进程重启后照常复活 ——
+	// 旧版本只存在内存里，重启后被熔断的账号就永远停着，和手动停用分不清。
+	ReviveAt float64 `json:"revive_at,omitempty"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -218,6 +227,10 @@ type VideoJob struct {
 	// （实测会退化成显示 alt 文本），得回上游那个公网 https 地址给它；
 	// 而网关自己的网页与网关同源，用本地副本。两个地址都要存下来才选得出来。
 	SourceURL string `json:"source_url,omitempty"`
+	// Owner 是创建该任务的调用方：下游密钥为 "key:<密钥摘要>"，网关网页为 "web"。
+	// 查询任务时据此做归属校验 —— 否则任何一把下游密钥都能拿池里账号的凭据
+	// 去查别人的任务。1.0.24 及以前的记录没有这个字段（空串），按旧行为放行。
+	Owner string `json:"owner,omitempty"`
 }
 
 // ImageJob 是图片任务映射（下游 request_id → 上游 image_id + 产出 URL + 承载账号）。
@@ -415,6 +428,11 @@ type Store struct {
 
 	adminSessions *sessionTable
 	chatSessions  *sessionTable
+
+	// keyInflight 是各下游密钥「已通过额度检查、尚未结束」的请求数（受 mu 保护）。
+	keyInflight map[string]int
+	// usageMu 串行化 usage.jsonl 的追加与保留期改写，避免改写期间追加的行丢失。
+	usageMu sync.Mutex
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -703,24 +721,31 @@ func writeJSON(path string, payload any) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
+	// 把上一版挪成 .bak 再换上新版：新版万一坏了（断电、磁盘错误），readJSON
+	// 还能退回上一版，而不是整份配置归零 —— settings.json 归零意味着管理员密码
+	// 回落到初始值，accounts.json 归零意味着账号全丢。
+	if _, err := os.Stat(path); err == nil {
+		_ = os.Rename(path, path+".bak")
+	}
 	return os.Rename(tmp, path)
 }
 
 func readJSON(path string, out any) error {
 	buf, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if len(strings.TrimSpace(string(buf))) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(buf, out); err != nil {
-		// 坏文件不应让服务起不来：备份后按默认值继续
+	if err == nil && len(strings.TrimSpace(string(buf))) > 0 {
+		if json.Unmarshal(buf, out) == nil {
+			return nil
+		}
+		// 坏文件留一份现场，再尝试上一版。
 		_ = os.WriteFile(path+".broken", buf, 0o600)
-		return nil
+	}
+	// 主文件缺失或损坏：退回 writeJSON 留下的上一版（写入中途断电时主文件可能不存在）。
+	// 上一版也没有就按默认值继续 —— 坏文件不应让服务起不来。
+	if bak, err := os.ReadFile(path + ".bak"); err == nil && len(strings.TrimSpace(string(bak))) > 0 {
+		_ = json.Unmarshal(bak, out)
 	}
 	return nil
 }
@@ -1086,7 +1111,55 @@ func KeyAllowsClass(k *DownstreamKey, poolClass string) bool {
 	return false
 }
 
-// QuotaExceeded 返回超限原因（空串表示未超限）。
+// ReserveQuota 原子地检查额度并占一个在途名额；返回的 release 必须在请求结束时调用。
+//
+// 旧实现「先查 QuotaExceeded、上游返回后才 ChargeKey」：N 个并发请求在额度只剩 1 时
+// 会全部通过检查，超额多少只取决于并发数和上游耗时（视频、长流式最明显）。
+// 这里把在途请求也算进已用量，检查与占位在同一把锁内完成。
+func (s *Store) ReserveQuota(value string) (release func(), msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var k *DownstreamKey
+	for _, it := range s.Keys {
+		if it.Key == value {
+			k = it
+			break
+		}
+	}
+	if k == nil {
+		return func() {}, "下游密钥不存在"
+	}
+	inflight := int64(s.keyInflight[value])
+	usedToday := int64(0)
+	if k.UsedDate == time.Now().Format("2006-01-02") {
+		usedToday = k.UsedToday
+	}
+	if k.DailyQuota > 0 && usedToday+inflight >= k.DailyQuota {
+		return func() {}, fmt.Sprintf("下游密钥已达每日额度上限（%d）", k.DailyQuota)
+	}
+	if k.TotalQuota > 0 && k.UsedTotal+inflight >= k.TotalQuota {
+		return func() {}, fmt.Sprintf("下游密钥已达总额度上限（%d）", k.TotalQuota)
+	}
+	if s.keyInflight == nil {
+		s.keyInflight = map[string]int{}
+	}
+	s.keyInflight[value]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.keyInflight[value] <= 1 {
+				delete(s.keyInflight, value)
+			} else {
+				s.keyInflight[value]--
+			}
+		})
+	}, ""
+}
+
+// QuotaExceeded 返回超限原因（空串表示未超限）。只看已计费的用量、不含在途请求，
+// 请求路径上请用 ReserveQuota。
 func (s *Store) QuotaExceeded(k *DownstreamKey) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1185,7 +1258,10 @@ func (s *Store) PutJob(job *VideoJob) {
 	if s.Jobs == nil {
 		s.Jobs = map[string]*VideoJob{}
 	}
-	s.Jobs[job.JobID] = job
+	// 存副本：调用方拿着 job 还会继续改（补 URL / 状态后再 PutJob），
+	// 直接存它的指针等于在锁外写一个快照读取方正在锁内拷贝的对象。
+	cp := *job
+	s.Jobs[job.JobID] = &cp
 	s.evictVideoJobsLocked()
 	_ = s.saveJobsLocked()
 }
@@ -1273,7 +1349,8 @@ func (s *Store) PutImageJob(job *ImageJob) {
 	if s.ImageJobs == nil {
 		s.ImageJobs = map[string]*ImageJob{}
 	}
-	s.ImageJobs[job.JobID] = job
+	cp := *job
+	s.ImageJobs[job.JobID] = &cp
 	s.evictImageJobsLocked()
 	_ = s.saveImageJobsLocked()
 }
@@ -1410,6 +1487,8 @@ func (s *Store) AppendUsage(record map[string]any) {
 	if err != nil {
 		return
 	}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
 	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return
@@ -1419,12 +1498,39 @@ func (s *Store) AppendUsage(record map[string]any) {
 }
 
 // TailUsage 读取最近 n 条日志（倒序）。
+//
+// 只读文件尾部一段：旧实现每次都把整个 usage.jsonl 读进内存，而控制台每次刷新都调它。
 func (s *Store) TailUsage(n int) []map[string]any {
-	buf, err := os.ReadFile(s.path("usage.jsonl"))
+	f, err := os.Open(s.path("usage.jsonl"))
 	if err != nil {
 		return nil
 	}
-	lines := strings.Split(strings.TrimRight(string(buf), "\n"), "\n")
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	// 单条记录约 300~600 字节，按每条 2 KB 估窗口足够，且至少读 64 KB。
+	window := int64(n) * 2048
+	if window < 64<<10 {
+		window = 64 << 10
+	}
+	start := info.Size() - window
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, info.Size()-start)
+	if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+		return nil
+	}
+	text := string(buf)
+	if start > 0 {
+		// 窗口起点多半落在某行中间，丢掉这半行。
+		if i := strings.IndexByte(text, '\n'); i >= 0 {
+			text = text[i+1:]
+		}
+	}
+	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
@@ -1440,6 +1546,86 @@ func (s *Store) TailUsage(n int) []map[string]any {
 		}
 	}
 	return out
+}
+
+// ---- 保留期 ----
+
+// PruneRetention 按设置里的保留天数清理过期数据，返回删掉的图片记录数与日志行数。
+//
+// 两个保留期设置在控制台里一直能改，但旧版本从没真正执行过：usage.jsonl 只增不减，
+// 图片记录只受条数上限约束。由 main 的维护循环定期调用。
+func (s *Store) PruneRetention(now time.Time) (imagesRemoved, usageRemoved int) {
+	settings := s.SettingsSnapshot()
+
+	if days := settings.ImageRecordRetention; days > 0 {
+		cutoff := float64(now.Add(-time.Duration(days)*24*time.Hour).UnixNano()) / 1e9
+		s.mu.Lock()
+		for id, j := range s.ImageJobs {
+			if j.CreatedAt > 0 && j.CreatedAt < cutoff {
+				delete(s.ImageJobs, id)
+				imagesRemoved++
+			}
+		}
+		if imagesRemoved > 0 {
+			_ = s.saveImageJobsLocked()
+		}
+		s.mu.Unlock()
+	}
+
+	if days := settings.LogRetentionDays; days > 0 {
+		usageRemoved = s.pruneUsageLog(now.Add(-time.Duration(days) * 24 * time.Hour))
+	}
+	return imagesRemoved, usageRemoved
+}
+
+// pruneUsageLog 删掉 usage.jsonl 里早于 cutoff 的行（按行里的 ts 字段）。
+// 流式读写，不把整个文件读进内存；没有可删的行就不重写文件。
+func (s *Store) pruneUsageLog(cutoff time.Time) int {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	path := s.path("usage.jsonl")
+	in, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	tmp := path + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		in.Close()
+		return 0
+	}
+	removed := 0
+	w := bufio.NewWriter(out)
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		var rec struct {
+			TS string `json:"ts"`
+		}
+		if json.Unmarshal(line, &rec) == nil && rec.TS != "" {
+			if t, err := time.ParseInLocation("2006-01-02 15:04:05", rec.TS, time.Local); err == nil && t.Before(cutoff) {
+				removed++
+				continue
+			}
+		}
+		_, _ = w.Write(line)
+		_ = w.WriteByte('\n')
+	}
+	scanErr := sc.Err()
+	in.Close()
+	flushErr := w.Flush()
+	syncErr := out.Sync()
+	out.Close()
+	if removed == 0 || scanErr != nil || flushErr != nil || syncErr != nil {
+		_ = os.Remove(tmp)
+		return 0
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return 0
+	}
+	return removed
 }
 
 // ---- 设置写入 ----

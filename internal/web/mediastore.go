@@ -5,16 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"agneshub/internal/config"
+	"agneshub/internal/relay"
 )
 
 // ---------------------------------------------------------------------------
@@ -98,7 +102,130 @@ var videoKind = mediaKind{
 //
 // 不设全局 Timeout：视频要下几分钟，全局超时会拦腰截断。改用每类的
 // context 超时（见 mediaKind.timeout）。
-var mediaFetchClient = &http.Client{}
+//
+// 地址来自上游响应，按不可信输入对待：只允许连公网地址（SSRF 防护）。
+// 否则一个被攻破或恶意的上游回一个 302 到 http://192.168.1.1/...，网关就会替它
+// 把内网内容取回来、落盘，再以媒体文件的形式公开提供。
+// 检查放在拨号阶段、针对解析后的 IP：跟随跳转与 DNS 重绑定都绕不过去。
+var mediaFetchClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           mediaDialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		MaxIdleConns:          20,
+		IdleConnTimeout:       90 * time.Second,
+	},
+	CheckRedirect: checkMediaRedirect,
+}
+
+// trustedMediaClient 用于取「账号自己的上游主机」上的产出：管理员把账号配到局域网里的
+// 中转时，产出地址本来就在内网，不能一刀切拦掉。
+var trustedMediaClient = &http.Client{CheckRedirect: checkMediaRedirect}
+
+func checkMediaRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("媒体地址跳转次数过多")
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return errors.New("媒体地址只允许 http/https")
+	}
+	return nil
+}
+
+var (
+	errNonPublicAddr = errors.New("媒体地址指向内网或本机，已拒绝")
+	publicOnlyDialer = &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			if ip := net.ParseIP(host); ip == nil || !isPublicIP(ip) {
+				return errNonPublicAddr
+			}
+			return nil
+		}}
+	plainDialer = &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+	// mediaProxyAddrs 是环境变量里配置的代理地址：连代理本身放行（代理多半就在本机，
+	// 例如 127.0.0.1:7890），最终目标由代理去连，这是运维显式做的选择。
+	mediaProxyAddrs = envProxyAddrs()
+)
+
+func mediaDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if mediaProxyAddrs[strings.ToLower(addr)] {
+		return plainDialer.DialContext(ctx, network, addr)
+	}
+	return publicOnlyDialer.DialContext(ctx, network, addr)
+}
+
+// isPublicIP 判断是否为可公开路由的地址。
+//
+// 刻意不拦 198.18.0.0/15：Clash 等代理的 fake-IP 模式会把公网域名解析到这个段，
+// 拦了会让这类用户完全取不到上游产出。
+func isPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		switch {
+		case v4[0] == 0: // 0.0.0.0/8
+			return false
+		case v4[0] == 100 && v4[1]&0xc0 == 64: // 100.64.0.0/10 运营商级 NAT / Tailscale
+			return false
+		case v4.Equal(net.IPv4bcast):
+			return false
+		}
+	}
+	return true
+}
+
+func envProxyAddrs() map[string]bool {
+	out := map[string]bool{}
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v == "" {
+			continue
+		}
+		if !strings.Contains(v, "://") {
+			v = "http://" + v
+		}
+		u, err := url.Parse(v)
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		port := u.Port()
+		if port == "" {
+			switch u.Scheme {
+			case "https":
+				port = "443"
+			case "socks5", "socks5h":
+				port = "1080"
+			default:
+				port = "80"
+			}
+		}
+		out[strings.ToLower(net.JoinHostPort(u.Hostname(), port))] = true
+	}
+	return out
+}
+
+// mediaClientFor 选回取用的客户端：账号上游所在主机用受信客户端，其余一律只准连公网。
+func (s *Server) mediaClientFor(rawURL string) *http.Client {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return mediaFetchClient
+	}
+	host := strings.ToLower(u.Hostname())
+	for _, a := range s.Store.AccountsSnapshot() {
+		if au, err := url.Parse(relay.UpstreamRoot(a)); err == nil && strings.ToLower(au.Hostname()) == host {
+			return trustedMediaClient
+		}
+	}
+	return mediaFetchClient
+}
 
 // mediaDir 返回该类媒体的缓存目录绝对路径。
 //
@@ -175,7 +302,7 @@ func (s *Server) downloadMedia(ctx context.Context, k mediaKind, rawURL string) 
 	if err != nil {
 		return "", false
 	}
-	resp, err := mediaFetchClient.Do(req)
+	resp, err := s.mediaClientFor(rawURL).Do(req)
 	if err != nil {
 		return "", false
 	}
@@ -225,9 +352,12 @@ func (s *Server) downloadMedia(ctx context.Context, k mediaKind, rawURL string) 
 
 	name := hex.EncodeToString(hasher.Sum(nil)[:16]) + ext
 	dest := filepath.Join(dir, name)
-	// 已经存在就跳过写入（内容寻址，同名必同内容）。
+	// 已经存在就跳过写入（内容寻址，同名必同内容）。刷新修改时间：淘汰按修改时间
+	// 从旧到新删，不刷新的话刚被「重新生成」的文件可能正是最旧的那个，返回地址后立刻被删。
 	if _, err := os.Stat(dest); err == nil {
 		_ = os.Remove(tmpName)
+		now := time.Now()
+		_ = os.Chtimes(dest, now, now)
 		return k.route + name, true
 	}
 	// rename 是原子的：并发下前端不会拿到一个只写了一半的文件。
@@ -258,6 +388,8 @@ func (s *Server) saveMediaBytes(k mediaKind, data []byte, mime string) (string, 
 	name := hex.EncodeToString(sum[:16]) + ext
 	dest := filepath.Join(dir, name)
 	if _, err := os.Stat(dest); err == nil {
+		now := time.Now()
+		_ = os.Chtimes(dest, now, now)
 		return k.route + name, true
 	}
 	tmp, err := os.CreateTemp(dir, "dl-*.part")
@@ -583,6 +715,32 @@ func (s *Server) pruneMediaCache(k mediaKind) {
 		}
 		_ = os.Remove(filepath.Join(dir, f.name))
 	}
+}
+
+// CleanStaleMediaParts 删掉超过 maxAge 的下载临时文件。
+//
+// 正常流程里 .part 由下载方自己清理，但进程在下载中途被杀（停套件、断电）会把它
+// 永远留下，视频的 .part 单个可达 200 MB；pruneMediaCache 为了不误删在下的文件跳过它们。
+func (s *Server) CleanStaleMediaParts(maxAge time.Duration) int {
+	removed := 0
+	cutoff := time.Now().Add(-maxAge)
+	for _, k := range []mediaKind{imageKind, videoKind} {
+		entries, err := os.ReadDir(s.mediaDir(k))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".part") {
+				continue
+			}
+			if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+				if os.Remove(filepath.Join(s.mediaDir(k), e.Name())) == nil {
+					removed++
+				}
+			}
+		}
+	}
+	return removed
 }
 
 // validMediaName 校验文件名形状：32 位十六进制 + 本类媒体的白名单扩展名。

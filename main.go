@@ -40,7 +40,7 @@ import (
 // Release tag 又是 v1.0.12-0002，用户根本对不上。而且 updater 的版本比较会在
 // 第一个 '-' 处截断，1.0.12-0002 与 1.0.12 被判成相等，永远显示「已是最新」。
 // 统一成一个号之后这些问题自然消失。
-var version = "1.0.24"
+var version = "1.0.25"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
 // 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
@@ -155,6 +155,34 @@ func main() {
 					cancel()
 					return
 				}
+			}
+		}
+	}()
+
+	// 数据保留维护：按设置里的保留天数清理图片记录与用量日志，并清掉被中断的下载临时文件。
+	// 启动一分钟后跑第一次（不和启动抢 I/O），之后每 6 小时一次。
+	go func() {
+		runJanitor := func() {
+			imgs, logs := store.PruneRetention(time.Now())
+			parts := srv.CleanStaleMediaParts(6 * time.Hour)
+			if imgs+logs+parts > 0 {
+				log.Printf("保留期清理：图片记录 %d 条、用量日志 %d 行、残留下载文件 %d 个", imgs, logs, parts)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Minute):
+		}
+		runJanitor()
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runJanitor()
 			}
 		}
 	}()

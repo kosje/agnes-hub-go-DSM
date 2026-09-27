@@ -569,3 +569,74 @@ func TestJSONRoundTripKeepsZeroValuedSettingsMeaningful(t *testing.T) {
 		t.Fatal("设置应可序列化")
 	}
 }
+
+// 保留期设置要真的生效：过期的图片记录与用量日志被清掉，未过期的留下。
+func TestPruneRetention(t *testing.T) {
+	s := newTestStore(t)
+	s.UpdateSettings(func(st *Settings) {
+		st.ImageRecordRetention = 30
+		st.LogRetentionDays = 7
+	})
+	now := time.Now()
+	old := float64(now.Add(-40*24*time.Hour).UnixNano()) / 1e9
+	fresh := float64(now.Add(-time.Hour).UnixNano()) / 1e9
+	s.PutImageJob(&ImageJob{JobID: "old", CreatedAt: old})
+	s.PutImageJob(&ImageJob{JobID: "fresh", CreatedAt: fresh})
+	s.AppendUsage(map[string]any{"ts": now.Add(-10 * 24 * time.Hour).Format("2006-01-02 15:04:05"), "n": 1})
+	s.AppendUsage(map[string]any{"ts": now.Format("2006-01-02 15:04:05"), "n": 2})
+
+	imgs, logs := s.PruneRetention(now)
+	if imgs != 1 || logs != 1 {
+		t.Fatalf("应删 1 条图片记录、1 行日志，实际 %d / %d", imgs, logs)
+	}
+	if _, ok := s.ImageJobByID("fresh"); !ok {
+		t.Fatal("未过期的图片记录不应被删")
+	}
+	if got := s.TailUsage(10); len(got) != 1 || got[0]["n"] != float64(2) {
+		t.Fatalf("应只剩未过期的那行日志，实际 %v", got)
+	}
+}
+
+// TailUsage 只读文件尾部，但结果必须与全量读取一致（最近 n 条、倒序）。
+func TestTailUsageReadsTail(t *testing.T) {
+	s := newTestStore(t)
+	for i := 0; i < 2000; i++ {
+		s.AppendUsage(map[string]any{"i": i, "pad": strings.Repeat("x", 200)})
+	}
+	got := s.TailUsage(5)
+	if len(got) != 5 || got[0]["i"] != float64(1999) || got[4]["i"] != float64(1995) {
+		t.Fatalf("应返回最近 5 条（倒序），实际 %v", got)
+	}
+}
+
+// 主文件写坏（断电等）时退回上一版：管理员密码不能因此回落到 admin123。
+func TestCorruptSettingsFallsBackToBackup(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SetPassword("kept-password"); err != nil {
+		t.Fatal(err)
+	}
+	// 再保存一次，让 .bak 也是已改密的版本
+	s.UpdateSettings(func(st *Settings) { st.KeepaliveMS = 1234 })
+	if err := os.WriteFile(filepath.Join(s.Dir, "settings.json"), []byte(`{"admin_pass`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.VerifyPassword("kept-password") || reloaded.VerifyPassword("admin123") {
+		t.Fatal("settings.json 损坏时应退回上一版，而不是把密码重置成 admin123")
+	}
+}
+
+// PutJob 存副本：调用方之后再改自己手里的对象，不影响已存的记录（旧实现在这里有数据竞争）。
+func TestPutJobStoresCopy(t *testing.T) {
+	s := newTestStore(t)
+	job := &VideoJob{JobID: "j1", Status: "submitted"}
+	s.PutJob(job)
+	job.Status = "mutated-outside-lock"
+	got, _ := s.JobByID("j1")
+	if got.Status != "submitted" {
+		t.Fatalf("存储里的记录不应被调用方的后续修改影响，实际 %q", got.Status)
+	}
+}
