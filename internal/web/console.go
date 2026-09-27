@@ -1210,6 +1210,16 @@ func applySettings(st *config.Settings, p map[string]any) {
 		if x, ok := v["video_wait_sec"]; ok {
 			ai.VideoWaitSec = asInt(x)
 		}
+		if x, ok := v["video_stream_wait_sec"]; ok {
+			n := asInt(x)
+			if n < 0 {
+				n = 0
+			}
+			if n > 3600 { // 上限 1 小时：再长的连接多半会被沿途的反代掐断
+				n = 3600
+			}
+			ai.VideoStreamWaitSec = n
+		}
 		if x, ok := v["preferred_models"].(map[string]any); ok {
 			next := map[string][]string{}
 			for k, raw := range x {
@@ -2308,7 +2318,7 @@ func (s *Server) handleChatVideoStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if st := strings.ToLower(asStr(body["status"])); st == "failed" || st == "error" {
 		job.Status = "failed"
-		job.Error = upstreamErrorMessage(200, body, nil)
+		job.Error = videoFailureReason(body)
 		s.Store.PutJob(job)
 		out["status"] = "failed"
 		out["error"] = job.Error

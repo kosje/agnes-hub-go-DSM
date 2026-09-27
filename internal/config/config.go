@@ -263,13 +263,21 @@ type ChatLog struct {
 
 // AutoIntentSettings 是 agnes-auto 的判定与适配配置。
 type AutoIntentSettings struct {
-	ContentScan      bool                `json:"content_scan"`
-	MinConfidence    float64             `json:"min_confidence"`
-	DefaultImageSize string              `json:"default_image_size"`
-	ImageInputField  string              `json:"image_input_field"`
-	VideoInputField  string              `json:"video_input_field"`
-	VideoWaitSec     int                 `json:"video_wait_sec"`
-	PreferredModels  map[string][]string `json:"preferred_models"`
+	ContentScan      bool    `json:"content_scan"`
+	MinConfidence    float64 `json:"min_confidence"`
+	DefaultImageSize string  `json:"default_image_size"`
+	ImageInputField  string  `json:"image_input_field"`
+	VideoInputField  string  `json:"video_input_field"`
+	VideoWaitSec     int     `json:"video_wait_sec"`
+	// VideoStreamWaitSec 是「对话形态 + stream=true」的生视频请求里，网关替客户端等待
+	// 视频完成的最长秒数。等待期间持续推送心跳与进度，完成后把视频链接接在同一条回复里；
+	// 0 表示不等待（退回旧行为：只回 job_id 与轮询地址）。
+	//
+	// 为什么要网关来等：AI 对话客户端不会去轮询 /v1/videos/{job_id}，旧行为下用户
+	// 只能看到一个任务号，视频永远出不来。流式响应能边等边发心跳，不会被客户端判超时；
+	// 非流式响应只能干等，所以非流式仍由 VideoWaitSec 单独控制（默认不等）。
+	VideoStreamWaitSec int                 `json:"video_stream_wait_sec"`
+	PreferredModels    map[string][]string `json:"preferred_models"`
 }
 
 // Settings 是全局设置。
@@ -368,12 +376,13 @@ func DefaultSettings() Settings {
 		ModelAliases:       map[string]string{},
 		AutoModelName:      "agnes-auto",
 		AutoIntent: AutoIntentSettings{
-			ContentScan:      true,
-			MinConfidence:    0.6,
-			DefaultImageSize: "1K",
-			ImageInputField:  "image",
-			VideoInputField:  "image",
-			VideoWaitSec:     0,
+			ContentScan:        true,
+			MinConfidence:      0.6,
+			DefaultImageSize:   "1K",
+			ImageInputField:    "image",
+			VideoInputField:    "image",
+			VideoWaitSec:       0,
+			VideoStreamWaitSec: 600,
 			PreferredModels: map[string][]string{
 				"text":  {"agnes-3.0-flash", "agnes-2.5-flash", "agnes-2.0-flash"},
 				"image": {"agnes-image-2.5-flash", "agnes-image-2.1-flash"},

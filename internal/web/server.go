@@ -1040,14 +1040,22 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 		return
 	}
 
-	// 可选：阻塞等待视频完成（默认 0 = 不等待）。视频是异步的，
-	// 对「用 chat 客户端发一句话要视频」的用户，等待能让体验完整；
-	// 但等待会占住一条连接，所以默认关闭、由控制台决定。
+	// 流式对话：网关替客户端等视频完成，边等边推心跳与进度，完成后把链接接在同一条回复里。
+	// AI 对话客户端不会去轮询 /v1/videos/{job_id}，不这么做用户只能看到一个任务号。
+	if stream && videoID != "" && settings.AutoIntent.VideoStreamWaitSec > 0 {
+		s.streamVideoUntilDone(w, r, settings, decision, result.ModelUsed, result.Account, job, extra,
+			time.Duration(settings.AutoIntent.VideoStreamWaitSec)*time.Second)
+		return
+	}
+
+	// 非流式：可选阻塞等待视频完成（默认 0 = 不等待）。非流式响应在等待期间发不了
+	// 心跳，等太久会被客户端判超时，所以默认关闭、由控制台决定。
 	videoURL := ""
 	if cfg := autoIntentConfig(settings); cfg.VideoWaitSec > 0 && videoID != "" {
 		if u := s.waitForVideo(r.Context(), result.Account, job, cfg.VideoWaitSec); u != "" {
 			// 落盘一份本地副本给控制台/聊天记录用；回给调用方的地址按调用方是谁定
 			// （外部客户端加载不了指向 NAS 的 http 地址，见 callerMediaURL）。
+			job.Status = "completed"
 			job.SourceURL = u
 			job.URL = s.localizeVideoURL(r.Context(), u, publicBaseURL(r, settings))
 			s.Store.PutJob(job)
@@ -1069,6 +1077,110 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 		return
 	}
 	writeJSON(w, 200, envelope, extra)
+}
+
+// streamVideoUntilDone 以 SSE 推送一条 chat 回复，并在同一条回复里等到视频完成。
+//
+// 推送顺序：
+//  1. 立即推「生成中」正文 —— 用户马上看到任务已受理；
+//  2. 按轮询间隔查上游，每 15 秒发一次 SSE 注释心跳（防反代 / 客户端判空闲断开），
+//     每满 1 分钟追加一行进度；
+//  3. 完成：落盘本地副本、更新任务记录，追加「生成完成：在浏览器中打开」；
+//     失败：追加失败原因；等到上限：说明任务仍在后台继续；
+//  4. 结束帧 + [DONE]。
+//
+// 客户端中途断开（关窗、取消）就停止等待，任务记录保留，控制台里照样能看到结果。
+func (s *Server) streamVideoUntilDone(w http.ResponseWriter, r *http.Request, settings config.Settings,
+	decision intent.Result, model string, account *config.Account, job *config.VideoJob,
+	headers map[string]string, maxWait time.Duration) {
+
+	for k, v := range headers {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	id := "chatcmpl-" + strings.TrimPrefix(config.NewID("v"), "v_")
+	created := time.Now().Unix()
+	requested := firstNonEmpty(decision.ModelRequested, "agnes-auto")
+	send := func(delta map[string]any, finish any) {
+		writeSSEFrame(w, flusher, map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": requested,
+			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+		})
+	}
+	send(map[string]any{"role": "assistant", "content": intent.VideoPendingContent(model, job.JobID)}, nil)
+
+	interval := time.Duration(settings.VideoPollIntervalMS) * time.Millisecond
+	if interval < time.Second {
+		interval = 5 * time.Second
+	}
+	poll := time.NewTicker(interval)
+	defer poll.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	progress := time.NewTicker(time.Minute)
+	defer progress.Stop()
+	started := time.Now()
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+
+	ctx := r.Context()
+	minutes := 0
+	tail := ""
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			writeSSEComment(w, flusher, "agnes-hub video pending")
+		case <-progress.C:
+			minutes++
+			send(map[string]any{"content": intent.VideoProgressContent(minutes)}, nil)
+		case <-deadline.C:
+			tail = intent.VideoTimeoutContent(job.JobID, time.Since(started))
+			break loop
+		case <-poll.C:
+			body := s.pollUpstream(ctx, account, job)
+			if body == nil {
+				continue
+			}
+			if u := extractVideoURL(body); u != "" {
+				job.Status = "completed"
+				job.SourceURL = u
+				job.URL = s.localizeVideoURL(ctx, u, publicBaseURL(r, settings))
+				s.Store.PutJob(job)
+				tail = intent.VideoDoneContent(s.callerMediaURL(r, settings, u, job.URL))
+				break loop
+			}
+			if st := strings.ToLower(asStr(body["status"])); st == "failed" || st == "error" {
+				job.Status = "failed"
+				job.Error = videoFailureReason(body)
+				s.Store.PutJob(job)
+				tail = intent.VideoFailedContent(job.Error)
+				break loop
+			}
+		}
+	}
+	send(map[string]any{"content": tail}, nil)
+	meta := decision.Meta()
+	meta["model_used"] = model
+	meta["job_id"] = job.JobID
+	meta["video_id"] = job.VideoID
+	meta["status"] = job.Status
+	writeSSEFrame(w, flusher, map[string]any{
+		"id": id, "object": "chat.completion.chunk", "created": created, "model": requested,
+		"choices":   []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		"agnes_hub": meta,
+	})
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 // waitForVideo 轮询等待视频完成，返回 video_url 或空串。
@@ -1659,6 +1771,21 @@ func errorObjectHasMessage(m map[string]any) bool {
 }
 
 // upstreamErrorMessage 尽最大努力从上游错误响应里挖出一句人能看懂的原因。
+// videoFailureReason 取视频任务失败的原因。
+//
+// upstreamErrorMessage 是「标准 error.message 缺失时」的兜底，本身不看那个字段；
+// 而视频失败回的恰恰多是标准形态 {"status":"failed","error":{"message":"..."}}，
+// 直接用它会得到一句「没有可读的错误说明」。所以先看标准字段，再走兜底。
+func videoFailureReason(body map[string]any) string {
+	if e, ok := body["error"].(map[string]any); ok {
+		if s := strings.TrimSpace(asStr(e["message"])); s != "" {
+			return s
+		}
+	}
+	raw, _ := json.Marshal(body)
+	return upstreamErrorMessage(200, body, raw)
+}
+
 func upstreamErrorMessage(status int, m map[string]any, raw []byte) string {
 	// 非标准但常见的字段名（各家 relay 五花八门）
 	for _, k := range []string{"message", "msg", "detail", "error_msg", "error_description", "reason"} {

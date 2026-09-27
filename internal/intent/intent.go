@@ -1188,6 +1188,44 @@ func VideoContent(model string, job map[string]any, videoURL string) string {
 	return strings.Join(lines, "\n")
 }
 
+// VideoPendingContent 是流式等待视频时的第一段正文：先让用户知道任务已提交、正在生成。
+func VideoPendingContent(model, jobID string) string {
+	s := fmt.Sprintf("视频生成中（模型 %s），完成后会直接显示在这里，通常需要 1～5 分钟。", model)
+	if jobID != "" {
+		s += fmt.Sprintf("\n\n任务号：`%s`", jobID)
+	}
+	return s
+}
+
+// VideoProgressContent 是等待期间每分钟追加的一行进度，让用户知道还在等、没有卡死。
+func VideoProgressContent(minutes int) string {
+	return fmt.Sprintf("\n\n仍在生成…已等待 %d 分钟", minutes)
+}
+
+// VideoDoneContent 是视频完成后追加的正文：与图片同一套「在浏览器中打开」链接写法。
+//
+// Markdown 没有视频语法，AI 客户端里没法像图片那样内嵌播放，只能给一个可点的入口。
+func VideoDoneContent(videoURL string) string {
+	if link := mediaAddressLink(videoURL); link != "" {
+		return "\n\n生成完成：" + link
+	}
+	return "\n\n生成完成：" + videoURL
+}
+
+// VideoFailedContent 是上游明确报告失败时追加的正文。
+func VideoFailedContent(reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		reason = "上游未给出原因"
+	}
+	return "\n\n生成失败：" + reason
+}
+
+// VideoTimeoutContent 是等到上限仍未完成时追加的正文：任务并没有取消，只是不再等。
+func VideoTimeoutContent(jobID string, waited time.Duration) string {
+	return fmt.Sprintf("\n\n已等待 %d 分钟仍未完成，任务还在后台继续生成。"+
+		"稍后可在网关控制台「视频任务」页查看结果（任务号 `%s`）。", int(waited.Minutes()), jobID)
+}
+
 // SSEFromChat 把非流式 chat 结果合成 SSE 分片：客户端要 stream=true 时也能拿到完整内容。
 func SSEFromChat(envelope map[string]any) [][]byte {
 	content := ""

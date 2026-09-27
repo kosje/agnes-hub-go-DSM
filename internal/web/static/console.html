@@ -916,7 +916,8 @@ function viewSettings(){
       ${fld("s_isize","生图默认尺寸", ai.default_image_size||"1K","text","上游只接受 1K/2K/3K/4K 或 WIDTHxHEIGHT")}
       ${fld("s_ifield","图生图输入图字段名", ai.image_input_field||"image","text","留空则不自动带图；上游规范变更时改这里")}
       ${fld("s_vfield","图生视频输入图字段名", ai.video_input_field||"image","text","")}
-      ${fld("s_vwait","视频阻塞等待秒数", ai.video_wait_sec??0,"number","0 = 立即返回 job_id 让客户端轮询")}
+      ${fld("s_vswait","对话里等待视频完成（秒）", ai.video_stream_wait_sec??600,"number","AI 客户端流式对话里要视频时，网关边等边推进度，完成后把链接接在同一条回复里；0 = 只回任务号")}
+      ${fld("s_vwait","非流式请求等待视频（秒）", ai.video_wait_sec??0,"number","非流式请求等待期间发不了心跳，等久了客户端会判超时；0 = 立即返回 job_id")}
     </div>
     <h3 style="margin-top:14px">模型偏好顺序（只在账号已声明的清单内生效，绝不越界）</h3>
     <div class="grid g2">
@@ -1042,6 +1043,7 @@ function bindSettingsEvents(){
       auto_intent:{content_scan:g("s_scan")==="1", min_confidence:Number(g("s_conf")),
         default_image_size:g("s_isize"), image_input_field:g("s_ifield"),
         video_input_field:g("s_vfield"), video_wait_sec:Number(g("s_vwait")),
+        video_stream_wait_sec:Number(g("s_vswait")),
         preferred_models:{}},
       safety_factor:Number(g("s_safety")), pacing_window_sec:Number(g("s_window")),
       calibration_enabled:g("s_cal")==="1", penalty_cooldown_sec:Number(g("s_penalty")),
