@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"sync"
@@ -460,8 +461,10 @@ func breakerCooldown(base time.Duration, trips int) time.Duration {
 }
 
 // StartMaintenance 启动后台维护：熔断复活 + 到期绑定清理 + 因子落盘。
-func (h *Hub) StartMaintenance(ctx context.Context) {
+func (h *Hub) StartMaintenance(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -474,6 +477,7 @@ func (h *Hub) StartMaintenance(ctx context.Context) {
 			}
 		}
 	}()
+	return done
 }
 
 // flushFactors 把二维校准因子合并落盘（降写放大：30 秒一次批量写，而不是每次 429 都写）。
@@ -496,6 +500,9 @@ func (h *Hub) flushFactors() {
 	// 兜底：把统计字段（RateLimited / LastError / 熔断状态等）批量写一次，
 	// 热路径里改这些字段的代码一律走 MutateAccountNoSave，这里统一落盘。
 	h.store.FlushAccounts()
+	if err := h.store.FlushBindings(); err != nil {
+		log.Printf("保存会话绑定失败：%v", err)
+	}
 }
 
 // BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。

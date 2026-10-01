@@ -38,11 +38,11 @@ type Server struct {
 	mux     *http.ServeMux
 	rules   intent.Rules
 	Updater *updater.Updater
-	// Version 由 main 注入，供 /healthz 与自更新接口显示，避免写死在多处。
+	// Version 由 main 注入，供 /healthz 与版本检查接口显示。
 	Version string
 	// ReleaseRepo 是控制台「查看全部版本」要跳转的 GitHub 仓库（owner/name），
 	// 由 main 注入。套件版禁用了自更新，这里指向套件自己的 Release 仓库；
-	// 自更新开启时指向自更新仓库，保证链接与「立即更新」实际会拉取的来源一致。
+	// 若配置了版本检查器，链接跟随其仓库。
 	ReleaseRepo string
 	// SuiteManaged 表示二进制由外部包管理器（群晖套件中心等）负责升级，
 	// 必须禁止进程内替换自身。注意它只关掉「应用更新」——
@@ -52,7 +52,7 @@ type Server struct {
 	// PackageManaged 表示由群晖套件中心管理（SuiteManaged 的一种）。只影响控制台
 	// 给出的升级指引：套件版去套件中心，其余到 GitHub Release 手动下载。
 	PackageManaged bool
-	// intentCache 缓存 auto 路径的意图判定（body 哈希 + 规则指纹 → 结论）。
+	// intentCache 缓存请求路径、body、模型名、别名与规则共同决定的意图。
 	// 仅 handleTextish 命中 auto 模型时读写；显式模型名、媒体端点均不走。
 	intentCache *intent.Cache
 	// logins 是网页登录的失败限速表。
@@ -70,14 +70,14 @@ func New(store *config.Store, h *hub.Hub, client *http.Client) *Server {
 // SetClient 替换上游客户端（测试指向本地模拟上游用）。
 func (s *Server) SetClient(c *http.Client) { s.Client = c }
 
-// SetUpdater 注入自更新器（启动后调用）。
+// SetUpdater 注入只读版本检查器。
 func (s *Server) SetUpdater(u *updater.Updater) { s.Updater = u }
 
 // SetReleaseRepo 注入控制台「查看全部版本」要跳转的仓库（owner/name）。
 func (s *Server) SetReleaseRepo(repo string) { s.ReleaseRepo = repo }
 
 // SetSuiteManaged 声明二进制由外部包管理器管理（群晖套件中心等）。
-// 只关闭「应用更新」，不影响「查最新版本」。
+// 仅用于兼容状态字段；所有平台均已移除安装更新能力。
 func (s *Server) SetSuiteManaged(v bool) { s.SuiteManaged = v }
 
 // SetPackageManaged 声明由群晖套件中心管理。
@@ -198,8 +198,16 @@ func (s *Server) downstreamKey(r *http.Request) (*config.DownstreamKey, *apiErro
 	return item, nil
 }
 
+const maxRequestBody = 32 << 20
+
 func readBody(r *http.Request) (map[string]any, []byte, *apiError) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	if r.ContentLength > maxRequestBody {
+		return nil, nil, requestTooLarge()
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+	if len(raw) > maxRequestBody {
+		return nil, nil, requestTooLarge()
+	}
 	if err != nil {
 		return nil, nil, badRequest("读取请求体失败：" + err.Error())
 	}
@@ -211,7 +219,15 @@ func readBody(r *http.Request) (map[string]any, []byte, *apiError) {
 	if err := dec.Decode(&body); err != nil {
 		return nil, nil, badRequest("请求体不是合法 JSON")
 	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return nil, nil, badRequest("请求体必须只包含一个 JSON 对象")
+	}
 	return body, raw, nil
+}
+
+func requestTooLarge() *apiError {
+	return &apiError{Status: http.StatusRequestEntityTooLarge, Type: "invalid_request_error",
+		Code: "request_too_large", Message: "请求体超过 32 MiB 限制，请缩小图片或请求内容"}
 }
 
 // gate 检查池权限并占用一个额度名额。成功时返回的 release 必须在请求结束时调用
@@ -607,14 +623,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 //
 // 命中条件（全部满足才用缓存）：
 //   - 规则集未变（指纹在 Key() 里，变了自动 miss，无需手动清）
-//   - body + requestedModel 哈希命中
+//   - path + body + requestedModel + 模型别名 + 规则阈值的哈希命中
 //   - 未超过 TTL（10 分钟）
 //
 // 命中时 Source 标记为 "cache"，Reason 写 "命中意图判定缓存"，
 // 下游观测端能直接区分「缓存判定」与「现场判定」。
 func (s *Server) decideCached(path string, body map[string]any, requested string, settings config.Settings) intent.Result {
 	icfg := autoIntentConfig(settings)
-	key := s.intentCache.Key(body, s.rules, icfg.MinConfidence, icfg.ContentScan, requested)
+	key := s.intentCache.Key(path, body, s.rules, icfg.MinConfidence, icfg.ContentScan, requested, settings.ModelAliases)
 	if cached := s.intentCache.Get(key); cached != nil {
 		out := *cached
 		if out.Source != "cache" {

@@ -367,8 +367,10 @@ func TestBindingsGCExpiresStaleEntries(t *testing.T) {
 	}
 	s.mu.Unlock()
 
-	// 任意一次写入都会顺带清理过期绑定
-	s.Bind("ses:another", "acc_3")
+	// 批量保存时清理过期绑定，避免每次 Bind 扫描整个表。
+	if err := s.FlushBindings(); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := s.BindingsGet("ses:stale"); ok {
 		t.Error("超过 TTL 的绑定应被清理，否则文件会无限增长")
 	}

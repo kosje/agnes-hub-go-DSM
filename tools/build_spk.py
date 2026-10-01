@@ -34,8 +34,7 @@
     SPK_OUT_DIR=D:/somewhere python tools/build_spk.py
     python tools/build_spk.py --emit-web-logo      # 只重生成 Web UI 顶栏 logo
 
-默认只出 x86_64：本项目实际只分发群晖 x86_64 机型（DS918+ 等 apollolake 平台）。
-armv8 的目标保留在 ARCH_TARGETS 里，需要时用 --arch 打开。
+默认只出 x86_64；正式发布使用 --arch all，同时分发 x86_64 与 armv8。
 
 构建前需要先交叉编译出对应的 Linux 二进制（源码零改动，Go 标准库自带交叉编译）：
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o agnes-hub-go-linux-amd64 .
@@ -966,7 +965,7 @@ def validate_spk(path):
 def select_targets(spec):
     """把 --arch 的取值解析成 [(arch, 二进制名), ...]。
 
-    默认只出 x86_64：本项目实际只分发群晖 x86_64 机型（apollolake 等）。
+    默认只出 x86_64；正式发布使用 --arch all。
     armv8 目标保留在 ARCH_TARGETS 里，需要时用 --arch armv8 或 --arch all。
     """
     if spec == "all":

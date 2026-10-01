@@ -250,6 +250,10 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 			return nil, err
 		}
 		last = result
+		// Count failed upstream attempts exactly once, including attempts followed by failover.
+		if result.Status >= 400 {
+			h.Metrics.RequestsError.Add(1)
+		}
 
 		if !retry {
 			if result.Status < 400 {
@@ -272,7 +276,6 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 			sleepBackoff(ctx, s, attempt)
 			continue
 		}
-		h.Metrics.RequestsError.Add(1)
 		h.Metrics.WaitMS.Add(result.WaitMS)
 		return result, nil
 	}
@@ -340,7 +343,6 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		<-sem
 		cancel()
 		h.NoteError(account, fmt.Sprintf("%T: %v", err, err))
-		h.Metrics.RequestsError.Add(1)
 		return &Result{
 			Status:  http.StatusBadGateway,
 			Header:  http.Header{"Content-Type": []string{"application/json"}},

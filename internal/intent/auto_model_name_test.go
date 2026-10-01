@@ -4,7 +4,7 @@ import "testing"
 
 // TestIsAutoModelNamed 钉住「让网关决定」的名称识别。
 //
-// 回归背景：IsAutoModel 只认内置的 auto / auto-all / auto* 前缀，而本项目的
+// 回归背景：IsAutoModel 只认内置的 auto / auto-all，而本项目的
 // 默认 AutoModelName 是 "agnes-auto" —— 不在内置集合里。只调用 IsAutoModel
 // 会把 agnes-auto 判成「显式模型」，整条自动判定链路（内容判定 → 生图/生视频）
 // 被跳过，请求带着 model=agnes-auto 原样透传给上游。
@@ -22,7 +22,10 @@ func TestIsAutoModelNamed(t *testing.T) {
 		// 内置名与自定义名仍然认
 		{"auto", "agnes-auto", true},
 		{"auto-all", "agnes-auto", true},
-		{"auto-fast", "agnes-auto", true},
+		{"auto-fast", "agnes-auto", false},
+		{"auto-fast", "auto-fast", true},
+		{"autoglm-9b", "agnes-auto", false},
+		{"automatic", "agnes-auto", false},
 		{"my-auto", "my-auto", true},
 		// 显式模型名绝不能被误判成 auto，否则显式路由会被内容判定劫持
 		{"agnes-image-2.5-flash", "agnes-auto", false},

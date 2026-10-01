@@ -61,9 +61,12 @@ func (s *Server) apiUpstreamModels(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AccountID string `json:"account_id"`
 	}
-	if body, _, err := readBody(r); err == nil && body != nil {
-		req.AccountID = strings.TrimSpace(asStr(body["account_id"]))
+	body, _, err := readBody(r)
+	if err != nil {
+		writeErr(w, err)
+		return
 	}
+	req.AccountID = strings.TrimSpace(asStr(body["account_id"]))
 
 	settings := s.Store.SettingsSnapshot()
 	accounts := s.Store.AccountsSnapshot()

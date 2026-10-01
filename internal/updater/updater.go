@@ -1,20 +1,8 @@
-// Package updater implements self-update: the running gateway checks GitHub
-// releases, downloads a newer binary when available, and hot-swaps itself.
-//
-// Design decisions
-//   - Check endpoint is unauthenticated (read-only version probe).
-//   - Apply endpoint requires admin auth (modifies executable on disk).
-//   - The update path is: check → download → verify SHA256 → swap → signal restart.
-//   - The parent process (bat / Windows Service) is expected to handle the
-//     actual restart.
-//   - On Windows we replace the .exe only after all in-flight requests finish
-//     (graceful shutdown signal first, then swap).
+// Package updater checks GitHub releases. Installation is handled externally.
 package updater
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,11 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -62,63 +47,28 @@ type CheckResult struct {
 	Error             string         `json:"error,omitempty"`
 }
 
-// ApplyResult holds the outcome of an update apply.
-type ApplyResult struct {
-	Success    bool   `json:"success"`
-	NewVersion string `json:"new_version,omitempty"`
-	OldVersion string `json:"old_version,omitempty"`
-	Message    string `json:"message,omitempty"`
-	Error      string `json:"error,omitempty"`
-}
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
 // Config controls updater behaviour.
 type Config struct {
 	// Repo is "owner/repo" for GitHub release lookups. Empty disables checking.
 	Repo string
-	// BinaryName is the name of the executable to replace (e.g. "agnes-hub-go").
-	BinaryName string
-	// DataDir is where runtime data lives; updates must not touch it.
-	DataDir string
-	// CheckInterval is how often to auto-check in background. 0 = disabled.
-	CheckInterval time.Duration
-	// AllowPreRelease controls whether pre-release tags are considered.
-	AllowPreRelease bool
-	// SHA256Expected is an optional known-good hash to verify against.
-	SHA256Expected string
-	// NoRelaunch 只影响 Windows：置 true 时替换完成后不自动把新版本拉起来，
-	// 交给调用方（服务管理器 / 用户）决定何时重启。默认 false = 自动重启。
-	NoRelaunch bool
-	// SuiteManaged 表示二进制由外部包管理器（群晖套件中心等）负责升级。
-	//
-	// 只影响「有没有更新」的判定口径：套件版的 release 资产是 SPK，不是裸二进制，
-	// pickAsset 永远挑不到。若仍按「必须挑到本平台资产才算有更新」来判，
-	// 结果就是 IsUpdateAvailable 恒为 false —— 控制台永远显示「已是最新」，
-	// 用户根本不知道有没有新版。置 true 后只看版本号，不看资产。
-	SuiteManaged bool
 }
 
 // ---------------------------------------------------------------------------
 // Updater
 // ---------------------------------------------------------------------------
 
-// Updater is the self-update engine.
+// Updater is a read-only release checker.
 type Updater struct {
 	cfg       Config
 	client    *http.Client
 	mu        sync.Mutex
 	lastCheck *CheckResult
-	pending   atomic.Bool // true when a restart is requested after successful apply
 	version   string
-	binPath   string
 	logger    *log.Logger
 }
 
 // New constructs an Updater.
-func New(cfg Config, version, binPath string, logger *log.Logger) *Updater {
+func New(cfg Config, version string, logger *log.Logger) *Updater {
 	if logger == nil {
 		logger = log.New(os.Stderr, "[updater] ", log.LstdFlags|log.Lmicroseconds)
 	}
@@ -126,38 +76,30 @@ func New(cfg Config, version, binPath string, logger *log.Logger) *Updater {
 		cfg:     cfg,
 		client:  &http.Client{Timeout: 30 * time.Second},
 		version: version,
-		binPath: binPath,
 		logger:  logger,
 	}
 	return u
 }
 
-// Repo 返回配置的 GitHub 仓库（owner/name）。空字符串表示自更新未启用。
-// 控制台用它拼「查看全部版本」的跳转地址，保证链接与自更新实际拉取的仓库一致。
+// Repo 返回版本检查使用的 GitHub 仓库（owner/name），也用于控制台发布页链接。
 func (u *Updater) Repo() string { return u.cfg.Repo }
 
-// Version 返回当前版本。加锁是因为应用更新后会在运行期改写它。
+// Version 返回运行中程序的版本。
 func (u *Updater) Version() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.version
 }
 
-func (u *Updater) setVersion(v string) {
-	u.mu.Lock()
-	u.version = v
-	u.mu.Unlock()
-}
-
 // Check performs a one-shot GitHub release lookup and returns the result.
-// Returns nil (with empty result) when the repo is not configured.
+// An unconfigured repo returns a disabled result without accessing the network.
 func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 	cur := u.Version()
 	if u.cfg.Repo == "" {
 		return &CheckResult{
 			CurrentVersion:    cur,
 			IsUpdateAvailable: false,
-			Error:             "self-update disabled (no repo configured)",
+			Error:             "version checking disabled (no repo configured)",
 		}, nil
 	}
 
@@ -172,30 +114,16 @@ func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 	tag := release.TagName
 	isNewer := versionGt(tag, cur)
 
-	// 只挑本平台能用的那个资产；挑不到就不算「有更新」，
-	// 否则点了更新只会在 Apply 阶段失败。
-	//
-	// 套件版例外：它的资产是 SPK（agnes-hub-x86_64-1.0.13.spk），不含裸二进制名，
-	// pickAsset 必然返回 nil。这里只关心「版本号有没有变新」，升级由套件中心完成。
-	needAsset := !u.cfg.SuiteManaged
-	asset := pickAsset(release.Assets, u.cfg.BinaryName, runtime.GOOS, runtime.GOARCH)
-
 	result := &CheckResult{
 		CurrentVersion:    cur,
 		LatestVersion:     displayVersion(tag),
-		IsUpdateAvailable: isNewer && (!needAsset || asset != nil),
+		IsUpdateAvailable: isNewer,
 		// 带上时分：控制台「发布时间」要能看出这次检查拿到的到底是不是刚发的版本。
 		// 用服务器本地时区，用户看到的就是自己 NAS 上的时间。
 		ReleaseDate: release.PublishedAt.Local().Format("2006-01-02 15:04"),
 		Changelog:   truncate(release.Body, 500),
 		Assets:      release.Assets,
 	}
-	// 只有「确实有新版本、但没提供本平台的包」才值得报错；
-	// 已经是最新版时资产列表里没有本平台的包是正常的，不该弹错误。
-	if isNewer && needAsset && asset == nil {
-		result.Error = fmt.Sprintf("release %s 没有 %s/%s 的资产", tag, runtime.GOOS, runtime.GOARCH)
-	}
-
 	u.mu.Lock()
 	u.lastCheck = result
 	u.mu.Unlock()
@@ -209,135 +137,7 @@ func (u *Updater) LastCheck() *CheckResult {
 	return u.lastCheck
 }
 
-// Apply downloads the new binary, verifies it, and replaces the running one.
-// The process is expected to be restarted by the caller.
-func (u *Updater) Apply(ctx context.Context) (*ApplyResult, error) {
-	last := u.LastCheck()
-	if last == nil || !last.IsUpdateAvailable {
-		return &ApplyResult{
-			Success: false,
-			Error:   "no update available",
-		}, nil
-	}
-
-	asset := pickAsset(last.Assets, u.cfg.BinaryName, runtime.GOOS, runtime.GOARCH)
-	if asset == nil {
-		return &ApplyResult{
-			Success: false,
-			Error:   "no suitable asset for this platform",
-		}, nil
-	}
-
-	u.logger.Printf("downloading %s → %s", asset.BrowserURL, u.cfg.BinaryName)
-
-	// Download to a temp file first (atomic-ish).
-	tmpDir := u.cfg.DataDir
-	if tmpDir == "" {
-		tmpDir = os.TempDir()
-	}
-	tmpPath := filepath.Join(tmpDir, ".update-tmp-"+strings.ReplaceAll(asset.Name, ".", "-"))
-
-	resp, err := u.client.Get(asset.BrowserURL)
-	if err != nil {
-		return &ApplyResult{Success: false, Error: "download failed: " + err.Error()}, nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return &ApplyResult{Success: false, Error: "HTTP " + fmt.Sprint(resp.StatusCode)}, nil
-	}
-
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return &ApplyResult{Success: false, Error: "create temp: " + err.Error()}, nil
-	}
-
-	h := sha256.New()
-	written, err := io.Copy(io.MultiWriter(f, h), resp.Body)
-	f.Close()
-	if err != nil {
-		_ = os.Remove(tmpPath)
-		return &ApplyResult{Success: false, Error: "write: " + err.Error()}, nil
-	}
-
-	// 尺寸合理性：下载被截断、或拿到的是错误页/重定向页面时都会明显偏小。
-	// 上界防「下成别的大文件」，下界防「下成一段 HTML 就当二进制换上」。
-	if written < 32*1024 || written > 50*1024*1024 {
-		_ = os.Remove(tmpPath)
-		return &ApplyResult{Success: false,
-			Error: fmt.Sprintf("downloaded %d bytes, out of sane range (32KB-50MB)", written)}, nil
-	}
-
-	// 魔数校验：SHA256 只有在调用方显式给了期望值时才比得了，
-	// 那时才挡不住「GitHub 返回一页 HTML 却被当成新版本」。
-	if err := checkExecutable(tmpPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return &ApplyResult{Success: false, Error: err.Error()}, nil
-	}
-
-	digest := hex.EncodeToString(h.Sum(nil))
-	if u.cfg.SHA256Expected != "" && digest != u.cfg.SHA256Expected {
-		_ = os.Remove(tmpPath)
-		return &ApplyResult{
-			Success: false,
-			Error:   "SHA256 mismatch: got " + digest + " expected " + u.cfg.SHA256Expected,
-		}, nil
-	}
-
-	// 先把新二进制放到正式文件旁边的 .new：
-	// 这一步只是改名，不碰正在运行的旧文件，任何平台都能成功。
-	newPath := u.binPath + ".new"
-	if err := os.Rename(tmpPath, newPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return &ApplyResult{Success: false,
-			Error: "stage new binary to " + filepath.Base(newPath) + ": " + err.Error()}, nil
-	}
-
-	// 再让平台各自决定怎么把它变成「正在运行的那个名字」。
-	// 类 Unix 就地 rename 即可；Windows 必须等本进程退出，见 swap_windows.go。
-	if err := replaceBinary(u.binPath, newPath, u.cfg.NoRelaunch); err != nil {
-		u.logger.Printf("replace binary failed: %v", err)
-		return &ApplyResult{Success: false,
-			Error: "downloaded and verified, but swap failed: " + err.Error()}, nil
-	}
-
-	u.setVersion(last.LatestVersion)
-	u.logger.Printf("updated %s -> %s (sha256 %s)", last.CurrentVersion, last.LatestVersion, digest[:12])
-
-	msg := "update applied; restart to activate"
-	if runtime.GOOS == "windows" {
-		msg = "update staged; 旧进程退出后自动替换并重启"
-	}
-	return &ApplyResult{
-		Success:    true,
-		NewVersion: last.LatestVersion,
-		OldVersion: last.CurrentVersion,
-		Message:    msg,
-	}, nil
-}
-
-// RequestRestart sets a flag that tells the caller to exit gracefully.
-// The web server's main should watch this and call cancel() when set.
-func (u *Updater) RequestRestart() {
-	u.pending.Store(true)
-}
-
-// NeedRestart returns true after Apply succeeded and the caller should exit.
-func (u *Updater) NeedRestart() bool {
-	return u.pending.Load()
-}
-
-// ClearPending clears the restart flag (e.g. after a failed restart attempt).
-func (u *Updater) ClearPending() {
-	u.pending.Store(false)
-}
-
-// ---------------------------------------------------------------------------
-// Background checker
-// ---------------------------------------------------------------------------
-
-// StartBackground checks periodically and returns a cleanup func.
-// Pass 0 interval to disable.
+// StartBackground checks periodically until ctx is canceled. Zero interval disables it.
 func (u *Updater) StartBackground(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		return
@@ -390,35 +190,6 @@ func (u *Updater) fetchLatestRelease(ctx context.Context) (*GitHubRelease, error
 		return nil, err
 	}
 	return &release, nil
-}
-
-// ---------------------------------------------------------------------------
-// Asset selection
-// ---------------------------------------------------------------------------
-
-func pickAsset(assets []ReleaseAsset, binaryName, goos, goarch string) *ReleaseAsset {
-	// Prefer exact match first.
-	for i := range assets {
-		a := &assets[i]
-		if !strings.Contains(a.Name, binaryName) {
-			continue
-		}
-		switch {
-		case goos == "windows" && strings.HasSuffix(a.Name, ".exe"):
-			return a
-		case goos == "linux" && goarch == "amd64" && strings.Contains(a.Name, "amd64"):
-			return a
-		case goos == "linux" && goarch == "arm64" && strings.Contains(a.Name, "arm64"):
-			return a
-		}
-	}
-	// Fallback: any asset with the binary name.
-	for i := range assets {
-		if strings.Contains(assets[i].Name, binaryName) {
-			return &assets[i]
-		}
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -479,52 +250,6 @@ func compareParts(a, b versionParts) int {
 		}
 	}
 	return 0
-}
-
-// ---------------------------------------------------------------------------
-// 二进制校验
-// ---------------------------------------------------------------------------
-
-// checkExecutable 校验文件开头的魔数，确认它确实是本平台的二进制。
-//
-// 为什么不能只靠 SHA256：SHA256 只在调用方事先知道期望值时才起作用，
-// 而自动更新场景下「期望值」恰恰只能从 release 页面拿，等于形同虚设。
-// 魔数校验很便宜，却能挡住最常见的失败模式 —— 把一页 HTML 错误信息
-// 或一段重定向内容当成新版本换上，让服务再也起不来。
-func checkExecutable(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open downloaded file: %w", err)
-	}
-	defer f.Close()
-
-	head := make([]byte, 4)
-	if _, err := io.ReadFull(f, head); err != nil {
-		return fmt.Errorf("read magic of downloaded file: %w", err)
-	}
-
-	var want string
-	var ok bool
-	switch runtime.GOOS {
-	case "windows":
-		want = "MZ"
-		ok = head[0] == 0x4D && head[1] == 0x5A
-	case "linux":
-		want = "ELF"
-		ok = head[0] == 0x7F && head[1] == 'E' && head[2] == 'L' && head[3] == 'F'
-	case "darwin":
-		want = "Mach-O"
-		ok = (head[0] == 0xFE && head[1] == 0xED) || // 32/64 位 fat 之外的常见形态
-			(head[0] == 0xCF && head[1] == 0xFA) || // 64 位 Mach-O
-			(head[0] == 0xCA && head[1] == 0xFE) // fat / universal
-	default:
-		return nil // 未知平台不拦，交给调用方
-	}
-	if !ok {
-		return fmt.Errorf("downloaded file is not a %s executable (magic % X, want %s)",
-			runtime.GOOS, head, want)
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------

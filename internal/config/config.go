@@ -441,7 +441,8 @@ type Store struct {
 	// keyInflight 是各下游密钥「已通过额度检查、尚未结束」的请求数（受 mu 保护）。
 	keyInflight map[string]int
 	// usageMu 串行化 usage.jsonl 的追加与保留期改写，避免改写期间追加的行丢失。
-	usageMu sync.Mutex
+	usageMu       sync.Mutex
+	bindingsDirty bool
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -788,12 +789,29 @@ func (s *Store) saveKeysLocked() error { return writeJSON(s.path("downstream_key
 
 // SaveBindings 落盘粘性绑定。
 func (s *Store) SaveBindings() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.saveBindingsLocked()
 }
 
-func (s *Store) saveBindingsLocked() error { return writeJSON(s.path("bindings.json"), s.Bindings) }
+func (s *Store) saveBindingsLocked() error {
+	if err := writeJSON(s.path("bindings.json"), s.Bindings); err != nil {
+		return err
+	}
+	s.bindingsDirty = false
+	return nil
+}
+
+// FlushBindings batches affinity persistence. Failed writes remain dirty for retry.
+func (s *Store) FlushBindings() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcBindingsLocked()
+	if !s.bindingsDirty {
+		return nil
+	}
+	return s.saveBindingsLocked()
+}
 
 // SaveJobs 落盘视频任务映射。
 func (s *Store) SaveJobs() error {
@@ -1218,8 +1236,7 @@ func (s *Store) Bind(sessionKey, accountID string) {
 		s.Bindings = map[string]Binding{}
 	}
 	s.Bindings[sessionKey] = Binding{AccountID: accountID, Updated: float64(time.Now().UnixNano()) / 1e9}
-	s.gcBindingsLocked()
-	_ = s.saveBindingsLocked()
+	s.bindingsDirty = true
 }
 
 // BindingsGet 读取绑定。
@@ -1239,6 +1256,7 @@ func (s *Store) gcBindingsLocked() {
 	for k, v := range s.Bindings {
 		if v.Updated < cutoff {
 			delete(s.Bindings, k)
+			s.bindingsDirty = true
 		}
 	}
 }
@@ -1255,6 +1273,7 @@ func (s *Store) ClearBindings() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Bindings = map[string]Binding{}
+	s.bindingsDirty = true
 	_ = s.saveBindingsLocked()
 }
 

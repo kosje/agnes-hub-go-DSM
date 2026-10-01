@@ -1179,7 +1179,6 @@ function viewAbout(){
     <div class="row" style="margin-top:12px">
       <span class="row hide" id="updBtns">
         <button class="sm" id="btnChk">检查更新</button>
-        <button class="sm primary" id="btnApply">立即更新</button>
       </span>
       <a class="gh-link" id="lnkReleases" target="_blank" rel="noopener noreferrer"
          title="在 GitHub 查看项目仓库"
@@ -1212,9 +1211,7 @@ function bindAboutEvents(){
     const cur = s.current_version || "—";
     const last = s.last_check || {};
     const avail = !!last.is_update_available;
-    // canApply：能否在进程内替换二进制（套件版恒为 false）
     // canCheck：能否向 GitHub 查最新版本（套件版仍为 true）
-    const canApply = s.enabled === true;
     const canCheck = s.checkable !== false;
 
     kpi.innerHTML = `
@@ -1231,10 +1228,9 @@ function bindAboutEvents(){
     const lnk = document.getElementById("lnkReleases");
     if(lnk) lnk.href = "https://github.com/" + (s.repo || "kosje/agnes-hub-go-DSM") + "/releases";
 
-    // 「检查更新 / 立即更新」只在进程内自更新可用时才露出来。
-    // 套件版由套件中心升级，按钮留着只会误导。
+    // 所有平台都只提供版本检查；安装由套件中心或用户完成。
     const btns = document.getElementById("updBtns");
-    if(btns) btns.classList.toggle("hide", !canApply);
+    if(btns) btns.classList.toggle("hide", !canCheck);
 
     if(err || last.error){
       box.innerHTML = `<div class="banner warn">${esc(err || last.error)}</div>`;
@@ -1253,8 +1249,7 @@ function bindAboutEvents(){
     const notes = (last.changelog||"").trim();
     box.innerHTML = `<div class="banner warn">
         发现新版本 <b>${esc(last.latest_version)}</b>（当前 ${esc(cur)}）。
-        ${canApply ? "点「立即更新」会下载对应平台的二进制并替换，随后程序自动退出并重启。"
-                   : esc(s.update_hint||"") + "。"}
+        ${esc(s.update_hint||"") + "。"}
       </div>
       ${notes? `<pre class="scroll" style="background:#fafbfc;border:1px solid var(--line);
         border-radius:10px;padding:12px;margin:0">${esc(notes)}</pre>`:""}`;
@@ -1268,7 +1263,7 @@ function bindAboutEvents(){
       // 会一直停在「—」。有缓存就不重复联网，避免反复打开本页把 GitHub 配额打满。
       const last = s.last_check || {};
       if(s.checkable !== false && (!last.latest_version || last.error)){
-        paint(await api("/api/update/check"));
+        paint({...await api("/api/update/status"), last_check: await api("/api/update/check")});
       }
     }catch(e){ kpi.innerHTML = `<div class="kpi"><div class="k">错误</div><div class="v">—</div></div>`;
               box.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`; }
@@ -1276,27 +1271,9 @@ function bindAboutEvents(){
 
   document.getElementById("btnChk").onclick = async (ev)=>{
     const b = ev.currentTarget; b.disabled = true; b.textContent = "检查中…";
-    try{ paint(await api("/api/update/check")); toast("已检查更新","good"); }
+    try{ paint({...await api("/api/update/status"), last_check: await api("/api/update/check")}); toast("已检查更新","good"); }
     catch(e){ toast(e.message,"bad"); }
     finally{ b.disabled = false; b.textContent = "检查更新"; }
-  };
-
-  document.getElementById("btnApply").onclick = async (ev)=>{
-    const b = ev.currentTarget;
-    if(!confirm("确认下载并更新到最新版本？\n更新完成后程序会自动重启。")) return;
-    b.disabled = true; b.textContent = "更新中…";
-    try{
-      const r = await api("/api/update/apply",{method:"POST"});
-      if(r.success){
-        toast("更新已就位，程序即将重启","good");
-        box.innerHTML = `<div class="banner good">已更新到 <b>${esc(r.new_version)}</b>，
-          程序正在退出以便替换二进制，稍后会自动重启。若未自动重启，请手动重新启动一次。</div>`;
-      }else{
-        toast(r.error||"更新失败","bad");
-        box.innerHTML = `<div class="banner warn">更新失败：${esc(r.error||"未知原因")}</div>`;
-      }
-    }catch(e){ toast(e.message,"bad"); }
-    finally{ b.disabled = false; b.textContent = "立即更新"; }
   };
 
   paintEnv();

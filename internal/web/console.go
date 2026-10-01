@@ -1668,13 +1668,13 @@ func (s *Server) updateStatus() map[string]any {
 	if s.Updater != nil && s.Updater.Repo() != "" {
 		repo = s.Updater.Repo()
 	}
-	// enabled     —— 能否「应用更新」（进程内替换二进制）。套件版恒为 false。
+	// enabled     —— 兼容旧客户端，所有平台恒为 false。
 	// checkable   —— 能否向 GitHub 查最新版本。套件版仍为 true，只是查到之后
 	//                不在这里装，而是引导用户去套件中心。
 	out := map[string]any{
 		"current_version": cur,
-		"enabled":         s.Updater != nil && !s.SuiteManaged,
-		"checkable":       s.Updater != nil,
+		"enabled":         false,
+		"checkable":       s.Updater != nil && s.Updater.Repo() != "",
 		"suite_managed":   s.SuiteManaged,
 		"package_managed": s.PackageManaged,
 		"update_hint":     s.manualUpdateHint(),
@@ -1725,41 +1725,13 @@ func (s *Server) apiUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, result, nil)
 }
 
-// apiUpdateApply 下载并替换二进制。
-//
-// 必须有管理员会话：这是唯一会改动磁盘上可执行文件的接口。
-// 替换成功后置重启标志，主循环监听到就优雅退出 ——
-// Windows 上随后由助手进程完成替换并重启，类 Unix 上由调用方重启。
+// apiUpdateApply preserves the old endpoint but never installs anything.
 func (s *Server) apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
 		s.deny(w, r)
 		return
 	}
-	if s.SuiteManaged {
-		// 套件 INFO 里登记了 package.tgz 的 checksum。进程内换掉二进制会让
-		// 「实际内容」与「已安装版本」对不上，下次套件中心校验或升级必然冲突。
-		writeJSON(w, 200, map[string]any{
-			"success": false,
-			"error":   s.manualUpdateHint(),
-		}, nil)
-		return
-	}
-	if s.Updater == nil {
-		writeJSON(w, 200, map[string]any{
-			"success": false,
-			"error":   "自更新未启用",
-		}, nil)
-		return
-	}
-	result, err := s.Updater.Apply(r.Context())
-	if err != nil {
-		writeJSON(w, 200, map[string]any{"success": false, "error": err.Error()}, nil)
-		return
-	}
-	if result.Success {
-		s.Updater.RequestRestart()
-	}
-	writeJSON(w, 200, result, nil)
+	writeJSON(w, 200, map[string]any{"success": false, "error": s.manualUpdateHint()}, nil)
 }
 
 // ---------------------------------------------------------------------------

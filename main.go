@@ -40,7 +40,7 @@ import (
 // Release tag 又是 v1.0.12-0002，用户根本对不上。而且 updater 的版本比较会在
 // 第一个 '-' 处截断，1.0.12-0002 与 1.0.12 被判成相等，永远显示「已是最新」。
 // 统一成一个号之后这些问题自然消失。
-var version = "1.0.27"
+var version = "1.0.28"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
 // 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
@@ -55,13 +55,6 @@ func env(key, fallback string) string {
 }
 
 func main() {
-	// 自更新助手模式：此时本进程唯一任务是等上一个进程退出、
-	// 换掉被锁定的 exe、再把新版本拉起来，然后立刻结束。
-	// 必须在任何初始化之前判断，否则助手会去抢端口。
-	if updater.SwapHelperRequested() {
-		os.Exit(updater.RunSwapHelper())
-	}
-
 	host := flag.String("host", env("AGNES_HUB_HOST", "127.0.0.1"), "监听地址（0.0.0.0 表示允许局域网访问）")
 	port := flag.String("port", env("AGNES_HUB_PORT", "4142"), "监听端口")
 	dataDir := flag.String("data", env("AGNES_HUB_DATA", ""), "数据目录（默认 ./data）")
@@ -97,7 +90,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	h.StartMaintenance(ctx)
+	maintenanceDone := h.StartMaintenance(ctx)
 
 	srv := web.New(store, h, relay.BuildClient())
 	srv.Version = version
@@ -114,18 +107,8 @@ func main() {
 	//
 	// 「查最新版本号」是只读的、没有副作用，保留：控制台要如实显示
 	// 「最新版本 / 发布时间 / 是否已是最新」。检查频率 12 小时。
-	exe, _ := os.Executable()
 	checkInterval := 12 * time.Hour
-	updCfg := updater.Config{
-		Repo:          releaseRepo,
-		BinaryName:    "agnes-hub-go",
-		DataDir:       *dataDir,
-		CheckInterval: checkInterval,
-		// 本仓库的 release 资产是 SPK，不是裸二进制，pickAsset 永远挑不到 ——
-		// 若不告诉 updater，它会判定「没有本平台的资产」→ 恒显示「已是最新」。
-		SuiteManaged: true,
-	}
-	upd := updater.New(updCfg, version, exe, nil)
+	upd := updater.New(updater.Config{Repo: releaseRepo}, version, nil)
 	srv.SetUpdater(upd)
 	srv.SetSuiteManaged(true)
 	srv.SetPackageManaged(*noSelfUpdate)
@@ -137,25 +120,6 @@ func main() {
 	go func() {
 		if _, err := upd.Check(ctx); err != nil {
 			log.Printf("检查更新失败：%v", err)
-		}
-	}()
-
-	// 应用完更新后要真的退出：光置一个标志位没人看，
-	// 必须有人把它翻译成取消信号，进程才会走到优雅关闭。
-	go func() {
-		t := time.NewTicker(500 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if upd.NeedRestart() {
-					fmt.Println("自更新已就位，正在退出以便替换二进制…")
-					cancel()
-					return
-				}
-			}
 		}
 	}()
 
@@ -260,6 +224,12 @@ func main() {
 	}
 	wg.Wait()
 	<-shutdownDone
+	<-maintenanceDone
+	// Flush again after in-flight requests finish.
+	if err := store.FlushBindings(); err != nil {
+		log.Printf("保存会话绑定失败：%v", err)
+	}
+	store.FlushAccounts()
 	fmt.Println("Agnes Hub 已停止。")
 }
 
