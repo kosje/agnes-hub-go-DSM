@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.29"
+var version = "1.0.30"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
 // 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
@@ -235,8 +235,9 @@ func main() {
 	<-shutdownDone
 	<-maintenanceDone
 	// Flush again after in-flight requests finish.
-	store.FlushBindings()
-	store.FlushAccounts()
+	if err := store.FlushPending(); err != nil {
+		log.Printf("停止服务时保存数据失败：%v", err)
+	}
 	fmt.Println("Agnes Hub 已停止。")
 }
 

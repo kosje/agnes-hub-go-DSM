@@ -80,7 +80,7 @@ type Metrics struct {
 	BudgetExhausted atomic.Int64
 	// BudgetDayRollovers 累计「跨天自动清零日预算」次数（观测滚动是否生效）。
 	BudgetDayRollovers atomic.Int64
-	StartedAt     time.Time
+	StartedAt          time.Time
 }
 
 // Hub 是调度器。
@@ -118,8 +118,8 @@ type Hub struct {
 
 	// #24 AutoScenario 冷却防抖：最近一次自动切换情景的时间 + 当时的目标情景。
 	// 同一情景 60s 内不重复切（避免在两个情景边界来回抖动）。
-	autoMu          sync.Mutex
-	lastAutoSwitch  time.Time
+	autoMu           sync.Mutex
+	lastAutoSwitch   time.Time
 	lastAutoScenario string
 
 	// Metrics 是运行指标（/healthz 与控制台观测）。
@@ -729,12 +729,11 @@ func (h *Hub) flushFactors() {
 	}
 	// 兜底：把统计字段（RateLimited / LastError / 熔断状态等）批量写一次，
 	// 热路径里改这些字段的代码一律走 MutateAccountNoSave，这里统一落盘。
-	h.store.FlushAccounts()
 	// #20 热路径异步落盘：批量写下游密钥（ChargeKey 只改内存）+ 批量追加 usage 日志
 	// （AppendUsage 只入内存缓冲）+ 批量写粘性绑定（Bind 只改内存）。挂机丢 ≤30s 可接受。
-	h.store.FlushKeys()
-	h.store.FlushUsage()
-	h.store.FlushBindings()
+	if err := h.store.FlushPending(); err != nil {
+		log.Printf("保存待落盘数据失败，将在下一轮重试：%v", err)
+	}
 }
 
 // rollDailyBudgets 维护循环调用：跨天时把各账号的日预算归属日滚动到「今天」，
@@ -911,7 +910,7 @@ type pickScore struct {
 	priority    int
 	budgetTier  int // 0 = 更优先（按 RoutingMode 决定速率型/用量型谁先被吃），1 = 兜底
 	regionMatch bool
-	sessions    int           // 该账号当前被多少个活跃任务（粘性会话）绑定；新任务优先分散到没人用的号
+	sessions    int // 该账号当前被多少个活跃任务（粘性会话）绑定；新任务优先分散到没人用的号
 	wait        time.Duration
 	inflight    int
 }
@@ -940,9 +939,9 @@ func (s pickScore) betterThan(o pickScore) bool {
 
 // budgetTier 依据 RoutingMode 给账号打「预算偏好层」：
 //
-//	- rate_first（默认）：速率型（无日预算，agnles）tier 0 主力，用量型（有日预算，CF）tier 1 兜底；
-//	- budget_first：用量型 tier 0 先烧免费配额，速率型 tier 1 兜底；
-//	- balanced / 未知：一律 tier 0（不做偏好，纯按区域/等待/在途排，等同旧行为）。
+//   - rate_first（默认）：速率型（无日预算，agnles）tier 0 主力，用量型（有日预算，CF）tier 1 兜底；
+//   - budget_first：用量型 tier 0 先烧免费配额，速率型 tier 1 兜底；
+//   - balanced / 未知：一律 tier 0（不做偏好，纯按区域/等待/在途排，等同旧行为）。
 //
 // 注意：预算已耗尽的账号在 Candidates 阶段已被剔除，这里只处理「仍有余量的两类」。
 func (h *Hub) budgetTier(a *config.Account, mode string) int {
@@ -1509,23 +1508,23 @@ func (h *Hub) Snapshot() map[string]any {
 	}
 	return map[string]any{
 		"metrics": map[string]any{
-			"started_at":      h.Metrics.StartedAt.Format("2006-01-02 15:04:05"),
-			"uptime_sec":      int(time.Since(h.Metrics.StartedAt).Seconds()),
-			"requests_total":  h.Metrics.RequestsTotal.Load(),
-			"requests_ok":     h.Metrics.RequestsOK.Load(),
-			"requests_error":  h.Metrics.RequestsError.Load(),
-			"upstream_429":    h.Metrics.Upstream429.Load(),
-			"queued_total":    h.Metrics.QueuedTotal.Load(),
-			"queue_timeout":   h.Metrics.QueueTimeout.Load(),
-			"queue_overflow":  h.Metrics.QueueOverflow.Load(),
-			"spillovers":      h.Metrics.Spillovers.Load(),
-			"continuations":   h.Metrics.Continuations.Load(),
+			"started_at":        h.Metrics.StartedAt.Format("2006-01-02 15:04:05"),
+			"uptime_sec":        int(time.Since(h.Metrics.StartedAt).Seconds()),
+			"requests_total":    h.Metrics.RequestsTotal.Load(),
+			"requests_ok":       h.Metrics.RequestsOK.Load(),
+			"requests_error":    h.Metrics.RequestsError.Load(),
+			"upstream_429":      h.Metrics.Upstream429.Load(),
+			"queued_total":      h.Metrics.QueuedTotal.Load(),
+			"queue_timeout":     h.Metrics.QueueTimeout.Load(),
+			"queue_overflow":    h.Metrics.QueueOverflow.Load(),
+			"spillovers":        h.Metrics.Spillovers.Load(),
+			"continuations":     h.Metrics.Continuations.Load(),
 			"soft_fail_retries": h.Metrics.SoftFailRetries.Load(),
 			"soft_fail_gave_up": h.Metrics.SoftFailGaveUp.Load(),
 			"resumed_streams":   h.Metrics.ResumedStreams.Load(),
 			// 已进入网关但未走完的转发请求数（区分「客户端没发」与「卡在网关内」）
-			"pending":  h.Metrics.Pending.Load(),
-			"accepted": h.Metrics.Accepted.Load(),
+			"pending":         h.Metrics.Pending.Load(),
+			"accepted":        h.Metrics.Accepted.Load(),
 			"breaker_opened":  h.Metrics.BreakerOpened.Load(),
 			"breaker_revived": h.Metrics.BreakerRevived.Load(),
 			"wait_ms_total":   h.Metrics.WaitMS.Load(),

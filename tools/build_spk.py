@@ -54,6 +54,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tarfile
 import zlib
@@ -887,6 +888,22 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
     return d, md5
 
 
+def validate_build_provenance(binary):
+    """拒绝从有未提交修改的源码或另一提交构建的二进制。"""
+    metadata = subprocess.check_output(
+        ["go", "version", "-m", binary], cwd=ROOT, text=True, encoding="utf-8")
+    revision = re.search(r"vcs\.revision=(\w+)", metadata)
+    if "vcs.modified=false" not in metadata or revision is None:
+        raise ValueError("二进制必须从干净 Git 工作树构建（vcs.modified=false）")
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if revision.group(1) != head:
+        raise ValueError("二进制记录的源码提交与当前 HEAD 不一致，请重新编译")
+    if subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, text=True).strip():
+        raise ValueError("打包前请先提交源码，工作树必须干净")
+
+
 def build_spk(bundle, out_path):
     """组装 DSM SPK。
 
@@ -1024,6 +1041,7 @@ def main():
 
     for arch, binary_name in targets:
         binary_src = os.path.join(ROOT, binary_name)
+        validate_build_provenance(binary_src)
         bundle, md5 = prepare_arch(arch, binary_src, spk_ver, icon_src)
         out = os.path.join(OUT_DIR, "%s-%s-%s.spk" % (APP_ID, arch, spk_ver))
         build_spk(bundle, out)

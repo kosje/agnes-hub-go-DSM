@@ -471,6 +471,9 @@ python tools/build_catalog.py
 `link` 指向这份副本（Pages 直出、无跳转）。历史版本以 GitHub Release 为准。Release 上仍保留一份作为镜像；想让 `link` 指回 Release
 用 `--link-from-release`，但不推荐，原因见「直接下载」一节。
 
+打包前须先提交源码，并从干净工作树交叉编译。打包脚本会调用 `go version -m` 和 Git，
+要求二进制记录 `vcs.modified=false`，且 `vcs.revision` 与当前源码提交一致，否则拒绝打包。
+
 构建是**可复现**的：同源码同版本号连续构建两次，SPK 的 md5 完全一致
 （tar 条目的 mtime 与内层 gzip 容器头都已归零）。这点很重要 ——
 套件源 catalog 里声明的 md5 必须与实际发布的文件对得上。

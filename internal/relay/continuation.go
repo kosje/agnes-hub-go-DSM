@@ -20,7 +20,6 @@ package relay
 //   - 工具调用截断（tool_calls 参数被截断）不续写——提取不到部分文本时原样透传。
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -328,107 +327,6 @@ func doOnceWithContinuation(ctx context.Context, h *hub.Hub, client *http.Client
 
 // ---- 流式续写 ----
 
-// sseFilter 是 SSE 逐行过滤器：记录 finish_reason、累积 delta 文本、
-// 吞掉 finish chunk 与 data: [DONE]（由 continuationStream 在真正结束时补发）。
-// 非 OpenAI chunk 格式自动切换原样透传。
-type sseFilter struct {
-	sc           *bufio.Scanner
-	pending      []byte // 已过滤待读字节
-	eof          bool
-	pass         bool   // 非 OpenAI 格式，原样透传
-	finish       []byte // 缓存的 finish chunk 行（原样字节，含 \n）
-	finishReason string
-	partial      strings.Builder
-	sawOpenAI    bool
-	// ---- 韧性：识别「这一段没能正常产出」的各种形态 ----
-	readErr     error  // 传输层读异常（连接重置 / 看门狗超时），非 io.EOF
-	upstreamErr bool   // 中途出现 {"error":...} 帧
-	blocked     bool   // finish_reason 为审查类（content_filter / SAFETY ...）
-}
-
-func newSSEFilter(r io.Reader) *sseFilter {
-	f := &sseFilter{}
-	f.sc = bufio.NewScanner(r)
-	f.sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	return f
-}
-
-func (f *sseFilter) emit(line string) {
-	f.pending = append(f.pending, line...)
-	f.pending = append(f.pending, '\n')
-}
-
-// fill 从 scanner 尽量填充 pending，返回是否有了新数据。
-func (f *sseFilter) fill() bool {
-	for f.sc.Scan() {
-		line := f.sc.Text()
-		if f.pass {
-			f.emit(line)
-			return true
-		}
-		if !strings.HasPrefix(line, "data:") {
-			f.emit(line)
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "[DONE]" {
-			continue // 吞掉，结尾由 continuationStream 补发
-		}
-		var chunk map[string]any
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			f.emit(line)
-			continue
-		}
-		// 中途 error 帧：吞掉。客户端收到就会中断在途任务，所以由网关自己
-		// 决定「重发一轮」还是「续写」，不把错误外泄。
-		if ev, ok := chunk["error"]; ok && ev != nil {
-			f.upstreamErr = true
-			continue
-		}
-		choices, ok := chunk["choices"].([]any)
-		if !ok {
-			// usage-only 收尾帧（stream_options.include_usage）等：原样下发
-			f.sawOpenAI = true
-			f.emit(line)
-			continue
-		}
-		f.sawOpenAI = true
-		if len(choices) > 0 {
-			if c, ok := choices[0].(map[string]any); ok {
-				if d, ok := c["delta"].(map[string]any); ok {
-					f.partial.WriteString(anyContentToString(d["content"]))
-				}
-				if fr, _ := c["finish_reason"].(string); fr != "" {
-					f.finishReason = fr
-					f.finish = append([]byte(line), '\n')
-					if fr != "length" && blocksContent[fr] {
-						f.blocked = true
-					}
-					continue // 吞掉 finish chunk，收尾时决定是否补发
-				}
-			}
-		}
-		f.emit(line)
-		return true
-	}
-	f.eof = true
-	return false
-}
-
-func (f *sseFilter) Read(p []byte) (int, error) {
-	for len(f.pending) == 0 {
-		if f.eof {
-			return 0, io.EOF
-		}
-		if !f.fill() {
-			return 0, io.EOF
-		}
-	}
-	n := copy(p, f.pending)
-	f.pending = f.pending[n:]
-	return n, nil
-}
-
 // continuationStream 把「多轮续写的 SSE 流」封装成一个 ReadCloser：
 // 当前段读到 EOF 时，若上一段 finish_reason=length 且还有轮数，就自动重新
 // 排队发起新一轮请求继续推；轮数用尽或正常结束时补发 finish chunk + [DONE]。
@@ -442,10 +340,14 @@ type continuationStream struct {
 	rounds      int
 	resume      bool // StreamAutoResume：断流/error 帧/异常时自动重连续写
 
-	round  int
-	cur    *Result
-	f      *sseFilter
-	closed bool
+	round       int
+	cur         *Result
+	f           *sseFilter
+	closed      bool
+	accumulated strings.Builder
+	ended       bool
+	tail        []byte
+	endErr      error
 }
 
 func newContinuationStream(ctx context.Context, h *hub.Hub, client *http.Client,
@@ -463,7 +365,7 @@ func newContinuationStream(ctx context.Context, h *hub.Hub, client *http.Client,
 // 前提：客户端还没拿到完整答案，网关此时收尾就等于让它的任务停在中途。
 // 只在 OpenAI 风格 SSE 上介入（认不出的格式一律原样透传，零回归）。
 func (c *continuationStream) shouldResume() bool {
-	if !c.resume || c.round >= c.rounds {
+	if c.round >= c.rounds || c.f.pass || c.f.hasTools {
 		return false
 	}
 	if c.ctx != nil && c.ctx.Err() != nil {
@@ -473,9 +375,13 @@ func (c *continuationStream) shouldResume() bool {
 		return false // 非 OpenAI SSE 格式：不改动，保持原样
 	}
 	partial := strings.TrimSpace(c.f.partial.String())
+	if c.f.finishReason == "length" {
+		return true
+	}
+	if !c.resume {
+		return false
+	}
 	switch {
-	case c.f.finishReason == "length":
-		return true // 明确被 max_tokens 截断 → 续写
 	case c.f.upstreamErr:
 		return true // 中途 error 帧 → 有产出就续写，没产出就整轮重发
 	case c.f.readErr != nil:
@@ -490,7 +396,8 @@ func (c *continuationStream) shouldResume() bool {
 
 // advance 结束当前段并切换到下一轮。返回 false 表示无法继续（应收尾）。
 func (c *continuationStream) advance() bool {
-	partial := strings.TrimSpace(c.f.partial.String())
+	c.accumulated.WriteString(c.f.partial.String())
+	partial := c.accumulated.String()
 	if c.round >= c.rounds {
 		return false
 	}
@@ -499,11 +406,16 @@ func (c *continuationStream) advance() bool {
 	if prev != nil && prev.Account != nil {
 		prevAcc = prev.Account.ID
 	}
+	// The completed round must release its concurrency token before requesting
+	// another. Otherwise a single-slot account waits for itself indefinitely.
+	if prev != nil {
+		prev.Close()
+	}
 	c.round++
 	noteContinuation(c.h)
 	var next *Result
 	var err error
-	if partial == "" {
+	if strings.TrimSpace(partial) == "" {
 		// 本段毫无产出（空流 / 一上来就是 error / 连接即失败）：
 		// 不能追加续写消息（没有前缀可续），改用原始请求换号重发一轮。
 		next, err = refireOnce(c.ctx, c.h, c.client, c.opts, c.origBodyFor, prevAcc)
@@ -518,9 +430,6 @@ func (c *continuationStream) advance() bool {
 	}
 	c.cur = next
 	c.f = newSSEFilter(next.Stream)
-	if prev != nil {
-		prev.Close()
-	}
 	return true
 }
 
@@ -531,14 +440,32 @@ func refireOnce(ctx context.Context, h *hub.Hub, client *http.Client,
 	wrapped.BodyFor = origBodyFor
 	wrapped.SessionKey = "" // 断粘性：本就是要换一个号
 	if excludeAcc != "" {
-		wrapped.Exclude = map[string]bool{excludeAcc: true}
+		wrapped.Exclude = make(map[string]bool, len(opts.Exclude)+1)
+		for id, excluded := range opts.Exclude {
+			wrapped.Exclude[id] = excluded
+		}
+		wrapped.Exclude[excludeAcc] = true
 	}
 	return doOnce(ctx, h, client, wrapped)
 }
 
 func (c *continuationStream) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for {
 		if c.closed {
+			return 0, io.EOF
+		}
+		if c.ended {
+			if len(c.tail) > 0 {
+				n := copy(p, c.tail)
+				c.tail = c.tail[n:]
+				return n, nil
+			}
+			if c.endErr != nil {
+				return 0, c.endErr
+			}
 			return 0, io.EOF
 		}
 		n, err := c.f.Read(p)
@@ -569,7 +496,7 @@ func (c *continuationStream) Read(p []byte) (int, error) {
 		// 也没收到 [DONE] 就断开」当成连接错误抛给上层——正是「任务中途停止」
 		// 最常见的表现。所以即便这一段是被错误中断的，也要合成一个 stop 帧。
 		var tail []byte
-		if c.f.sawOpenAI {
+		if c.f.sawOpenAI && !c.f.pass {
 			if len(c.f.finish) > 0 {
 				tail = append(tail, c.f.finish...)
 			} else {
@@ -577,17 +504,13 @@ func (c *continuationStream) Read(p []byte) (int, error) {
 			}
 			tail = append(tail, []byte("data: [DONE]\n\n")...)
 		}
+		c.endErr = c.f.readErr
+		if c.ctx != nil && c.ctx.Err() != nil {
+			c.endErr = c.ctx.Err()
+		}
 		c.closeCurrent()
-		if len(tail) == 0 {
-			return 0, io.EOF
-		}
-		if len(p) < len(tail) {
-			// p 太小（io.Copy 的 p 足够大，不会发生）：兜底塞 pending
-			c.f.pending = append(c.f.pending, tail...)
-			continue
-		}
-		copy(p, tail)
-		return len(tail), io.EOF
+		c.ended = true
+		c.tail = tail
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -217,10 +218,10 @@ type DownstreamKey struct {
 	UsedTotal     int64    `json:"used_total"`
 	UsedToday     int64    `json:"used_today"`
 	// 令牌（token）用量统计：UsedTokensToday 按天滚动，UsedTokensTotal 累计。
-	UsedTokensTotal int64  `json:"used_tokens_total"`
-	UsedTokensToday int64  `json:"used_tokens_today"`
-	UsedDate      string   `json:"used_date"`
-	CreatedAt     float64  `json:"created_at"`
+	UsedTokensTotal int64   `json:"used_tokens_total"`
+	UsedTokensToday int64   `json:"used_tokens_today"`
+	UsedDate        string  `json:"used_date"`
+	CreatedAt       float64 `json:"created_at"`
 }
 
 // Binding 是「任务 → 账号」的粘性绑定。
@@ -512,18 +513,18 @@ func DefaultSettings() Settings {
 		ProbeModel:           "agnes-2.5-flash",
 		OptimizationMode:     "concurrent_batch",
 		ImageRecordRetention: 30,
-		ImageMaxCapacity: 500,
-		VideoMaxCapacity: 200,
+		ImageMaxCapacity:     500,
+		VideoMaxCapacity:     200,
 		// 注意：这里刻意**不**在 normalizeSettings 里给它补默认值。
 		// 旧版 settings.json 里没有这个键，反序列化时会保留这里的默认值；
 		// 而用户显式写 0 表示「不限」，一旦在 normalize 里补默认值就永远关不掉了。
-		VideoCacheMaxMB:     2048,
-		RegionPriority:      "cn_first",
-		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
-		FreeTextRPM:         10,    // agnes 免费档文本池标称 RPM（可配置）
-		StreamIdleTimeoutMS: 60000, // 流式空闲看门狗：连续 60s 无新字节才断开
-		UsageLogMaxLines:    20000, // usage.jsonl 滚动保留最大行数
-		UsageRequestLogBytes: 512,  // 日志「用户完整请求」保留字节上限
+		VideoCacheMaxMB:       2048,
+		RegionPriority:        "cn_first",
+		RequestTimeoutMS:      30000,  // 默认 30s 上游请求超时
+		FreeTextRPM:           10,     // agnes 免费档文本池标称 RPM（可配置）
+		StreamIdleTimeoutMS:   60000,  // 流式空闲看门狗：连续 60s 无新字节才断开
+		UsageLogMaxLines:      20000,  // usage.jsonl 滚动保留最大行数
+		UsageRequestLogBytes:  512,    // 日志「用户完整请求」保留字节上限
 		RateLimitRetryMax:     6,      // 429 网关内部自动重试次数上限（换账号+重新排队）
 		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
 		// MAX_TOKENS 截断自动续写：默认 2 轮（截断不再打断客户端任务）。
@@ -557,20 +558,20 @@ func DefaultSettings() Settings {
 
 // ScenarioPreset 是一个情景的参数包。
 type ScenarioPreset struct {
-	Name        string   `json:"name"`
-	Desc        string   `json:"desc"`
-	Safety      float64  `json:"safety_factor"`
-	FreeTextRPM float64  `json:"free_text_rpm"`
-	RetryMax    int      `json:"retry_max"`
-	RetryBaseMS int      `json:"retry_base_backoff_ms"`
-	RetryCapMS  int      `json:"retry_max_backoff_ms"`
-	QueueSize   int      `json:"queue_max_size"`
-	QueueWaitMS int      `json:"queue_max_wait_ms"`
-	ImageConc   int      `json:"image_concurrency"`
-	VideoInFlt  int      `json:"video_max_inflight"`
-	StreamIdle  int      `json:"stream_idle_timeout_ms"`
-	TwoLevel    bool     `json:"text_two_level_queue"`
-	Region      string   `json:"region_priority"`
+	Name        string  `json:"name"`
+	Desc        string  `json:"desc"`
+	Safety      float64 `json:"safety_factor"`
+	FreeTextRPM float64 `json:"free_text_rpm"`
+	RetryMax    int     `json:"retry_max"`
+	RetryBaseMS int     `json:"retry_base_backoff_ms"`
+	RetryCapMS  int     `json:"retry_max_backoff_ms"`
+	QueueSize   int     `json:"queue_max_size"`
+	QueueWaitMS int     `json:"queue_max_wait_ms"`
+	ImageConc   int     `json:"image_concurrency"`
+	VideoInFlt  int     `json:"video_max_inflight"`
+	StreamIdle  int     `json:"stream_idle_timeout_ms"`
+	TwoLevel    bool    `json:"text_two_level_queue"`
+	Region      string  `json:"region_priority"`
 	// 429 网关内自动重试预算（随情景走）：挂机批量/写代码更高更久（多等少错、不中断任务），
 	// 交互场景更短（快失败快切号），生图保守（非幂等、防重复扣费）。
 	// RateLimitRetryMax=0 表示沿用该情景 RetryMax；RateLimitWaitBudget=0 表示不限等待预算。
@@ -740,22 +741,21 @@ func RecommendScenario(p LoadProfile) (ScenarioPreset, string) {
 
 // Store 是全部持久化状态的唯一真源。
 type Store struct {
-	mu        sync.RWMutex
-	Dir       string
-	Settings  Settings
-	Accounts  []*Account
-	Keys      []*DownstreamKey
-	Bindings  map[string]Binding
-	Jobs      map[string]*VideoJob
-	ImageJobs map[string]*ImageJob
-	ChatLogs  map[string]*ChatLog
+	mu            sync.RWMutex
+	Dir           string
+	Settings      Settings
+	Accounts      []*Account
+	Keys          []*DownstreamKey
+	Bindings      map[string]Binding
+	Jobs          map[string]*VideoJob
+	ImageJobs     map[string]*ImageJob
+	ChatLogs      map[string]*ChatLog
 	adminSessions *sessionTable
 	chatSessions  *sessionTable
 
 	// keyInflight 是各下游密钥「已通过额度检查、尚未结束」的请求数（受 mu 保护）。
 	keyInflight map[string]int
-	// usageLineCount 是 usage.jsonl 的累计行数（进程内估计，启动时从文件读一次，
-	// 之后按追加行数增长）。P1-1 用它触发滚动截断，避免长期挂机把磁盘写满。
+	// usageLineCount tracks committed lines only, excluding the pending buffer.
 	usageLineCount atomic.Int64
 	// #20 热路径异步落盘：
 	//   keysDirty 由 ChargeKey 在改内存后打标，维护循环 FlushKeys 批量写盘（避免每请求
@@ -763,9 +763,10 @@ type Store struct {
 	//   usageBuf/usageMu 收集待落盘的 usage 记录，FlushUsage 批量追加（一次 Open/Write 多行
 	//   一次 Close），用独立锁避免与 s.mu（keys/accounts/settings 读多写少）耦合。
 	keysDirty atomic.Bool
-	// usageMu 串行化 usage.jsonl 的追加与保留期改写，避免改写期间追加的行丢失。
-	usageMu  sync.Mutex
-	usageBuf []map[string]any
+	// usageMu protects the in-memory buffer; usageFileMu protects the disk state.
+	usageMu     sync.Mutex
+	usageFileMu sync.Mutex // Serializes append, truncate, prune and live snapshots.
+	usageBuf    []map[string]any
 	// #20 补漏：bindingsDirty 由热路径 Bind（Pick 每个粘性会话请求都会调）打标，
 	// 维护循环 FlushBindings 批量写盘，避免每请求同步 saveBindingsLocked。
 	// 与 keysDirty 一样走 s.mu 保护（s.Bindings 在 s.mu 下），无需独立锁。
@@ -1030,7 +1031,7 @@ func asString(v any) string {
 		return fmt.Sprintf("%v", t)
 	}
 }
-//
+
 // model_manifest 的语义：**缺失（nil）→ 用默认清单补齐**（视为「还没声明」）；
 // **非 nil 的空切片 → 保留为空**（视为「明示不支持该模态」）。
 func normalizeAccount(a *Account, s Settings) {
@@ -1338,10 +1339,10 @@ func (s *Store) TouchStatsDirty(id string) {
 
 // FlushAccounts 把内存中所有账号的状态写一次 accounts.json。
 // 用于维护循环的批量落盘（替代热路径里的同步写盘）。
-func (s *Store) FlushAccounts() {
+func (s *Store) FlushAccounts() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_ = s.saveAccountsLocked()
+	return s.saveAccountsLocked()
 }
 
 // RollDailyBudgets 把所有账号的日预算归属日滚动到指定自然日（本地时区今天）。
@@ -1549,13 +1550,17 @@ func (s *Store) MutateKey(value string, fn func(*DownstreamKey) bool) bool {
 // FlushKeys 批量落盘下游密钥（#20：维护循环周期调用）。
 // 仅当 ChargeKey 在内存改过（keysDirty=true）才真正写一次盘，把「每请求全量
 // saveKeysLocked」降为「30s 一次」；与 FlushAccounts 的兜底写盘同口径。
-func (s *Store) FlushKeys() {
-	if !s.keysDirty.CompareAndSwap(true, false) {
-		return // 无脏数据
-	}
+func (s *Store) FlushKeys() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_ = s.saveKeysLocked()
+	if !s.keysDirty.Load() {
+		return nil
+	}
+	if err := s.saveKeysLocked(); err != nil {
+		return err
+	}
+	s.keysDirty.Store(false)
+	return nil
 }
 
 // KeysSnapshot 返回密钥列表深拷贝。
@@ -1692,20 +1697,25 @@ func (s *Store) Bind(sessionKey, accountID string) {
 		s.Bindings = map[string]Binding{}
 	}
 	s.Bindings[sessionKey] = Binding{AccountID: accountID, Updated: float64(time.Now().UnixNano()) / 1e9}
-	s.gcBindingsLocked()
 	s.bindingsDirty.Store(true)
 }
 
 // FlushBindings 批量落盘粘性绑定（#20 补漏：维护循环周期调用）。
 // 仅当热路径 Bind 改过（bindingsDirty=true）才真正写一次盘；与 FlushKeys 同口径。
-func (s *Store) FlushBindings() {
-	if !s.bindingsDirty.CompareAndSwap(true, false) {
-		return
-	}
+func (s *Store) FlushBindings() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gcBindingsLocked()
-	_ = s.saveBindingsLocked()
+	if !s.bindingsDirty.Load() {
+		return nil
+	}
+	return s.saveBindingsLocked()
+}
+
+// FlushPending is shared by maintenance and shutdown; every store is attempted
+// even when one write fails. Dirty flags/buffers remain available for retry.
+func (s *Store) FlushPending() error {
+	return errors.Join(s.FlushAccounts(), s.FlushKeys(), s.FlushUsage(), s.FlushBindings())
 }
 
 // BindingsGet 读取绑定。
@@ -1994,7 +2004,7 @@ func (s *Store) saveChatLogsLocked() error { return writeJSON(s.path("chat_logs.
 
 // AppendUsage 记录一行 usage（#20：热路径不再每请求 Open/Write/Close）。
 // 改为入内存缓冲 usageBuf，由维护循环 FlushUsage 批量落盘（一次 Open/Write 多行
-// 一次 Close）。usageLineCount 仍按记录数原子自增，用于触发滚动截断。
+// 一次 Close）。计数与滚动截断在批量成功保存之后执行。
 func (s *Store) AppendUsage(record map[string]any) {
 	if record == nil {
 		return
@@ -2003,74 +2013,6 @@ func (s *Store) AppendUsage(record map[string]any) {
 	s.usageBuf = append(s.usageBuf, record)
 	s.usageMu.Unlock()
 
-	// 行数计数只作「是否该截断」的触发器，真正截断在 FlushUsage 批量落盘后
-	// 于磁盘态上执行（此处文件里还没有这批缓冲行，不能据此截断）。
-	s.usageLineCount.Add(1)
-}
-
-// FlushUsage 批量把 usageBuf 里的记录一次性追加到 usage.jsonl（#20：维护循环周期调用）。
-// 一次 Open/Write 多行 + 一次 Close，把「每请求一次磁盘往返」降为「30s 一次批量写」。
-// 与 429 不写盘同口径：挂机期间若进程被杀，最多丢最近一个 flush 周期（≤30s）的日志。
-func (s *Store) FlushUsage() {
-	s.usageMu.Lock()
-	if len(s.usageBuf) == 0 {
-		s.usageMu.Unlock()
-		return
-	}
-	batch := s.usageBuf
-	s.usageBuf = nil
-	s.usageMu.Unlock()
-
-	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		// 写盘失败：记录放回缓冲头部，下轮重试（不丢数据）。
-		s.usageMu.Lock()
-		s.usageBuf = append(batch, s.usageBuf...)
-		s.usageMu.Unlock()
-		return
-	}
-	var sb strings.Builder
-	for _, rec := range batch {
-		line, err := json.Marshal(rec)
-		if err != nil {
-			continue
-		}
-		sb.Write(line)
-		sb.WriteByte('\n')
-	}
-	if sb.Len() > 0 {
-		_, _ = f.WriteString(sb.String())
-	}
-	_ = f.Close()
-
-	// 批量落盘完成后，基于磁盘态做一次截断（P1-1 滚动日志防磁盘写满）。
-	maxLines := s.Settings.UsageLogMaxLines
-	if maxLines > 0 && s.usageLineCount.Load()%int64(maxLines) == 0 {
-		s.truncateUsageLog(maxLines)
-	}
-}
-
-// truncateUsageLog 把 usage.jsonl 截断为最近 keep 行，并更新计数。
-func (s *Store) truncateUsageLog(keep int) {
-	path := s.path("usage.jsonl")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > keep {
-		lines = lines[len(lines)-keep:]
-	}
-	out := strings.TrimRight(strings.Join(lines, "\n"), "\n")
-	if out != "" {
-		out += "\n"
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(out), 0o644); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
-	s.usageLineCount.Store(countLines(path))
 }
 
 // countLines 统计文件的换行数（作为行数的近似基线）。
@@ -2086,6 +2028,15 @@ func countLines(path string) int64 {
 //
 // 只读文件尾部一段：旧实现每次都把整个 usage.jsonl 读进内存，而控制台每次刷新都调它。
 func (s *Store) TailUsage(n int) []map[string]any {
+	s.usageFileMu.Lock()
+	defer s.usageFileMu.Unlock()
+	return s.tailUsageLocked(n)
+}
+
+func (s *Store) tailUsageLocked(n int) []map[string]any {
+	if n <= 0 {
+		return nil
+	}
 	f, err := os.Open(s.path("usage.jsonl"))
 	if err != nil {
 		return nil
@@ -2138,6 +2089,8 @@ func (s *Store) TailUsage(n int) []map[string]any {
 // 日志页可见。pending 里的记录尚未上盘，与磁盘内容不重叠；结果倒序（最新在前），
 // 取最近 n 条。
 func (s *Store) TailUsageLive(n int) []map[string]any {
+	s.usageFileMu.Lock()
+	defer s.usageFileMu.Unlock()
 	if n <= 0 {
 		n = 200
 	}
@@ -2149,7 +2102,7 @@ func (s *Store) TailUsageLive(n int) []map[string]any {
 	s.usageMu.Unlock()
 
 	// 2) 磁盘尾部：多读 pending 的份数，保证合并后仍有 n 条可选
-	disk := s.TailUsage(n + pendingCount)
+	disk := s.tailUsageLocked(n + pendingCount)
 
 	out := make([]map[string]any, 0, n)
 	// pending 倒序遍历即「新→旧」，先取它（比磁盘里更近）
@@ -2198,8 +2151,8 @@ func (s *Store) PruneRetention(now time.Time) (imagesRemoved, usageRemoved int) 
 // pruneUsageLog 删掉 usage.jsonl 里早于 cutoff 的行（按行里的 ts 字段）。
 // 流式读写，不把整个文件读进内存；没有可删的行就不重写文件。
 func (s *Store) pruneUsageLog(cutoff time.Time) int {
-	s.usageMu.Lock()
-	defer s.usageMu.Unlock()
+	s.usageFileMu.Lock()
+	defer s.usageFileMu.Unlock()
 	path := s.path("usage.jsonl")
 	in, err := os.Open(path)
 	if err != nil {
@@ -2242,6 +2195,7 @@ func (s *Store) pruneUsageLog(cutoff time.Time) int {
 		_ = os.Remove(tmp)
 		return 0
 	}
+	s.usageLineCount.Add(-int64(removed))
 	return removed
 }
 

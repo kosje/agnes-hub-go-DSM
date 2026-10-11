@@ -31,12 +31,12 @@ import (
 type respKind int
 
 const (
-	respOK respKind = iota // 内容可用（含「认不出来」的异构结构）
-	respTruncated          // max_tokens 截断 → 交给续写层，不重发
-	respBlocked            // 安全/审查策略拒绝 → 换号重发可能成功
-	respEmpty              // 没有任何产出
-	respErrorish           // body 内嵌 error
-	respMalformed          // 非合法 JSON
+	respOK        respKind = iota // 内容可用（含「认不出来」的异构结构）
+	respTruncated                 // max_tokens 截断 → 交给续写层，不重发
+	respBlocked                   // 安全/审查策略拒绝 → 换号重发可能成功
+	respEmpty                     // 没有任何产出
+	respErrorish                  // body 内嵌 error
+	respMalformed                 // 非合法 JSON
 )
 
 func (k respKind) String() string {
@@ -59,16 +59,16 @@ func (k respKind) String() string {
 // blocksContent 是「上游主动中止生成」的 finish/stop reason。
 // 它不是截断（不缺 token），换个号常常就能正常输出，所以值得重发。
 var blocksContent = map[string]bool{
-	"content_filter":     true, // OpenAI
-	"SAFETY":             true, // Gemini
-	"RECITATION":         true,
-	"BLOCKLIST":          true,
-	"PROHIBITED_CONTENT": true,
-	"OTHER":              true,
-	"SPII":               true,
+	"content_filter":          true, // OpenAI
+	"SAFETY":                  true, // Gemini
+	"RECITATION":              true,
+	"BLOCKLIST":               true,
+	"PROHIBITED_CONTENT":      true,
+	"OTHER":                   true,
+	"SPII":                    true,
 	"MALFORMED_FUNCTION_CALL": true,
-	"refusal":            true, // Anthropic
-	"sensitive":          true,
+	"refusal":                 true, // Anthropic
+	"sensitive":               true,
 }
 
 // needRefire 判定该软失败是否值得「换号重发一轮」。
@@ -170,6 +170,13 @@ func classifyAnthropicResp(m map[string]any) respKind {
 		}
 		if blocksContent[sr] {
 			return respBlocked
+		}
+	}
+	if blocks, ok := m["content"].([]any); ok {
+		for _, block := range blocks {
+			if b, ok := block.(map[string]any); ok && (b["type"] == "tool_use" || b["type"] == "server_tool_use") {
+				return respOK
+			}
 		}
 	}
 	if strings.TrimSpace(anyContentToString(m["content"])) == "" {
