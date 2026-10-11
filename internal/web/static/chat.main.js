@@ -103,6 +103,7 @@ function renderApp(){
       <div id="chatView" class="msg-list"></div>
       <div id="imageView" class="hide" style="padding:16px;overflow-y:auto;flex:1"></div>
       <div id="videoView" class="hide" style="padding:16px;overflow-y:auto;flex:1"></div>
+      <div id="historyView" class="msg-list hide"></div>
       <div id="inputArea" class="input-area">
         <div class="setting-row" style="margin-bottom:8px">
           <div class="setting-group" style="max-width:260px">
@@ -174,6 +175,7 @@ function renderApp(){
   // 渲染生图/生视频视图（必须在 renderApp 之后调用）
   renderImageView();
   renderVideoView();
+  switchTab(state.tab);
 
   loadHistory();
   loadModels();
@@ -181,23 +183,43 @@ function renderApp(){
 
 function switchTab(tab){
   state.tab=tab;
+  state.historyTab=null;
+  document.getElementById("historyView").innerHTML="";
+  updateTabVisibility();
+}
+
+function updateTabVisibility(){
+  const tab=state.tab;
+  const inHistory=state.historyTab===tab;
   document.querySelectorAll(".tabs button").forEach(b=>b.classList.toggle("on",b.dataset.tab===tab));
-  document.getElementById("chatView").classList.toggle("hide",tab!=="chat");
-  document.getElementById("imageView").classList.toggle("hide",tab!=="image");
+  document.getElementById("chatView").classList.toggle("hide",tab!=="chat"||inHistory);
+  document.getElementById("imageView").classList.toggle("hide",tab!=="image"||inHistory);
   document.getElementById("videoView").classList.toggle("hide",tab!=="video");
-  document.getElementById("inputArea").classList.toggle("hide",tab!=="chat");
+  document.getElementById("historyView").classList.toggle("hide",!inHistory);
+  document.getElementById("inputArea").classList.toggle("hide",tab!=="chat"||inHistory);
   document.getElementById("historyList").classList.toggle("hide",tab!=="chat");
   document.getElementById("imgHistory").classList.toggle("hide",tab!=="image");
   document.getElementById("vidHistory").classList.toggle("hide",tab!=="video");
 }
 
+// 历史详情使用独立容器，保留草稿、生成结果和正在更新的消息节点。
+function openHistory(tab){
+  switchTab(tab);
+  state.historyTab=tab;
+  const view=document.getElementById("historyView");
+  view.innerHTML='<div><button class="sm" id="btnHistoryBack">← 返回</button></div>';
+  document.getElementById("btnHistoryBack").onclick=()=>switchTab(tab);
+  view.scrollTop=0;
+  updateTabVisibility();
+  return view;
+}
+
 /* ==================== CHAT ==================== */
-function addMsg(role,content,model,ts){
+function addMsg(role,content,model,ts,list=document.getElementById("chatView")){
   const div=document.createElement("div");
   div.className="msg "+(role==="user"?"user":"ass");
   const meta=model?`<div class="msg-meta">${esc(model)} · ${fmtDate(ts)}</div>`:"";
   div.innerHTML=`<div class="msg-bubble">${role==="user"?esc(content):renderMarkdown(content)}</div>${meta}`;
-  const list=document.getElementById("chatView");
   list.appendChild(div);
   list.scrollTop=list.scrollHeight;
   return div;
@@ -530,12 +552,10 @@ async function clearChatLogs(){
 function showChatLog(id){
   const j=state.chatLogs.find(x=>x.id===id);
   if(!j)return;
-  switchTab("chat");
-  const view=document.getElementById("chatView");
-  view.innerHTML="";
-  addMsg("user",j.prompt,null,j.created_at||Date.now()/1000);
-  addMsg("ass",j.reply||"",j.model,j.created_at||Date.now()/1000);
-  view.scrollTop=view.scrollHeight;
+  const view=openHistory("chat");
+  addMsg("user",j.prompt,null,j.created_at||Date.now()/1000,view);
+  addMsg("ass",j.reply||"",j.model,j.created_at||Date.now()/1000,view);
+  view.scrollTop=0;
 }
 
 async function deleteImgJob(id){
@@ -561,12 +581,13 @@ async function showImgJob(jobId){
   try{
     const resp=(state.imgJobs||[]).find(j=>j.job_id===jobId);
     if(!resp) throw new Error("记录不存在，请刷新");
-    const view=document.getElementById("imageView");
-    view.innerHTML=`
-      <button class="sm" onclick="switchTab('image')">← 返回</button>
+    const view=openHistory("image");
+    const detail=document.createElement("div");
+    detail.innerHTML=`
       <h3>图片任务: ${esc(jobId)}</h3>
       <p class="muted">模型: ${esc(resp.model||"?")} · 状态: ${esc(resp.status||"?")}</p>
       <img src="${safeImgURL(resp.url)?esc(resp.url):""}" style="max-width:100%;border-radius:8px;margin-top:10px">`;
+    view.appendChild(detail);
   }catch(e){toast(e.message,"bad");}
 }
 

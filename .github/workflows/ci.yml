@@ -31,6 +31,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./... -count=1 -timeout=300s
       - run: node tools/test_console_ui.cjs
+      - run: node tools/test_chat_ui.cjs
       - run: python tools/test_build_provenance.py
       - name: Cross-compile supported architectures
         run: |
