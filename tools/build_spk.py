@@ -904,8 +904,8 @@ def validate_build_provenance(binary):
         raise ValueError("打包前请先提交源码，工作树必须干净")
 
 
-def validate_ui_branding():
-    """合并上游后若恢复旧品牌，阻止把错误面板名称打进正式套件。"""
+def validate_ui_surface():
+    """防止合并上游时覆盖品牌或删除已恢复的控制台入口。"""
     ui_dir = os.path.join(ROOT, "internal", "web", "static")
     for name in ("console.html", "chat.html", "chat.main.js"):
         with open(os.path.join(ui_dir, name), encoding="utf-8") as fh:
@@ -914,6 +914,13 @@ def validate_ui_branding():
             raise ValueError("%s 含上游旧品牌文字，请在打包前清理" % name)
         if name == "console.html" and "<title>Agens-Hub 控制台</title>" not in text:
             raise ValueError("控制台品牌必须为 Agens-Hub 控制台")
+        if name == "console.html":
+            required = ("s_baseurl", "s_cmedia", "s_vswait", "s_vid_mb", "btnMediaBase",
+                        "mediaBaseBox", "btnChatPw", "btnChatPwClear", "renderForceChange",
+                        "public_base_url:g(\"s_baseurl\")", "/api/export?redact=1")
+            missing = [value for value in required if value not in text]
+            if missing:
+                raise ValueError("控制台缺少已恢复的入口或保存逻辑：%s" % "、".join(missing))
 
 
 def build_spk(bundle, out_path):
@@ -1031,7 +1038,7 @@ def main():
         return
 
     targets = select_targets(args.arch)
-    validate_ui_branding()
+    validate_ui_surface()
 
     go_version = read_version()
     spk_ver = spk_version(go_version)

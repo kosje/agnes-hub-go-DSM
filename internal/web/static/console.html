@@ -236,11 +236,41 @@ function renderShell(){
   document.getElementById("btnLogout").onclick = async ()=>{ await api("/api/logout",{method:"POST"}); location.reload(); };
   document.getElementById("btnPw").onclick = changePassword;
 }
+function renderForceChange(){
+  document.getElementById("app").innerHTML = `
+  <div class="login">
+    <div class="card">
+      <h1>请先修改初始密码</h1>
+      <p class="muted">初始密码人尽皆知，改掉之前控制台的其它功能不可用。</p>
+      <div id="toast" class="hide"></div>
+      <label>当前密码</label><input id="fcOld" type="password" autocomplete="current-password">
+      <label>新密码（至少 6 位）</label><input id="fcNew" type="password" autocomplete="new-password">
+      <label>确认新密码</label><input id="fcNew2" type="password" autocomplete="new-password">
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="btnFc">修改并进入控制台</button>
+        <button class="sm" id="btnFcOut">退出</button>
+      </div>
+    </div>
+  </div>`;
+  const go = async ()=>{
+    const o=document.getElementById("fcOld").value, a=document.getElementById("fcNew").value, b=document.getElementById("fcNew2").value;
+    if(a!==b){ toast("两次输入的新密码不一致","bad"); return; }
+    try{ await api("/api/password",{method:"POST",body:JSON.stringify({old_password:o,new_password:a})});
+      state.session.must_change_password=false; await boot(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
+  document.getElementById("btnFc").onclick = go;
+  document.getElementById("fcNew2").onkeydown = e=>{ if(e.key==="Enter") go(); };
+  document.getElementById("btnFcOut").onclick = async ()=>{ await api("/api/logout",{method:"POST"}); location.reload(); };
+  document.getElementById("fcOld").focus();
+}
+
 async function changePassword(){
+  const o = prompt("输入当前密码"); if(!o) return;
   const a = prompt("输入新密码（至少 6 位）"); if(!a) return;
   const b = prompt("再输入一次确认"); if(a!==b){ alert("两次输入不一致"); return; }
-  try{ await api("/api/password",{method:"POST",body:JSON.stringify({new_password:a})});
-    state.session.must_change_password=false; toast("密码已修改","good"); renderShell(); }
+  try{ await api("/api/password",{method:"POST",body:JSON.stringify({old_password:o,new_password:a})});
+    state.session.must_change_password=false; toast("密码已修改","good"); renderShell(); await refresh(); }
   catch(e){ alert(e.message); }
 }
 
@@ -406,6 +436,8 @@ function viewAccounts(){
     </div>
     <div class="card">
       <h2>批量导入</h2>
+      <div class="row" style="margin-bottom:8px"><button class="sm" id="btnUpModels">向上游拉取可用模型</button></div>
+      <div id="upModelsBox" style="margin-bottom:8px"></div>
       <label>每行一个账号：<span class="mono">名称,key[,base_url[,access_type[,group]]]</span>，以 # 开头的行会被忽略</label>
       <textarea id="bulkText" placeholder="账号-1,sk-xxxx,https://api.example.cn/v1,free,cn
 账号-2,sk-yyyy,https://api.example.cn/v1,free,cn"></textarea>
@@ -435,6 +467,7 @@ function viewAccounts(){
   </div>`;
 }
 function bindAccountEvents(){
+  bindUpstreamModels();
   const view = document.getElementById("view");
   const add = document.getElementById("btnAddAcc");
   const typeSel = document.getElementById("aType");
@@ -480,6 +513,58 @@ function bindAccountEvents(){
   view.querySelectorAll("button[data-act]").forEach(b=>b.onclick=()=>accountAction(b.dataset.act,b.dataset.id,b.dataset.on));
 }
 /* ---------------- 弹窗基础 ---------------- */
+function bindUpstreamModels(){
+  const btn = document.getElementById("btnUpModels");
+  const box = document.getElementById("upModelsBox");
+  if(!btn || !box) return;
+  btn.onclick = async ()=>{
+    btn.disabled = true; btn.textContent = "查询中…";
+    box.innerHTML = '<div class="muted">正在向各账号的上游查询模型列表…</div>';
+    try{
+      const r = await api("/api/models/upstream",{method:"POST",body:JSON.stringify({})});
+      box.innerHTML = renderUpstreamModels(r);
+    }catch(e){
+      box.innerHTML = `<div class="banner bad">${esc(e.message)}</div>`;
+    }finally{
+      btn.disabled = false; btn.textContent = "向上游拉取可用模型";
+    }
+  };
+}
+
+
+function renderUpstreamModels(r){
+  const results = r.results || [];
+  if(results.length === 0) return '<div class="banner info">没有启用中的账号可探测。</div>';
+  const mods = r.by_modality || {};
+  const summary = MODALITIES.map(m=>{
+    const list = mods[m] || [];
+    return `<div class="kpi"><div class="k">上游可用的 ${m} 模型（${list.length}）</div>
+      <div class="v" style="font-size:12px;font-family:var(--mono);word-break:break-all">${esc(list.join(", ")||"—")}</div></div>`;
+  }).join("");
+  const rows = results.map(x=>{
+    const miss = x.missing || {};
+    const missKeys = Object.keys(miss);
+    const missHTML = missKeys.length
+      ? missKeys.map(m=>`<div class="banner bad" style="margin:6px 0 0">
+          本地清单里的 <b>${esc(m)}</b> 模型上游没给：<span class="mono">${esc(miss[m].join(", "))}</span>
+        </div>`).join("")
+      : (x.ok ? '<div class="banner good" style="margin:6px 0 0">本地清单里的模型上游都有。</div>' : "");
+    const head = x.ok
+      ? `<span class="pill ok">${x.count} 个模型</span>`
+      : `<span class="pill off">HTTP ${x.status||"—"}</span>`;
+    return `<div class="card" style="margin:10px 0 0">
+      <div class="spread"><b>${esc(x.account_name)}</b><span>${head}</span></div>
+      <div class="muted mono" style="font-size:11px">${esc(x.base_url)}</div>
+      ${x.ok ? `<div class="mono muted" style="font-size:11px;margin-top:6px;word-break:break-all">${esc((x.models||[]).join(", "))}</div>` : ""}
+      ${x.error ? `<div class="banner bad" style="margin:6px 0 0">${esc(x.error)}</div>` : ""}
+      ${missHTML}
+    </div>`;
+  }).join("");
+  return `<div class="grid g4">${summary}</div>${rows}
+    <div class="hint" style="margin-top:8px">${esc(r.probe_note||"")}（${esc(r.probed_at||"")}）</div>`;
+}
+
+
 function openModal(html){
   let r = document.getElementById("modalRoot");
   if(!r){ r = document.createElement("div"); r.id="modalRoot"; document.body.appendChild(r); }
@@ -645,18 +730,111 @@ function viewQueue(){
         <td class="mono">${r.updated?new Date(r.updated*1000).toLocaleString():""}</td></tr>`).join("")||'<tr><td colspan="3" class="muted">暂无绑定</td></tr>'}</tbody></table></div>
   </div>`;
 }
+const videoRoutePrefix = "/api/chat/videos/";
 function viewJobs(){
-  const rows = (state.jobs||[]).map(j=>`<tr>
-    <td class="mono" style="font-size:11px">${esc(j.job_id)}</td>
-    <td class="mono" style="font-size:11px">${esc(j.video_id)}</td>
-    <td>${esc(j.model)}</td>
-    <td class="mono" style="font-size:11px">${esc(j.account_id)}</td>
-    <td><span class="pill info">${esc(j.status)}</span></td>
-    <td class="mono">${j.created_at?new Date(j.created_at*1000).toLocaleString():""}</td></tr>`).join("");
-  return `<div class="card"><h2>视频任务（下游 job_id → 上游 video_id）</h2>
-    <div class="muted" style="margin-bottom:8px">客户端只认 job_id，上游语义（video_id / model_name）由网关维护，从根上避免「轮询用错字段」导致的卡住。</div>
-    <div class="scroll"><table><thead><tr><th>job_id</th><th>video_id</th><th>模型</th><th>承载账号</th><th>状态</th><th>创建时间</th></tr></thead>
+  const rows = (state.jobs||[]).map(j=>{
+    const name = accName(j.account_id);
+    return `<tr>
+      <td>
+        <div class="mono copyable" style="font-size:11px" data-copy="${esc(j.job_id)}"
+             title="点击复制完整 job_id：${esc(j.job_id)}">${esc(shortID(j.job_id))}</div>
+        <div class="mono muted" style="font-size:11px" title="上游 video_id：${esc(j.video_id)}">${esc(shortID(j.video_id))||"—"}</div>
+      </td>
+      <td class="mono nowrap" style="font-size:11px">${esc(j.model||"—")}</td>
+      <td>
+        <div style="font-size:12px">${name?esc(name):'<span class="muted">（账号已删除）</span>'}</div>
+        <div class="mono muted" style="font-size:11px" title="${esc(j.account_id)}">${esc(shortID(j.account_id))}</div>
+      </td>
+      <td class="nowrap"><span class="pill ${jobStatusClass(j.status)}">${esc(j.status)}</span></td>
+      <td class="nowrap">${jobOutputCell(j)}</td>
+      <td class="mono nowrap" style="font-size:11px">${j.created_at?new Date(j.created_at*1000).toLocaleString("zh-CN",{hour12:false}):""}</td>
+    </tr>`;
+  }).join("");
+  return `<div class="card">
+    <div class="spread"><h2>视频任务（${(state.jobs||[]).length}）</h2>
+      <div class="muted">客户端只认 job_id，上游语义（video_id / model_name）由网关维护</div></div>
+    <div class="muted" style="margin-bottom:8px">
+      产出已落盘到数据目录的 <span class="mono">videos/</span>，点「播放」直接看本地副本。
+      job_id / video_id 太长，这里只显示前后几位，<b>点一下即可复制完整值</b>。
+    </div>
+    <div id="jobPlayer"></div>
+    <div class="scroll"><table>
+      <thead><tr><th>任务</th><th>模型</th><th>承载账号</th><th>状态</th><th>产出</th><th>创建时间</th></tr></thead>
       <tbody>${rows||'<tr><td colspan="6" class="muted">暂无任务</td></tr>'}</tbody></table></div></div>`;
+}
+
+// shortID 把 64 字符的 job_id / video_id 压成「前 8…后 4」。
+//
+// 这些 id 是不换行的长串，原样铺进表格会把整张表撑出横向滚动条，
+// 其余列全被挤到换行。完整值放在 title 里、点一下可复制。
+function shortID(s){
+  s = String(s==null?"":s);
+  if(s.length<=16) return s;
+  return s.slice(0,8)+"…"+s.slice(-4);
+}
+
+// accName 把 account_id 换成可读的账号名（任务记录里只存了 id）。
+function accName(id){
+  const list = (state.accounts && state.accounts.accounts) || [];
+  const a = list.find(x=>x.id===id);
+  return a ? a.name : "";
+}
+
+function jobStatusClass(s){
+  switch(s){
+    case "completed": return "ok";
+    case "failed": return "off";
+    case "submitted": case "in_progress": case "queued": return "warn";
+    default: return "info";
+  }
+}
+
+// jobOutputCell 决定「产出」列显示什么。
+//
+// 注意 url 现在可能是绝对地址（1.0.16 起为了外部客户端改成绝对地址），
+// 所以判断用 includes 而不是 startsWith。
+function jobOutputCell(j){
+  if((j.url||"").includes(videoRoutePrefix)){
+    return `<button class="sm" data-play="${esc(j.url)}">播放</button>`;
+  }
+  if(j.status==="completed"){
+    return `<button class="sm" data-refetch="${esc(j.job_id)}"
+      title="这条记录产生于本地落盘功能上线之前，点一下去上游把产出取回本地">补取</button>`;
+  }
+  return '<span class="muted">—</span>';
+}
+
+// copyText 复制到剪贴板。
+//
+// 必须带兜底：控制台常通过局域网 http 访问，那种非安全上下文里
+// navigator.clipboard 是 undefined，只有老办法能用。
+
+function bindJobEvents(){
+  const box = document.getElementById("jobPlayer");
+  if(!box) return;
+  document.querySelectorAll("button[data-play]").forEach(b=>b.onclick=()=>{
+    const u = b.dataset.play || "";
+    // 只接受本机落盘的地址，避免把上游 CDN 链接渲染进来（那些地址浏览器
+    // 常常够不到，而且落盘之后也没必要再回上游取）。
+    if(!u.includes(videoRoutePrefix)){ toast("该记录没有本地副本","bad"); return; }
+    box.innerHTML = `<video controls autoplay src="${esc(u)}"
+      style="width:100%;max-width:640px;margin-bottom:10px;border-radius:10px"></video>`;
+    box.scrollIntoView({behavior:"smooth", block:"nearest"});
+  });
+  document.querySelectorAll("[data-copy]").forEach(el=>el.onclick=async ()=>{
+    const ok = await new Promise(resolve=>copyText(el.dataset.copy,resolve));
+    toast(ok ? "已复制完整 ID" : "复制失败，请手动选中后复制", ok ? "good" : "bad");
+  });
+  document.querySelectorAll("button[data-refetch]").forEach(b=>b.onclick=async ()=>{
+    const id = b.dataset.refetch;
+    b.disabled = true; b.textContent = "取回中…";
+    try{
+      const r = await api("/api/video-jobs/"+encodeURIComponent(id)+"/refetch",{method:"POST",body:"{}"});
+      if(r.video_url){ toast("已取回本地副本","good"); await refresh(); }
+      else toast(r.error||"上游暂未给出产出地址","bad");
+    }catch(e){ toast(e.message,"bad"); }
+    finally{ b.disabled = false; b.textContent = "补取"; }
+  });
 }
 function viewLogs(){
   const logs = state.logs||[];
@@ -849,6 +1027,7 @@ function viewSettings(){
       ${fld("s_ifield","图生图输入图字段名", ai.image_input_field||"image","text","留空则不自动带图；上游规范变更时改这里")}
       ${fld("s_vfield","图生视频输入图字段名", ai.video_input_field||"image","text","")}
       ${fld("s_vwait","视频阻塞等待秒数", ai.video_wait_sec??0,"number","0 = 立即返回 job_id 让客户端轮询")}
+      ${fld("s_vswait","对话里等待视频完成（秒）", ai.video_stream_wait_sec??600,"number","流式对话生成视频时，网关等待并返回播放链接；0 = 只返回任务号")}
     </div>
     <h3 style="margin-top:14px">模型偏好顺序（只在账号已声明的清单内生效，绝不越界）</h3>
     <div class="grid g2">
@@ -898,7 +1077,6 @@ function viewSettings(){
       ${fld("s_probe","探测模型", s.probe_model||"default-model","text","账号测试按钮用的最小文本模型")}
       ${fld("s_ttl","粘性绑定 TTL（小时）", s.session_ttl_hours??72)}
     </div>
-    <div style="margin-top:12px"><button class="primary" id="btnSaveSettings">保存设置</button></div>
   </div>
   <div class="card">
     <h2>优化模式与记录</h2>
@@ -911,15 +1089,36 @@ function viewSettings(){
       ${fld("s_img_ret","图片记录保留天数", s.image_record_retention_days||30,"number","超过天数后自动清理历史记录")}
       ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录；0 = 不限制")}
       ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+      ${fld("s_vid_mb","本地视频缓存上限（MB）", s.video_cache_max_mb??2048,"number","超出时淘汰最旧视频；0 = 不限制")}
     </div>
   </div>
   <div class="card">
-    <h2>Chat 密码设置</h2>
+    <h2>接口与媒体地址</h2>
     <div class="grid g2">
-      <div><label>Chat 访问密码 (留空=无需密码)</label><input id="s_chat_pw" type="password" placeholder="输入新密码或留空禁用"></div>
+      ${fld("s_baseurl","接口地址（对外访问地址）", s.public_base_url||"","text","填客户端能访问到的网关地址，包含 http:// 或 https:// 和实际端口，如 https://hub.example.com:52325。无需填写 /v1；留空按请求自动推断。反向代理丢失端口时请显式填写。")}
+      <div><label>客户端媒体地址</label><select id="s_cmedia">
+        <option value="" ${!s.client_media_url||s.client_media_url==="auto"?"selected":""}>自动（已配置接口地址则使用网关地址）</option>
+        <option value="upstream" ${s.client_media_url==="upstream"?"selected":""}>上游地址</option>
+        <option value="local" ${s.client_media_url==="local"?"selected":""}>网关地址（本地副本）</option>
+      </select><div class="hint">影响外部 AI 客户端收到的图片和视频链接。网关地址需从客户端所在网络可访问；自动模式未配置接口地址时使用上游地址。</div></div>
+    </div>
+    <div style="margin-top:12px" class="row">
+      <button class="primary" id="btnSaveSettings">保存设置</button>
+      <button id="btnMediaBase">查看当前生效的媒体地址</button>
+    </div>
+    <div id="mediaBaseBox" style="margin-top:10px"></div>
+  </div>
+  <div class="card">
+    <h2>Chat 访问密码 <span class="pill ${s.chat_password_set?"ok":"warn"}">${s.chat_password_set?"已设置":"未设置"}</span></h2>
+    <div class="grid g2">
+      <div><label>新的 Chat 访问密码（至少 6 位）</label><input id="s_chat_pw" type="password" autocomplete="new-password" placeholder="输入新密码"></div>
       <div><label>确认密码</label><input id="s_chat_pw_confirm" type="password" placeholder="再次输入密码"></div>
     </div>
-    <div class="hint" style="margin-top:8px">设置后，访问 /chat 页面需要输入密码。清空密码则无需验证即可访问。</div>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" id="btnChatPw">保存 Chat 密码</button>
+      <button class="danger" id="btnChatPwClear">清除 Chat 密码</button>
+    </div>
+    <div class="hint" style="margin-top:8px">设置后可凭此密码使用对话页，无需提供管理员密码。未设置时须使用管理员密码登录。保存其他设置不会清除已有密码。</div>
   </div>
   <div class="card">
     <h2>迁移</h2>
@@ -931,9 +1130,72 @@ function viewSettings(){
     </div>
   </div>`;
 }
+function bindChatPasswordEvents(){
+  const set = document.getElementById("btnChatPw");
+  if(!set) return;
+  set.onclick = async ()=>{
+    const a = document.getElementById("s_chat_pw").value, b = document.getElementById("s_chat_pw_confirm").value;
+    if(!a){ toast("请输入新的 Chat 访问密码","bad"); return; }
+    if(a!==b){ toast("两次输入的密码不一致","bad"); return; }
+    try{ await api("/api/settings",{method:"POST",body:JSON.stringify({chat_password:a})});
+      toast("Chat 访问密码已保存","good"); await refresh(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
+  document.getElementById("btnChatPwClear").onclick = async ()=>{
+    if(!confirm("清除后 /chat 只能用管理员密码登录，已登录的 Chat 会话会失效。继续？")) return;
+    try{ await api("/api/settings",{method:"POST",body:JSON.stringify({chat_password_clear:true})});
+      toast("Chat 访问密码已清除","good"); await refresh(); }
+    catch(e){ toast(e.message,"bad"); }
+  };
+}
+
+
+function bindMediaBaseCheck(){
+  const btn = document.getElementById("btnMediaBase");
+  const box = document.getElementById("mediaBaseBox");
+  if(!btn || !box) return;
+  btn.onclick = async ()=>{
+    btn.disabled = true; btn.textContent = "查询中…";
+    try{
+      const r = await api("/api/media-base");
+      const row = (k,v)=>`<div class="row" style="gap:8px"><span class="muted" style="min-width:120px">${esc(k)}</span><span class="mono" style="font-size:12px;word-break:break-all">${esc(v||"—")}</span></div>`;
+      const forClient = (r.url_for_client||"");
+      // 用「地址里带不带 /api/chat/」判断给的是不是网关地址。注意不能再用
+      // client_media_url 的原始值来判断：auto 档的实际结果取决于有没有配
+      // 「对外访问地址」，只有服务端算出来的 url_for_client 才是真相。
+      const usingGateway = forClient.includes("/api/chat/");
+      const mode = r.client_media_mode || "auto";
+      const MODE_LABEL = {"":"自动","auto":"自动","upstream":"上游地址","local":"网关地址"};
+      const modeText = (MODE_LABEL[mode]||mode) + (mode==="auto"
+        ? (usingGateway ? "（已配对外访问地址 → 用网关地址）" : "（未配对外访问地址 → 用上游地址）")
+        : "");
+      box.innerHTML = `<div class="card" style="margin:0">
+        ${row("基地址", r.base_url)}
+        ${row("来源", r.source)}
+        ${row("示例图片地址", r.sample_image_url)}
+        ${row("客户端将收到", forClient)}
+        ${row("客户端媒体地址", modeText)}
+        <div class="hint">诊断用原始值：Host=${esc(r.host||"—")} · X-Forwarded-Host=${esc(r.x_forwarded_host||"—")} · X-Forwarded-Proto=${esc(r.x_forwarded_proto||"—")} · TLS=${r.tls?"是":"否"}</div>
+        <div class="banner ${usingGateway?"good":"warn"}" style="margin-top:8px">
+          ${usingGateway
+            ? "客户端拿到的是<b>网关地址</b>。请确认这个地址从客户端所在网络能打开 —— 把上面「客户端将收到」那行粘到浏览器试一下。"
+            : "客户端拿到的是<b>上游产出地址</b>。想改用网关地址（离线也能看），要么在上面把「对外访问地址」填全（含端口），要么把「客户端媒体地址」显式选成「网关地址」并保存。"}
+        </div>
+      </div>`;
+    }catch(e){
+      box.innerHTML = `<div class="banner bad">${esc(e.message)}</div>`;
+    }finally{
+      btn.disabled = false; btn.textContent = "查看当前生效的媒体地址";
+    }
+  };
+}
+
+
 function bindSettingsEvents(){
   const save = document.getElementById("btnSaveSettings");
   if(!save) return;
+  bindMediaBaseCheck();
+  bindChatPasswordEvents();
   save.onclick = async ()=>{
     const g = id=>document.getElementById(id).value;
     const payload = {
@@ -941,6 +1203,7 @@ function bindSettingsEvents(){
       auto_intent:{content_scan:g("s_scan")==="1", min_confidence:Number(g("s_conf")),
         default_image_size:g("s_isize"), image_input_field:g("s_ifield"),
         video_input_field:g("s_vfield"), video_wait_sec:Number(g("s_vwait")),
+        video_stream_wait_sec:Number(g("s_vswait")),
         preferred_models:{}},
       safety_factor:Number(g("s_safety")), pacing_window_sec:Number(g("s_window")),
       calibration_enabled:g("s_cal")==="1", penalty_cooldown_sec:Number(g("s_penalty")),
@@ -954,6 +1217,8 @@ function bindSettingsEvents(){
       probe_model:g("s_probe"), session_ttl_hours:Number(g("s_ttl")),
       optimization_mode:g("s_opt_mode"), image_record_retention_days:Number(g("s_img_ret")),
       image_max_capacity:Number(g("s_img_cap")), video_max_capacity:Number(g("s_vid_cap")),
+      video_cache_max_mb:Number(g("s_vid_mb")), public_base_url:g("s_baseurl").trim(),
+      client_media_url:g("s_cmedia"),
       free_text_rpm:Number(g("s_free_text_rpm")),
       scenario:g("s_scenario"),
       text_two_level_queue:document.getElementById("s_two_level")?document.getElementById("s_two_level").checked:false,
@@ -968,11 +1233,11 @@ function bindSettingsEvents(){
     catch(e){ toast(e.message,"bad"); }
   };
   const exp = (masked)=>async ()=>{
-    window.open("/api/export","_blank");
-    if(!masked) toast("含密钥的导出请用 /api/export 的结果自行保存","warn");
+    if(!masked && !confirm("将导出上游 API Key 和下游密钥明文，请妥善保管。继续？")) return;
+    window.open(masked ? "/api/export?redact=1" : "/api/export","_blank");
   };
   document.getElementById("btnExport").onclick = exp(true);
-  document.getElementById("btnExportFull").onclick = exp(true);
+  document.getElementById("btnExportFull").onclick = exp(false);
   document.getElementById("btnExportCapture").onclick = () => {
     window.open("/api/export/capture-analysis", "_blank");
   };
@@ -1356,7 +1621,7 @@ function render(){
     if(b) b.onclick = async ()=>{ if(!confirm("清空全部粘性绑定？")) return;
       await api("/api/bindings/clear",{method:"POST"}); await refresh(); };
   }
-  else if(state.tab==="jobs"){ v.innerHTML = viewJobs(); }
+  else if(state.tab==="jobs"){ v.innerHTML = viewJobs(); bindJobEvents(); }
   else if(state.tab==="intent"){ v.innerHTML = viewIntent(); bindIntentEvents(); }
   else if(state.tab==="logs"){ v.innerHTML = viewLogs(); }
   else if(state.tab==="settings"){ v.innerHTML = viewSettings(); bindSettingsEvents(); }
@@ -1368,18 +1633,20 @@ function viewAbout(){
   return `
   <div class="card">
     <h2>版本与自更新</h2>
-    <div class="muted" style="margin-bottom:12px">
-      程序会定时向本项目的 GitHub Releases 查询新版本，也可以在这里手动检查、立即更新。
-      更新包只从本仓库的 release 下载，并做尺寸与可执行文件魔数校验，
-      防止把一页错误信息当成新版本换上。
+    <div class="muted" style="margin-bottom:12px" id="updDesc">
+      进入本页会自动向本项目的 GitHub Releases 查询一次最新版本，并显示版本号与发布时间。
     </div>
     <div class="grid g4" id="updKpi"></div>
     <div id="updBox" style="margin-top:12px"></div>
     <div class="row" style="margin-top:12px">
-      <button class="sm" id="btnChk">检查更新</button>
-      <button class="sm primary" id="btnApply">立即更新</button>
-      <a class="muted" style="font-size:12px" target="_blank" rel="noopener noreferrer"
-         href="https://github.com/kosje/agnes-hub-go-DSM/releases">查看全部版本 ↗</a>
+      <span class="row hide" id="updBtns">
+        <button class="sm" id="btnChk">检查更新</button>
+      </span>
+      <a class="muted" id="lnkReleases" target="_blank" rel="noopener noreferrer"
+         title="在 GitHub 查看项目仓库"
+         href="https://github.com/kosje/agnes-hub-go-DSM/releases">
+        GitHub
+      </a>
     </div>
   </div>
   <div class="card">
@@ -1406,60 +1673,69 @@ function bindAboutEvents(){
     const cur = s.current_version || "—";
     const last = s.last_check || {};
     const avail = !!last.is_update_available;
+    // canCheck：能否向 GitHub 查最新版本（套件版仍为 true）
+    const canCheck = s.checkable !== false;
+
     kpi.innerHTML = `
       <div class="kpi"><div class="k">当前版本</div><div class="v">${esc(cur)}</div></div>
       <div class="kpi"><div class="k">最新版本</div><div class="v">${esc(last.latest_version || "—")}</div></div>
       <div class="kpi"><div class="k">更新状态</div><div class="v" style="font-size:15px">
-        ${avail ? '<span class="pill warn">有可用更新</span>'
-                : '<span class="pill ok">已是最新</span>'}</div></div>
+        ${!canCheck ? '<span class="pill info">无法查询</span>'
+              : avail ? '<span class="pill warn">有可用更新</span>'
+                      : '<span class="pill ok">已是最新</span>'}</div></div>
       <div class="kpi"><div class="k">发布时间</div><div class="v" style="font-size:15px">${esc(last.release_date || "—")}</div></div>`;
+
+    // 仓库地址跟着后端返回的 repo 走，保证与「最新版本」的实际来源一致。
+    // 只改 href —— 链接文字是固定的「GitHub」徽标，改 textContent 会把图标一起抹掉。
+    const lnk = document.getElementById("lnkReleases");
+    if(lnk) lnk.href = "https://github.com/" + (s.repo || "kosje/agnes-hub-go-DSM") + "/releases";
+
+    // 所有平台都只提供版本检查；安装由套件中心或用户完成。
+    const btns = document.getElementById("updBtns");
+    if(btns) btns.classList.toggle("hide", !canCheck);
 
     if(err || last.error){
       box.innerHTML = `<div class="banner warn">${esc(err || last.error)}</div>`;
       return;
     }
+    if(!canCheck){
+      box.innerHTML = `<div class="banner info">未配置更新仓库，无法查询最新版本。</div>`;
+      return;
+    }
     if(!avail){
-      box.innerHTML = `<div class="banner good">当前已是最新版本，无需更新。</div>`;
+      box.innerHTML = s.suite_managed
+        ? `<div class="banner info">已是最新版本。${esc(s.update_hint||"")}。</div>`
+        : `<div class="banner good">当前已是最新版本，无需更新。</div>`;
       return;
     }
     const notes = (last.changelog||"").trim();
     box.innerHTML = `<div class="banner warn">
         发现新版本 <b>${esc(last.latest_version)}</b>（当前 ${esc(cur)}）。
-        点「立即更新」会下载对应平台的二进制并替换，随后程序自动退出并重启。
+        ${esc(s.update_hint||"") + "。"}
       </div>
       ${notes? `<pre class="scroll" style="background:#fafbfc;border:1px solid var(--line);
         border-radius:10px;padding:12px;margin:0">${esc(notes)}</pre>`:""}`;
   };
 
   const load = async ()=>{
-    try{ paint(await api("/api/update/status")); }
-    catch(e){ kpi.innerHTML = `<div class="kpi"><div class="k">错误</div><div class="v">—</div></div>`;
+    try{
+      const s = await api("/api/update/status");
+      paint(s);
+      // 还没有检查结果（或上次查失败）时主动查一次 —— 否则「最新版本 / 发布时间」
+      // 会一直停在「—」。有缓存就不重复联网，避免反复打开本页把 GitHub 配额打满。
+      const last = s.last_check || {};
+      if(s.checkable !== false && (!last.latest_version || last.error)){
+        paint({...await api("/api/update/status"), last_check: await api("/api/update/check")});
+      }
+    }catch(e){ kpi.innerHTML = `<div class="kpi"><div class="k">错误</div><div class="v">—</div></div>`;
               box.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`; }
   };
 
   document.getElementById("btnChk").onclick = async (ev)=>{
     const b = ev.currentTarget; b.disabled = true; b.textContent = "检查中…";
-    try{ paint(await api("/api/update/check")); toast("已检查更新","good"); }
+    try{ paint({...await api("/api/update/status"), last_check: await api("/api/update/check")}); toast("已检查更新","good"); }
     catch(e){ toast(e.message,"bad"); }
     finally{ b.disabled = false; b.textContent = "检查更新"; }
-  };
-
-  document.getElementById("btnApply").onclick = async (ev)=>{
-    const b = ev.currentTarget;
-    if(!confirm("确认下载并更新到最新版本？\n更新完成后程序会自动重启。")) return;
-    b.disabled = true; b.textContent = "更新中…";
-    try{
-      const r = await api("/api/update/apply",{method:"POST"});
-      if(r.success){
-        toast("更新已就位，程序即将重启","good");
-        box.innerHTML = `<div class="banner good">已更新到 <b>${esc(r.new_version)}</b>，
-          程序正在退出以便替换二进制，稍后会自动重启。若未自动重启，请手动重新启动一次。</div>`;
-      }else{
-        toast(r.error||"更新失败","bad");
-        box.innerHTML = `<div class="banner warn">更新失败：${esc(r.error||"未知原因")}</div>`;
-      }
-    }catch(e){ toast(e.message,"bad"); }
-    finally{ b.disabled = false; b.textContent = "立即更新"; }
   };
 
   paintEnv();
@@ -1468,6 +1744,7 @@ function bindAboutEvents(){
 
 async function boot(){
   if(!state.session || !state.session.logged_in){ renderLogin(false); return; }
+  if(state.session.must_change_password){ renderForceChange(); return; }
   renderShell();
   await refresh();
 }
