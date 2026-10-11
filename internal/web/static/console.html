@@ -19,6 +19,10 @@
   h1{font-size:18px}h2{font-size:15px}h3{font-size:13px;color:var(--muted);text-transform:none}
   code,pre{font-family:var(--mono);font-size:12px}
   .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .scenario-controls{display:flex;gap:10px;align-items:center}
+  .scenario-controls select,.scenario-controls button{height:40px}
+  .scenario-controls select{flex:1;min-width:0}
+  .scenario-controls button{flex:none;white-space:nowrap}
   .spread{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
   .grid{display:grid;gap:12px}
@@ -977,12 +981,13 @@ function viewSettings(){
   <div class="card" style="border-color:var(--accent,#3b82f6)">
     <h2>运行情景（按网关执行方向一键侧重）</h2>
     <div class="muted" style="margin-bottom:10px">选一个情景，网关会按该方向自动调安全阀 / 文本 RPM / 重试 / 队列 / 并发等旋钮并即时生效；账号级 RPM 覆盖仍优先，不被冲掉。参数按 8 个免费号基准设计。</div>
-    <div class="row" style="gap:10px;align-items:flex-end">
-      <div><label>当前情景</label>
-        <select id="s_scenario" style="min-width:320px">${scOpts||`<option value="default">default · 默认均衡</option>`}</select>
-        <div class="hint">切到「多任务并行」默认打开两级队列（短调用优先）；「挂机批量」拉高空闲容忍与队列。</div>
+    <div>
+      <label for="s_scenario">当前情景</label>
+      <div class="scenario-controls">
+        <select id="s_scenario">${scOpts||`<option value="default">default · 默认均衡</option>`}</select>
+        <button class="primary" id="btnApplyScenario">一键应用</button>
       </div>
-      <button class="primary" id="btnApplyScenario">一键应用</button>
+      <div class="hint">切到「多任务并行」默认打开两级队列（短调用优先）；「挂机批量」拉高空闲容忍与队列。</div>
     </div>
     <div style="margin-top:10px">
       <label for="s_two_level" style="display:flex;gap:8px;align-items:center;cursor:pointer">

@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.33"
+var version = "1.0.34"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
 // 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
