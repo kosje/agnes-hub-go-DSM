@@ -182,7 +182,12 @@ var (
 	}
 )
 
-// IsAutoModel accepts only explicit automatic routing names.
+// IsAutoModel 判断 name 是否表示「让网关决定」：只认内置 auto 名（auto / auto-all）。
+// agnes-auto 是 config.AutoModelName 默认值，通过 IsAutoModelNamed 的 autoName 参数
+// 单独识别，不在这里硬编码（避免「未配置 auto 名时也把 agnes-auto 当 auto」的意外）。
+//
+// 刻意**不做** auto 前缀匹配：auto-fast / autoglm-9b / automatic 这类显式模型名
+// 绝不能被误判成 auto，否则显式路由会被内容判定劫持。
 func IsAutoModel(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "auto", "auto-all":
@@ -194,12 +199,6 @@ func IsAutoModel(name string) bool {
 
 // IsAutoModelNamed 判断 name 是否表示「让网关决定」，同时认内置 auto 名与
 // 设置里的 AutoModelName。
-//
-// 为什么必须有这个重载：IsAutoModel 只认 auto / auto-all，
-// 而本项目的默认 AutoModelName 是 "agnes-auto" —— 不在内置集合里。
-// 单用 IsAutoModel 会把 agnes-auto 判成「显式模型」，于是整条自动判定链路
-// （内容判定 → 生图 / 生视频）被跳过，请求带着 model=agnes-auto 原样透传给
-// 上游，界面表现就是「选了 auto 就不能生图」。
 func IsAutoModelNamed(name, autoName string) bool {
 	if IsAutoModel(name) {
 		return true
@@ -486,6 +485,29 @@ func messageContent(content any) (string, []string) {
 	}
 	return strings.TrimSpace(strings.Join(texts, "\n")), images
 }
+
+// CleanUserMessage 从一条 user 消息原文中剥离 WorkBuddy 等客户端注入的系统开销，
+// 只保留用户真正输入的部分，用于「查看请求」日志展示。
+//
+// 行为：
+//  1. 若内含 <user_query>...</user_query> 包裹（WorkBuddy 的常规形态），取其内部文本——
+//     这是最精确的用户输入，已天然排除了包裹在外层的 <system-reminder> 等注入。
+//  2. 否则去掉所有 <system-reminder ...>...</system-reminder> 块后返回剩余文本。
+//  3. 普通 chat 请求（user 消息本身即纯文本、无上述包裹）原样透传，清理为零副作用。
+func CleanUserMessage(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if m := userQueryRe.FindStringSubmatch(raw); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return strings.TrimSpace(systemReminderRe.ReplaceAllString(raw, ""))
+}
+
+var (
+	userQueryRe      = regexp.MustCompile(`(?s)<user_query>(.*?)</user_query>`)
+	systemReminderRe = regexp.MustCompile(`(?s)<system-reminder[^>]*>.*?</system-reminder>`)
+)
 
 // videoNounRe / imageNounRe / generateVerbRe 用于组合信号判定。
 //

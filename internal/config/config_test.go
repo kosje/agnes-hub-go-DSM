@@ -148,12 +148,19 @@ func TestRPMForOverrideBeatsTierTable(t *testing.T) {
 	s := newTestStore(t)
 	a := s.AddAccount("账号", "sk-1", "free", "", nil)
 
-	if got := s.RPMFor(a, "text"); got != 20 {
-		t.Fatalf("free 档文本池基线应为 20，实际 %v", got)
+	// 默认：agnes 免费档文本池基线由可配置项 FreeTextRPM 决定（默认 10）
+	if got := s.RPMFor(a, "text"); got != 10 {
+		t.Fatalf("free 档文本池基线应为 10，实际 %v", got)
 	}
 	if got := s.RPMFor(a, "video"); got != 1 {
 		t.Fatalf("free 档视频池基线应为 1，实际 %v", got)
 	}
+	// 全局可配置项优先生效
+	s.UpdateSettings(func(st *Settings) { st.FreeTextRPM = 15 })
+	if got := s.RPMFor(a, "text"); got != 15 {
+		t.Fatalf("FreeTextRPM 应优先生效，实际 %v", got)
+	}
+	// 账号级覆盖仍优先于全局可配置项
 	a.RPMOverrides["text"] = 22
 	if got := s.RPMFor(a, "text"); got != 22 {
 		t.Fatalf("账号级覆盖应优先，实际 %v", got)
@@ -311,8 +318,8 @@ func TestKeyLifecycleQuotaAndCharge(t *testing.T) {
 	if reason := s.QuotaExceeded(k); reason != "" {
 		t.Fatalf("尚未使用不应超限，实际 %q", reason)
 	}
-	s.ChargeKey(k.Key)
-	s.ChargeKey(k.Key)
+	s.ChargeKey(k.Key, 0)
+	s.ChargeKey(k.Key, 0)
 	if reason := s.QuotaExceeded(k); reason == "" {
 		t.Fatal("已达每日额度上限应报超限")
 	}
@@ -330,7 +337,7 @@ func TestKeyLifecycleQuotaAndCharge(t *testing.T) {
 func TestTotalQuotaIsEnforced(t *testing.T) {
 	s := newTestStore(t)
 	k := s.AddKey("总额度密钥", nil, 0, 1, "")
-	s.ChargeKey(k.Key)
+	s.ChargeKey(k.Key, 0)
 	if reason := s.QuotaExceeded(s.KeyByValue(k.Key)); reason == "" {
 		t.Fatal("已达总额度上限应报超限")
 	}
@@ -368,9 +375,7 @@ func TestBindingsGCExpiresStaleEntries(t *testing.T) {
 	s.mu.Unlock()
 
 	// 批量保存时清理过期绑定，避免每次 Bind 扫描整个表。
-	if err := s.FlushBindings(); err != nil {
-		t.Fatal(err)
-	}
+	s.FlushBindings()
 	if _, ok := s.BindingsGet("ses:stale"); ok {
 		t.Error("超过 TTL 的绑定应被清理，否则文件会无限增长")
 	}
@@ -411,6 +416,8 @@ func TestUsageLogAppendAndTail(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		s.AppendUsage(map[string]any{"i": i})
 	}
+	// #20：AppendUsage 改为内存缓冲，需 FlushUsage 批量落盘后 TailUsage 才可见。
+	s.FlushUsage()
 	got := s.TailUsage(3)
 	if len(got) != 3 {
 		t.Fatalf("应取回最近 3 条，实际 %d", len(got))
@@ -418,6 +425,33 @@ func TestUsageLogAppendAndTail(t *testing.T) {
 	// 倒序：最新的在最前
 	if v, _ := got[0]["i"].(float64); v != 4 {
 		t.Errorf("日志应倒序返回，实际首条 i=%v", got[0]["i"])
+	}
+}
+
+// TestUsageLogLiveIncludesUnflushed #20 修复回归：TailUsageLive 必须能把
+// 尚未 FlushUsage 落盘的内存缓冲也计入（控制台日志页实时可见 user_request），
+// 且新记录排在最新（倒序首条应为 i=4）。
+func TestUsageLogLiveIncludesUnflushed(t *testing.T) {
+	s := newTestStore(t)
+	// 先落盘 3 条作为磁盘基线
+	for i := 0; i < 3; i++ {
+		s.AppendUsage(map[string]any{"i": float64(i), "src": "disk"})
+	}
+	s.FlushUsage()
+	// 再 2 条只进内存缓冲，不 Flush
+	for i := 3; i < 5; i++ {
+		s.AppendUsage(map[string]any{"i": float64(i), "src": "pending"})
+	}
+	got := s.TailUsageLive(10)
+	if len(got) != 5 {
+		t.Fatalf("Live 应合并 3 磁盘 + 2 内存 = 5 条，实际 %d", len(got))
+	}
+	// 倒序：最新的（内存 i=4）在最前
+	if v, _ := got[0]["i"].(float64); v != 4 {
+		t.Errorf("Live 首条应为最新 i=4，实际 %v", got[0]["i"])
+	}
+	if got[0]["src"] != "pending" {
+		t.Errorf("Live 首条应来自未落盘缓冲，实际 %v", got[0]["src"])
 	}
 }
 
@@ -586,6 +620,7 @@ func TestPruneRetention(t *testing.T) {
 	s.PutImageJob(&ImageJob{JobID: "fresh", CreatedAt: fresh})
 	s.AppendUsage(map[string]any{"ts": now.Add(-10 * 24 * time.Hour).Format("2006-01-02 15:04:05"), "n": 1})
 	s.AppendUsage(map[string]any{"ts": now.Format("2006-01-02 15:04:05"), "n": 2})
+	s.FlushUsage() // 异步落盘：先刷盘再校验保留期清理
 
 	imgs, logs := s.PruneRetention(now)
 	if imgs != 1 || logs != 1 {
@@ -605,6 +640,7 @@ func TestTailUsageReadsTail(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		s.AppendUsage(map[string]any{"i": i, "pad": strings.Repeat("x", 200)})
 	}
+	s.FlushUsage() // 异步落盘：先刷盘再校验 TailUsage
 	got := s.TailUsage(5)
 	if len(got) != 5 || got[0]["i"] != float64(1999) || got[4]["i"] != float64(1995) {
 		t.Fatalf("应返回最近 5 条（倒序），实际 %v", got)

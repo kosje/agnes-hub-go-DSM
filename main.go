@@ -29,17 +29,6 @@ import (
 	"agneshub/internal/web"
 )
 
-// version 是本套件的版本号，也是唯一的版本号。
-//
-// 采用纯 x.y.z，**不再带 -000N 构建号**：套件 INFO 的 version、catalog 的
-// version、控制台显示的「当前版本 / 最新版本」、GitHub Release 的 tag 全部
-// 来自这一个值，发新版直接 +1（1.0.13 → 1.0.14）。
-//
-// 之前用「功能号-构建号」（1.0.12-0002）是为了能在功能号不变时重发，
-// 但代价是三处显示不一致：套件装的是 1.0.12-0002、控制台当前版本显示 1.0.12、
-// Release tag 又是 v1.0.12-0002，用户根本对不上。而且 updater 的版本比较会在
-// 第一个 '-' 处截断，1.0.12-0002 与 1.0.12 被判成相等，永远显示「已是最新」。
-// 统一成一个号之后这些问题自然消失。
 var version = "1.0.28"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
@@ -91,8 +80,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	maintenanceDone := h.StartMaintenance(ctx)
+	h.StartHistory(ctx)
 
-	srv := web.New(store, h, relay.BuildClient())
+	srv := web.New(store, h, relay.BuildClientForAccounts(len(store.AccountsSnapshot())))
 	srv.Version = version
 
 	// 初始化更新检查：只查、不装。
@@ -156,6 +146,14 @@ func main() {
 		Addr:              addr,
 		Handler:           srv,
 		ReadHeaderTimeout: 20 * time.Second,
+		// ReadTimeout 覆盖「读取整个请求体」的时间上限。此前未设置，意味着：
+		// 客户端一旦没能把自己声明的请求体发完（连接假死 / 超大上下文传输中断 /
+		// 中间代理掐断），handler 会一直阻塞在 io.ReadAll(r.Body) 上——
+		// goroutine 永久泄漏，客户端那边一直转圈，而网关的所有指标都显示「什么都没发生」
+		// （requests_total 不涨、用量日志不写、控制台负载为 0），排障时极易误判成
+		// 「请求根本没到网关」。这里给一个远大于正常上传耗时的上限兜底。
+		// 注意它只约束【请求体的读取】，不影响流式 SSE 的响应写出时长。
+		ReadTimeout: 5 * time.Minute,
 		// 刻意不设 WriteTimeout / IdleTimeout 上限：
 		// 视频提交与长回答的 SSE 流可能持续很久，超时会把正常任务掐断。
 		IdleTimeout: 120 * time.Second,
@@ -198,7 +196,18 @@ func main() {
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		shutdownCtx, c := context.WithTimeout(context.Background(), 8*time.Second)
+		// P1-2 优雅停机：先等在途（relay 层）请求排空再关 server，避免长视频任务 /
+		// 流式长回答被硬切。InflightTotal()==0 即排空；30s 宽限兜底（挂机的任务
+		// 不会因一次正常停机而白干，但也不会让进程永远退不出）。
+		deadline := time.Now().Add(30 * time.Second)
+		for h.InflightTotal() > 0 && time.Now().Before(deadline) {
+			log.Printf("优雅停机：等待 %d 个在途请求完成…", h.InflightTotal())
+			time.Sleep(500 * time.Millisecond)
+		}
+		if h.InflightTotal() > 0 {
+			log.Printf("优雅停机：30s 宽限到达仍有 %d 个在途请求，将随进程关闭（视频任务可通过 job_id 跨重启续查）", h.InflightTotal())
+		}
+		shutdownCtx, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
@@ -226,9 +235,7 @@ func main() {
 	<-shutdownDone
 	<-maintenanceDone
 	// Flush again after in-flight requests finish.
-	if err := store.FlushBindings(); err != nil {
-		log.Printf("保存会话绑定失败：%v", err)
-	}
+	store.FlushBindings()
 	store.FlushAccounts()
 	fmt.Println("Agnes Hub 已停止。")
 }

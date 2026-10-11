@@ -184,6 +184,34 @@ func TestStickyBindingKeptWhenHealthy(t *testing.T) {
 	}
 }
 
+// TestNewSessionPrefersUnboundAccount 任务分散：两个条件完全相同的账号，其中一个
+// 已被任务 1 绑定，新任务 2 进来时应优先选「没人绑定」的那个号，避免并发任务的
+// 压力全部挤在同一个号的通道上（这正是「不同任务走不同的号」的调度语义）。
+func TestNewSessionPrefersUnboundAccount(t *testing.T) {
+	h, store := newTestHub(t, nil)
+	a := store.AddAccount("账号A", "sk-a", "free", "",
+		manifest([]string{"agnes-2.5-flash"}, []string{}, []string{}))
+	b := store.AddAccount("账号B", "sk-b", "free", "",
+		manifest([]string{"agnes-2.5-flash"}, []string{}, []string{}))
+	h.Reload()
+
+	store.Bind("ses:task-1", a.ID) // 任务 1 已绑定 A
+
+	res, err := h.Pick("ses:task-2", "text", "", "", nil) // 新任务 2 尚无绑定
+	if err != nil {
+		t.Fatalf("选号失败：%v", err)
+	}
+	if res.Account.ID != b.ID {
+		t.Fatalf("新任务应分散到未绑定的账号B，实际选中 %s（绑定数 A=%d B=%d）",
+			res.Account.Name,
+			store.BindingsCountByAccount()[a.ID], store.BindingsCountByAccount()[b.ID])
+	}
+	// 且选中后立即建立新绑定，后续请求保持粘性
+	if cnt := store.BindingsCountByAccount(); cnt[b.ID] != 1 {
+		t.Fatalf("新任务选中 B 后应建立绑定，实际 B 的绑定数 %d", cnt[b.ID])
+	}
+}
+
 // TestStickyBindingSpilloverOverloaded Account 是 B1 的核心修正。
 //
 // 旧实现命中绑定就直接返回该账号，既不比较负载也不看惩罚。而客户端默认不发会话头，
@@ -272,8 +300,8 @@ func TestCalibrationIsPerPoolNotPerAccount(t *testing.T) {
 
 	beforeText := h.EffectiveRPM(a, "text")
 	beforeVideo := h.EffectiveRPM(a, "video")
-	if math.Abs(beforeText-20) > 1e-9 {
-		t.Fatalf("free 档文本池基线应为 20 RPM，实际 %.3f", beforeText)
+	if math.Abs(beforeText-10) > 1e-9 {
+		t.Fatalf("free 档文本池基线应为 10 RPM，实际 %.3f", beforeText)
 	}
 	if math.Abs(beforeVideo-1) > 1e-9 {
 		t.Fatalf("free 档视频池基线应为 1 RPM，实际 %.3f", beforeVideo)
@@ -432,10 +460,10 @@ func TestAcquireRejectsWhenWaitExceedsLimit(t *testing.T) {
 	})
 	h.Reload()
 
-	if _, err := h.Acquire(context.Background(), a, "text"); err != nil {
+	if _, err := h.Acquire(context.Background(), a, "text", false); err != nil {
 		t.Fatalf("首次领槽应立刻成功：%v", err)
 	}
-	if _, err := h.Acquire(context.Background(), a, "text"); !errors.Is(err, ErrQueueTimeout) {
+	if _, err := h.Acquire(context.Background(), a, "text", false); !errors.Is(err, ErrQueueTimeout) {
 		t.Fatalf("预计等待 60s 远超上限 200ms，应返回 ErrQueueTimeout，实际 %v", err)
 	}
 	if h.Metrics.QueueTimeout.Load() == 0 {
@@ -480,12 +508,12 @@ func TestEffectiveRPMAppliesSafetyAndFactor(t *testing.T) {
 	a := store.AddAccount("账号", "sk-a", "free", "", nil)
 	h.Reload()
 
-	if got := h.EffectiveRPM(a, "text"); math.Abs(got-20) > 1e-9 {
-		t.Fatalf("free 档文本池 baseline×安全系数(1.0) 应为 20，实际 %.3f", got)
+	if got := h.EffectiveRPM(a, "text"); math.Abs(got-10) > 1e-9 {
+		t.Fatalf("free 档文本池 baseline×安全系数(1.0) 应为 10，实际 %.3f", got)
 	}
 	h.BindFactor(a.ID, "text", 0.5)
-	if got := h.EffectiveRPM(a, "text"); math.Abs(got-10) > 1e-9 {
-		t.Fatalf("池因子 0.5 应使有效 RPM 降到 10，实际 %.3f", got)
+	if got := h.EffectiveRPM(a, "text"); math.Abs(got-5) > 1e-9 {
+		t.Fatalf("池因子 0.5 应使有效 RPM 降到 5，实际 %.3f", got)
 	}
 }
 
@@ -639,5 +667,57 @@ func TestManualDisableNotRevived(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 	if got := h.Candidates("text", nil, ""); len(got) != 0 {
 		t.Fatalf("手动停用的账号不应被自动复活")
+	}
+}
+// ---------------------------------------------------------------------------
+// #24 负载画像遥测（NoteRequest → LoadProfile → RecommendScenario）
+// ---------------------------------------------------------------------------
+
+// TestNoteRequestFeedsLoadProfile 每请求埋点必须真实累加到 LoadProfile：
+// 这是「接入方自动检测」能跑起来的前提（此前 NoteRequest 未被调用，画像恒为空）。
+func TestNoteRequestFeedsLoadProfile(t *testing.T) {
+	h, _ := newTestHub(t, nil)
+	h.NoteRequest("text", true)
+	h.NoteRequest("text", false)
+	h.NoteRequest("image", false)
+
+	p := h.LoadProfile()
+	if p.TotalRecent != 3 {
+		t.Fatalf("TotalRecent 应为 3，实际 %d", p.TotalRecent)
+	}
+	if math.Abs(p.TextRatio-2.0/3.0) > 1e-9 {
+		t.Errorf("TextRatio 应为 2/3，实际 %v", p.TextRatio)
+	}
+	if math.Abs(p.ImageRatio-1.0/3.0) > 1e-9 {
+		t.Errorf("ImageRatio 应为 1/3，实际 %v", p.ImageRatio)
+	}
+	// 流式比只对文本请求有意义：2 条文本里 1 条流式 → 0.5
+	if math.Abs(p.StreamRatio-0.5) > 1e-9 {
+		t.Errorf("StreamRatio 应为 0.5，实际 %v", p.StreamRatio)
+	}
+}
+
+// TestRecommendScenarioRoutesByProfile RecommendScenario 是纯函数，必须按画像
+// 稳定映射到对应情景（高 429→batch、生图高→image、视频高→auto、
+// 文本多并发→workbuddy、纯文本低并发→code、空负载→default）。
+func TestRecommendScenarioRoutesByProfile(t *testing.T) {
+	cases := []struct {
+		name string
+		in   config.LoadProfile
+		want string
+	}{
+		{"空负载回落 default", config.LoadProfile{}, "default"},
+		{"高 429 → batch", config.LoadProfile{TotalRecent: 10, Upstream429Rate: 5}, "batch"},
+		{"生图占比高 → image", config.LoadProfile{TotalRecent: 10, ImageRatio: 0.5}, "image"},
+		{"视频占比高 → auto", config.LoadProfile{TotalRecent: 10, VideoRatio: 0.5}, "auto"},
+		{"文本为主+流式 → workbuddy", config.LoadProfile{TotalRecent: 10, TextRatio: 0.9, StreamRatio: 0.6}, "workbuddy"},
+		{"纯文本低并发 → code", config.LoadProfile{TotalRecent: 10, TextRatio: 1.0}, "code"},
+		{"不偏向 → default", config.LoadProfile{TotalRecent: 10, TextRatio: 0.5, ImageRatio: 0.3, VideoRatio: 0.2}, "default"},
+	}
+	for _, c := range cases {
+		preset, reason := config.RecommendScenario(c.in)
+		if preset.Name != c.want {
+			t.Errorf("[%s] 期望情景 %s，实际 %s（reason=%s）", c.name, c.want, preset.Name, reason)
+		}
 	}
 }

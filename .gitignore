@@ -3,11 +3,17 @@
 # 注意 .gitignore 不支持行内注释：原来写成「*.exe~        # ...」时整行都被当成模式，等于没生效。
 *.exe~
 *.exe
+build/
 agnes-hub-go
 agnes-hub-go-linux-amd64
 agnes-hub-go-linux-arm64
+# 版本化发布副本（上传 GitHub Release 后即冗余，不入库）
+agnes-hub-go-linux-amd64-*
+agnes-hub-go-linux-arm64-*
 baipiao-hub-linux-amd64
 baipiao-hub-linux-arm64
+# 一次性发布脚本（内含 GitHub PAT，绝不入库）
+release_*.py
 
 # 运行期数据：含上游 API Key 与管理员口令散列，绝不提交
 data/
@@ -28,3 +34,25 @@ dist/
 *.spk
 # 例外：docs/ 下的 SPK 是套件源实际分发的文件，必须提交
 !docs/*.spk
+
+# 本机 Go 工具链与交叉编译临时产物（.gotmp 内含下载的 go/ 与中间二进制，绝不入库）
+.gotmp/
+
+# 请求字段分析交付报告（含从网关抓取的真实 system 提示词与记忆内容，私有，不入库）
+.workbuddy/request_full_analysis.html
+.workbuddy/request_fields_full.html
+.workbuddy/request_strip_analysis.html
+.workbuddy/gateway_efficiency_audit.html
+
+# NAS 口令（tools/deploy_nas.py 会读它，绝不提交）
+.nas_pass
+
+# fpk 构建产物（由 tools/build_fpk.py 生成，图标源文件在 assets/）
+fpk-bundle/
+
+# NAS SSH 公钥（部署用，绝不入库；.workbuddy/memory 仍保留跟踪，仅忽略此密钥文件）
+.workbuddy/nas_ssh_key
+
+# 一次性 NAS 热更/取证脚本（内含主机与流程细节，不入库）
+.workbuddy/_deploy_*.py
+.workbuddy/_probe_*.py

@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +31,7 @@ import (
 // ---------------------------------------------------------------------------
 var RPMTable = map[string]map[string]float64{
 	"free": {
-		"text": 20, "image_1k": 20, "image_2k": 10, "image_3k": 1, "image_4k": 1, "video": 1,
+		"text": 10, "image_1k": 20, "image_2k": 10, "image_3k": 1, "image_4k": 1, "video": 1,
 	},
 	"enterprise": {
 		"text": 40, "image_1k": 40, "image_2k": 20, "image_3k": 1, "image_4k": 1, "video": 2,
@@ -185,6 +186,23 @@ type Account struct {
 	// 没熔断、管理员手动停用，或连续熔断次数太多已放弃。落盘是为了进程重启后照常复活 ——
 	// 旧版本只存在内存里，重启后被熔断的账号就永远停着，和手动停用分不清。
 	ReviveAt float64 `json:"revive_at,omitempty"`
+
+	// ---- 每日用量预算（长尺度限流，与 RPM 节拍正交）----
+	//
+	// 有些上游的瓶颈不是「每分钟多少次」（速率墙），而是「每天多少用量」（预算墙），
+	// 典型如 Cloudflare Workers AI 的每日 neurons 免费额度。RPM pacer 只管短尺度（分钟），
+	// 若按 RPM 猛打会在几小时内烧光当天预算、触发上游超额报错。
+	// 故新增一个日预算维度：账号累计用量达到 DailyBudget 后，当天自动从候选池剔除
+	// （自动切到其他账号 / 其他池），次日 00:00 滚动清零重新可用。
+	//
+	// DailyBudget  ≤ 0 表示「不设日预算」，完全退回旧的 RPM 行为（向后兼容 agnes）。
+	// BudgetUnit   计量单位："neurons"（Cloudflare）或 "tokens"（按 token 计的池）。
+	// BudgetUsedToday / BudgetDay 是「按自然日累计的用量」，跨天（BudgetDay != 今天）自动清零。
+	DailyBudget     float64 `json:"daily_budget,omitempty"`
+	BudgetUnit      string  `json:"budget_unit,omitempty"`
+	BudgetUsedToday float64 `json:"budget_used_today,omitempty"`
+	// BudgetDay 是 BudgetUsedToday 所属的自然日（本地时区 YYYY-MM-DD），用于跨天判定。
+	BudgetDay string `json:"budget_day,omitempty"`
 }
 
 // DownstreamKey 是签发给客户端的中转密钥。
@@ -198,6 +216,9 @@ type DownstreamKey struct {
 	PinnedAccount string   `json:"pinned_account,omitempty"`
 	UsedTotal     int64    `json:"used_total"`
 	UsedToday     int64    `json:"used_today"`
+	// 令牌（token）用量统计：UsedTokensToday 按天滚动，UsedTokensTotal 累计。
+	UsedTokensTotal int64  `json:"used_tokens_total"`
+	UsedTokensToday int64  `json:"used_tokens_today"`
 	UsedDate      string   `json:"used_date"`
 	CreatedAt     float64  `json:"created_at"`
 }
@@ -352,9 +373,92 @@ type Settings struct {
 	// 网关自己的网页不受此项影响，一律用本地地址（与网关同源，一定可达）。
 	ClientMediaURL   string `json:"client_media_url"`
 	RequestTimeoutMS int    `json:"request_timeout_ms"` // 单个上游请求超时（ms），0=无限（不推荐）
+	// FreeTextRPM 是 agnes 免费档（access_type=free）文本池的标称 RPM，改为可配置项。
+	// 默认 10；填 0 或留空则回退默认值。per-account 的 rpm_overrides 仍然优先。
+	FreeTextRPM float64 `json:"free_text_rpm"`
+	// StreamIdleTimeoutMS 是流式（SSE）响应的「空闲看门狗」超时（ms）：
+	// 只要上游还在持续吐字节，计时就随数据重置，整条流不限时长；
+	// 仅当连续超过该时长【没有任何新字节】时才判定为卡死并断开。
+	// 非流式请求仍用 RequestTimeoutMS 的整请求墙钟超时，二者互不影响。
+	// 默认 60000；填 0 视为 60s。
+	StreamIdleTimeoutMS int `json:"stream_idle_timeout_ms"`
+	// UsageLogMaxLines 是 usage.jsonl 保留的最大行数（按最近 N 行滚动截断，
+	// 防止长期挂机把磁盘写满）。默认 20000；填 0 表示不限。
+	UsageLogMaxLines int `json:"usage_log_max_lines"`
+	// UsageRequestLogBytes 是日志里「用户提出的完整请求」保留的最大字节数，
+	// 超过即截断（默认 512，排障够用且不撑爆日志）。
+	UsageRequestLogBytes int `json:"usage_request_log_bytes"`
+	// Scenario 记录当前激活的「情景模式」名（default/code/image/auto/multi/batch）。
+	// 情景模式 = 一组网关参数包，一键应用后这些旋钮会被覆写成该情景侧重方向；
+	// 账号级 RPMOverrides 永远优先于情景包，不被冲掉。
+	Scenario string `json:"scenario,omitempty"`
+	// TextTwoLevelQueue 开启文本池「两级队列」：同一池内非流式（工具/短调用）
+	// 优先于流式（长生成）出队，只改出队顺序、不破坏该池 RPM 安全节拍。
+	// 多任务并行情景默认开启。
+	TextTwoLevelQueue bool `json:"text_two_level_queue"`
+	// RateLimitRetryMax 是上游 429（限流/达到最大额度）时【网关内部】的自动重试
+	// 次数上限。区别于 RetryMax（普通 5xx/408 退避）：429 是「受理前拒绝、重试安全」，
+	// 网关会在内部换账号 + 重新排队 + 感知 Retry-After 退避地自动重试，直到成功或
+	// 耗尽该预算，期间不透传 429 给客户端，从而不中断客户端的在途任务。
+	// 默认 6；填 0 表示沿用 RetryMax。
+	RateLimitRetryMax int `json:"rate_limit_retry_max"`
+	// ContinuationMaxRounds 是上游响应被 max_tokens 截断（finish_reason=length /
+	// MAX_TOKENS / max_tokens）时，网关内自动「续写」的最大轮数：把已生成的部分
+	// 输出作为 assistant 消息追加回请求再追加 user 续写指令，重新排队发起新一轮
+	// 上游请求并拼接结果，客户端不再因截断而任务中断。0 = 禁用（截断原样透传）。
+	ContinuationMaxRounds int `json:"continuation_max_rounds"`
+	// SoftFailRetryMax 是「HTTP 200 但内容不可用」时的换号重发次数上限。
+	// 这类失败（空内容 / body 内嵌 error / 非法 JSON / 审查类 finish_reason）
+	// 状态码正常，但客户端一收到就停，故网关应换成另一个号重发一轮。
+	// 默认 2；填 0 = 恢复旧行为（原样透传）。仅对文本 chat 路径生效，
+	// 视频轮询等异构响应结构不会被误判（认不出的结构一律视为可用）。
+	SoftFailRetryMax int `json:"soft_fail_retry_max"`
+	// StreamAutoResume 开启后，流式 SSE 在「未见 finish_reason 就断流 /
+	// 中途出现 error 帧 / 传输层异常」时，网关自动重连续写（不是把异常抛给
+	// 客户端），预算受 ContinuationMaxRounds 约束。默认 true。
+	StreamAutoResume bool `json:"stream_auto_resume"`
+	// RateLimitWaitBudgetMS 是 429 内部重试的「总等待预算」（ms）：所有 429 退避 +
+	// 排队等待累计超过它即停止重试并透传最后一次 429。默认 180000（3 分钟）；
+	// 填 0 表示不限（仅在 RateLimitRetryMax 耗尽时停）。防止限流持续时网关挂死。
+	RateLimitWaitBudgetMS int `json:"rate_limit_wait_budget_ms"`
+	// AutoScenario 开启后，维护循环会按实时负载画像（模态占比/流式比/并发/429）
+	// 周期性推荐并自动切换最贴合的情景（带冷却防抖，同一情景 60s 内不重复切）。
+	// 关闭时情景完全由人手在控制台选定/一键应用，不会静默翻转。默认 false。
+	AutoScenario bool `json:"auto_scenario"`
+	// RawCaptureEnabled 开启后，网关将【客户端发来的完整原始请求体】
+	// （未截断）落到 data/raw_capture/ 目录，每个请求一个文件，
+	// 用于排障与「请求字段全量分析」。默认 false（关闭）。
+	RawCaptureEnabled bool `json:"raw_capture_enabled"`
+	// UpstreamRequestGzip 开启后，网关对发往上游的请求体做 gzip 压缩
+	// （Content-Encoding: gzip），削减网关→上游的带宽（WorkBuddy 单请求体常达
+	// ~500KB，gzip 可压到 1/5~1/8）。已验证上游 agnes 兼容解压 gzip 请求体，
+	// 故默认 true（见 #29）；个别不兼容的上游可手动关闭。
+	UpstreamRequestGzip bool `json:"upstream_request_gzip"`
+	// AnthropicPromptCache 开启后，网关在 Anthropic 风格（/v1/messages）请求体的
+	// 顶层 system 块注入 cache_control:{type:"ephemeral"}，让上游对反复出现的
+	// 巨大静态前缀（system + tools）做前缀缓存，避免每轮重算 prefill。仅当上游
+	// 兼容 Anthropic 前缀缓存时生效；不兼容时该字段被忽略，内容不受影响（见 #29）。
+	AnthropicPromptCache bool `json:"anthropic_prompt_cache"`
+	// StripContentPolicy 开启后，网关在把请求体发给上游前，剥离 WorkBuddy 客户端
+	// 注入的 <content_policy> 段（纯字符串替换，~0.1ms/请求，远轻于 gzip 的 1ms）。
+	// 目的不是省速度，而是省 token：高轮次会话里该段每轮重复、约占 100~400 词，
+	// 剥离可削减送模型的正文量。默认 true（省 token；对 <user_query> 真实输入与
+	// 其余字段零改动）；若需保留原始正文送上游可手动关闭（setopt strip_content_policy off）。
+	StripContentPolicy bool `json:"strip_content_policy"`
+	// RoutingMode 决定「有日预算的用量型账号（如 Cloudflare）」与「无天花板的速率型账号
+	// （如 agnes）」混挂时谁先被吃：
+	//   - "rate_first"  （默认）优先速率型主力、用量型兜底 —— 最稳，agnles 扛主力、
+	//     CF 只在 agnes 拥堵/全熔断时顶上，且 CF 烧光当天自动出局、次日回池；
+	//   - "budget_first" 优先烧用量型免费配额（CF 烧光就自动让位 agnes，次日 00:00 自动回池）；
+	//   - "balanced" 不做偏好，纯按 priority→区域→投影等待→在途 排（与旧行为一致）。
+	// 无论哪种，「预算耗尽 → 当天自动从候选池剔除、次日自动回池」的不变量都成立。
+	RoutingMode      string `json:"routing_mode"`
 	ChatPasswordHash string `json:"chat_password_hash,omitempty"`
 	ChatPasswordSalt string `json:"chat_password_salt,omitempty"`
 }
+
+// RoutingModes 是 RoutingMode 的合法取值。
+var RoutingModes = []string{"rate_first", "budget_first", "balanced"}
 
 // DefaultSettings 返回出厂设置。
 func DefaultSettings() Settings {
@@ -408,15 +512,226 @@ func DefaultSettings() Settings {
 		ProbeModel:           "agnes-2.5-flash",
 		OptimizationMode:     "concurrent_batch",
 		ImageRecordRetention: 30,
-		ImageMaxCapacity:     500,
-		VideoMaxCapacity:     200,
+		ImageMaxCapacity: 500,
+		VideoMaxCapacity: 200,
 		// 注意：这里刻意**不**在 normalizeSettings 里给它补默认值。
 		// 旧版 settings.json 里没有这个键，反序列化时会保留这里的默认值；
 		// 而用户显式写 0 表示「不限」，一旦在 normalize 里补默认值就永远关不掉了。
-		VideoCacheMaxMB:  2048,
-		RegionPriority:   "cn_first",
-		RequestTimeoutMS: 30000, // 默认 30s 上游请求超时
+		VideoCacheMaxMB:     2048,
+		RegionPriority:      "cn_first",
+		RequestTimeoutMS:    30000, // 默认 30s 上游请求超时
+		FreeTextRPM:         10,    // agnes 免费档文本池标称 RPM（可配置）
+		StreamIdleTimeoutMS: 60000, // 流式空闲看门狗：连续 60s 无新字节才断开
+		UsageLogMaxLines:    20000, // usage.jsonl 滚动保留最大行数
+		UsageRequestLogBytes: 512,  // 日志「用户完整请求」保留字节上限
+		RateLimitRetryMax:     6,      // 429 网关内部自动重试次数上限（换账号+重新排队）
+		RateLimitWaitBudgetMS: 180000, // 429 内部重试总等待预算 3 分钟，超时才透传
+		// MAX_TOKENS 截断自动续写：默认 2 轮（截断不再打断客户端任务）。
+		ContinuationMaxRounds: 2,
+		// 「200 但内容不可用」最多换号重发 2 次（加上首发共 3 次尝试）
+		SoftFailRetryMax: 2,
+		// 流式断流 / error 帧自动重连续写，默认开（不让客户端停）
+		StreamAutoResume: true,
+		// #29：发往上游的请求体默认 gzip 压缩（已验证上游 agnes 兼容解压，见 #29）。
+		UpstreamRequestGzip: true,
+		// 默认剥离客户端注入的 <content_policy> 段以省 token（对 user_query 真实输入零改动）。
+		StripContentPolicy: true,
+		// 混挂「用量型（CF 有日预算）」与「速率型（agnles 无天花板）」时：agnles 扛主力、
+		// CF 兜底且烧光自动出局。这是最稳的挂机默认。
+		RoutingMode: "rate_first",
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 情景模式（Scenario）——按网关主要执行方向一键侧重
+//
+// 设计口径：情景不是新模式，而是「一组网关参数包」。应用某情景即覆写 Settings
+// 的若干旋钮（Safety / 文本 RPM / 重试 / 队列 / 并发 / 两级队列 …），随后走
+// Hub.Reload() 热重载即时生效、免重启。
+//
+// 优先级：账号级 RPMOverrides 永远优先于情景包（applyScenario 只写全局 Settings
+// 旋钮，不碰账号字段），因此你手工给某号调的 RPM 不会被情景冲掉。
+//
+// 参数按「8 个免费号」基准设计（池级吞吐 = 单号 RPM × 8 × Safety）。
+// ---------------------------------------------------------------------------
+
+// ScenarioPreset 是一个情景的参数包。
+type ScenarioPreset struct {
+	Name        string   `json:"name"`
+	Desc        string   `json:"desc"`
+	Safety      float64  `json:"safety_factor"`
+	FreeTextRPM float64  `json:"free_text_rpm"`
+	RetryMax    int      `json:"retry_max"`
+	RetryBaseMS int      `json:"retry_base_backoff_ms"`
+	RetryCapMS  int      `json:"retry_max_backoff_ms"`
+	QueueSize   int      `json:"queue_max_size"`
+	QueueWaitMS int      `json:"queue_max_wait_ms"`
+	ImageConc   int      `json:"image_concurrency"`
+	VideoInFlt  int      `json:"video_max_inflight"`
+	StreamIdle  int      `json:"stream_idle_timeout_ms"`
+	TwoLevel    bool     `json:"text_two_level_queue"`
+	Region      string   `json:"region_priority"`
+	// 429 网关内自动重试预算（随情景走）：挂机批量/写代码更高更久（多等少错、不中断任务），
+	// 交互场景更短（快失败快切号），生图保守（非幂等、防重复扣费）。
+	// RateLimitRetryMax=0 表示沿用该情景 RetryMax；RateLimitWaitBudget=0 表示不限等待预算。
+	RateLimitRetryMax   int `json:"rate_limit_retry_max"`
+	RateLimitWaitBudget int `json:"rate_limit_wait_budget_ms"`
+}
+
+// ScenarioPresets 返回全部情景参数包（顺序即控制台展示顺序）。
+// 8 免费号基准：text 池级 ≈ 10×8×safety，image_1k ≈ 20×8×safety。
+func ScenarioPresets() []ScenarioPreset {
+	return []ScenarioPreset{
+		{
+			Name: "default", Desc: "默认均衡：各池按官方节奏跑，不做激进侧重",
+			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 4, RateLimitWaitBudget: 90000, // 90s：均衡场景，429 适度自动重试
+		},
+		{
+			Name: "code", Desc: "代码编写：文本高优、首字节延迟优先；重试更快、生图/视频让路",
+			Safety: 0.95, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 400, RetryCapMS: 4000,
+			QueueSize: 200, QueueWaitMS: 60000, ImageConc: 2, VideoInFlt: 1,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 5, RateLimitWaitBudget: 60000, // 60s：交互写代码偏短快，适度自动重试
+		},
+		{
+			Name: "image", Desc: "图片生成：拉满 8 号并发生图，文本降档给生图让路",
+			Safety: 0.9, FreeTextRPM: 6, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 8, VideoInFlt: 1,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 3, RateLimitWaitBudget: 60000, // 生图非幂等，保守自动重试防重复扣费
+		},
+		{
+			Name: "auto", Desc: "自动判断：文本/生图/生视频均衡，交给意图判定路由",
+			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 200, QueueWaitMS: 120000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 60000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 4, RateLimitWaitBudget: 90000,
+		},
+		{
+			Name: "multi", Desc: "多任务并行：多任务横向吃满 8 号，队列更深、429 退避保守、开两级队列（短调用优先）",
+			Safety: 0.85, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 800, RetryCapMS: 12000,
+			QueueSize: 500, QueueWaitMS: 180000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 60000, TwoLevel: true, Region: "cn_first",
+			RateLimitRetryMax: 6, RateLimitWaitBudget: 180000, // 多任务深队列，429 自动重试更足
+		},
+		{
+			Name: "batch", Desc: "挂机批量：无人值守长跑，多等少错、最长空闲容忍，吞吐拉满",
+			Safety: 0.85, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 1000, RetryCapMS: 15000,
+			QueueSize: 500, QueueWaitMS: 300000, ImageConc: 4, VideoInFlt: 2,
+			StreamIdle: 120000, TwoLevel: false, Region: "cn_first",
+			RateLimitRetryMax: 10, RateLimitWaitBudget: 300000, // 挂机批量最高预算：多等少错，5 分钟自动顶满
+		},
+		{
+			// #23：专为「接入 WorkBuddy 写代码 / 自动工具调用 / 方案生成，偶尔多任务并发」
+			// 定制的推荐一键预设。相比 multi 更贴文本负载：文本满血、工具短调用（非流式）
+			// 走两级队列优先出队、多任务深队列吃满 8 号、生图/视频让路、长方案流式更耐断流。
+			Name: "workbuddy", Desc: "WorkBuddy 写代码推荐：文本为主、工具短调用优先（两级队列）、多任务深队列吃满、生图/视频让路、长方案流式不断流",
+			Safety: 0.9, FreeTextRPM: 10, RetryMax: 3, RetryBaseMS: 500, RetryCapMS: 8000,
+			QueueSize: 400, QueueWaitMS: 180000, ImageConc: 2, VideoInFlt: 1,
+			StreamIdle: 90000, TwoLevel: true, Region: "cn_first",
+			RateLimitRetryMax: 8, RateLimitWaitBudget: 180000, // 写代码：429 高预算自动顶，不中断客户端在途任务
+		},
+	}
+}
+
+// ScenarioNames 返回全部情景 ID（供控制台/校验）。
+func ScenarioNames() []string {
+	outs := make([]string, 0, len(ScenarioPresets()))
+	for _, p := range ScenarioPresets() {
+		outs = append(outs, p.Name)
+	}
+	return outs
+}
+
+// FindScenario 按名取情景包；找不到返回 false。
+func FindScenario(name string) (ScenarioPreset, bool) {
+	for _, p := range ScenarioPresets() {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return ScenarioPreset{}, false
+}
+
+// ApplyScenario 把某情景的参数包覆写进 Settings（调用方负责落盘 + Hub.Reload）。
+// 只改全局旋钮，绝不碰账号级字段（RPMOverrides / 各池 RPM），保证账号级优先。
+// 返回 false 表示未知情景（不改任何字段）。
+func ApplyScenario(st *Settings, name string) bool {
+	p, ok := FindScenario(name)
+	if !ok {
+		return false
+	}
+	st.SafetyFactor = p.Safety
+	st.FreeTextRPM = p.FreeTextRPM
+	st.RetryMax = p.RetryMax
+	st.RetryBaseBackoffMS = p.RetryBaseMS
+	st.RetryMaxBackoffMS = p.RetryCapMS
+	st.QueueMaxSize = p.QueueSize
+	st.QueueMaxWaitMS = p.QueueWaitMS
+	st.ImageConcurrency = p.ImageConc
+	st.VideoMaxInFlight = p.VideoInFlt
+	st.StreamIdleTimeoutMS = p.StreamIdle
+	st.TextTwoLevelQueue = p.TwoLevel
+	st.RegionPriority = p.Region
+	// 429 网关内自动重试预算随情景走：挂机批量（batch）最多最久，写代码（workbuddy）高，
+	// 交互（code）适度，生图（image）保守。0 语义保留（RetryMax=0 沿用情景 RetryMax；
+	// WaitBudget=0 不限等待）。
+	st.RateLimitRetryMax = p.RateLimitRetryMax
+	st.RateLimitWaitBudgetMS = p.RateLimitWaitBudget
+	st.Scenario = p.Name
+	return true
+}
+
+// LoadProfile 是接入方的实时负载画像（近窗口统计，供自动检测匹配情景）。
+// 由 Hub.LoadProfile() 采集；比例字段用 0~1 浮点，0 表示该维度无数据。
+type LoadProfile struct {
+	TotalRecent     int     // 近窗口请求总数（0 = 无负载）
+	TextRatio       float64 // 文本占比
+	ImageRatio      float64 // 生图占比
+	VideoRatio      float64 // 生视频占比
+	StreamRatio     float64 // 流式请求占比（长生成特征）
+	ConcurrencyNow  int     // 当前在途并发数（多任务并行特征）
+	Upstream429Rate int     // 近 60s 真实命中 429 次数（限流压力）
+}
+
+// RecommendScenario 按负载画像推荐最贴合的情景 + 人类可读理由（纯函数，可单测）。
+// 与 7 个情景一一映射；数据不足时回落 default。
+func RecommendScenario(p LoadProfile) (ScenarioPreset, string) {
+	if p.TotalRecent == 0 {
+		preset, _ := FindScenario("default")
+		return preset, "暂无负载数据，用默认均衡"
+	}
+	// 1) 高 429 + 深队列诉求 → 挂机批量（多等少错、最长容忍）
+	if p.Upstream429Rate >= 3 {
+		preset, _ := FindScenario("batch")
+		return preset, "近期 429 压力大（近60s≥3次），切挂机批量：多等少错、最长空闲容忍、吞吐拉满"
+	}
+	// 2) 视频占比高 → 自动判断里的视频侧重（长任务、低并发）
+	if p.VideoRatio >= 0.4 {
+		preset, _ := FindScenario("auto")
+		return preset, "视频请求占比高（≥40%），切自动判断：均衡三模态、视频低并发"
+	}
+	// 3) 生图占比高 → 图片生成（拉满并发生图、文本让路）
+	if p.ImageRatio >= 0.4 {
+		preset, _ := FindScenario("image")
+		return preset, "生图请求占比高（≥40%），切图片生成：拉满 8 号并发生图、文本降档让路"
+	}
+	// 4) 多任务并发（在途高）+ 流式/短调用混合 → WorkBuddy 写代码推荐（文本为主 + 两级队列）
+	if p.ConcurrencyNow >= 3 || (p.TextRatio >= 0.7 && p.StreamRatio >= 0.5) {
+		preset, _ := FindScenario("workbuddy")
+		return preset, "文本为主且多任务并发（在途≥3 或 文本≥70%+流式≥50%），切 WorkBuddy 写代码推荐：工具短调用优先、多任务深队列、生图/视频让路"
+	}
+	// 5) 纯文本、低并发 → 代码编写（首字节延迟优先、快速重试）
+	if p.TextRatio >= 0.8 {
+		preset, _ := FindScenario("code")
+		return preset, "几乎全文本且低并发（文本≥80%），切代码编写：首字节延迟优先、生图/视频让路"
+	}
+	// 6) 其余 → 默认均衡
+	preset, _ := FindScenario("default")
+	return preset, "负载不偏向某一类，用默认均衡"
 }
 
 // ---------------------------------------------------------------------------
@@ -434,15 +749,27 @@ type Store struct {
 	Jobs      map[string]*VideoJob
 	ImageJobs map[string]*ImageJob
 	ChatLogs  map[string]*ChatLog
-
 	adminSessions *sessionTable
 	chatSessions  *sessionTable
 
 	// keyInflight 是各下游密钥「已通过额度检查、尚未结束」的请求数（受 mu 保护）。
 	keyInflight map[string]int
+	// usageLineCount 是 usage.jsonl 的累计行数（进程内估计，启动时从文件读一次，
+	// 之后按追加行数增长）。P1-1 用它触发滚动截断，避免长期挂机把磁盘写满。
+	usageLineCount atomic.Int64
+	// #20 热路径异步落盘：
+	//   keysDirty 由 ChargeKey 在改内存后打标，维护循环 FlushKeys 批量写盘（避免每请求
+	//   全量 saveKeysLocked）；keys/accounts 的写锁 s.mu 已覆盖 Keys 字段，故此处无需独立锁。
+	//   usageBuf/usageMu 收集待落盘的 usage 记录，FlushUsage 批量追加（一次 Open/Write 多行
+	//   一次 Close），用独立锁避免与 s.mu（keys/accounts/settings 读多写少）耦合。
+	keysDirty atomic.Bool
 	// usageMu 串行化 usage.jsonl 的追加与保留期改写，避免改写期间追加的行丢失。
-	usageMu       sync.Mutex
-	bindingsDirty bool
+	usageMu  sync.Mutex
+	usageBuf []map[string]any
+	// #20 补漏：bindingsDirty 由热路径 Bind（Pick 每个粘性会话请求都会调）打标，
+	// 维护循环 FlushBindings 批量写盘，避免每请求同步 saveBindingsLocked。
+	// 与 keysDirty 一样走 s.mu 保护（s.Bindings 在 s.mu 下），无需独立锁。
+	bindingsDirty atomic.Bool
 }
 
 // NewStore 载入（或初始化）data 目录。
@@ -533,6 +860,9 @@ func (s *Store) load() error {
 	for _, a := range s.Accounts {
 		normalizeAccount(a, s.Settings)
 	}
+	// P1-1：启动时从现有 usage.jsonl 读一次行数作为累计基线，
+	// 之后每次追加递增；超过阈值时滚动截断，防止挂机写满磁盘。
+	s.usageLineCount.Store(countLines(s.path("usage.jsonl")))
 	return nil
 }
 
@@ -631,6 +961,32 @@ func normalizeSettings(v *Settings) {
 	if v.VideoMaxCapacity <= 0 {
 		v.VideoMaxCapacity = d.VideoMaxCapacity
 	}
+	if v.FreeTextRPM <= 0 {
+		v.FreeTextRPM = d.FreeTextRPM
+	}
+	if v.StreamIdleTimeoutMS <= 0 {
+		v.StreamIdleTimeoutMS = d.StreamIdleTimeoutMS
+	}
+	// UsageLogMaxLines：0 视为「沿用默认 20000」（旧配置文件缺该字段时反序列化为 0）；
+	// 只有显式负值才表示「不限制」。默认取向是挂机安全——总是带上限，避免写满磁盘。
+	if v.UsageLogMaxLines == 0 {
+		v.UsageLogMaxLines = d.UsageLogMaxLines
+	}
+	if v.UsageRequestLogBytes <= 0 {
+		v.UsageRequestLogBytes = d.UsageRequestLogBytes
+	}
+	// 情景模式：旧配置缺该字段时归到 default（不改任何旋钮，仅记录名）。
+	if v.Scenario == "" {
+		v.Scenario = "default"
+	}
+	// 429 网关内部重试预算：0 有语义（RetryMax=0 沿用 RetryMax；WaitBudget=0 不限时），
+	// 故不做 <=0 回落，只对负数兜底，防止填错负数导致行为怪异。
+	if v.RateLimitRetryMax < 0 {
+		v.RateLimitRetryMax = d.RateLimitRetryMax
+	}
+	if v.RateLimitWaitBudgetMS < 0 {
+		v.RateLimitWaitBudgetMS = d.RateLimitWaitBudgetMS
+	}
 	migrateSettings(v)
 }
 
@@ -661,7 +1017,19 @@ func migrateSettings(v *Settings) {
 	}
 }
 
-// normalizeAccount 补齐缺失字段。
+// asString 把 any 安全转成字符串（config 包内通用工具）。
+func asString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case fmt.Stringer:
+		return t.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
 //
 // model_manifest 的语义：**缺失（nil）→ 用默认清单补齐**（视为「还没声明」）；
 // **非 nil 的空切片 → 保留为空**（视为「明示不支持该模态」）。
@@ -701,6 +1069,63 @@ func normalizeAccount(a *Account, s Settings) {
 	if a.ModelManifest.Video == nil {
 		a.ModelManifest.Video = append([]string(nil), s.ModelManifestDefault.Video...)
 	}
+	// 日预算字段归一化：BudgetUnit 空值按 "neurons"（Cloudflare 默认口径）。
+	if a.BudgetUnit == "" {
+		a.BudgetUnit = "neurons"
+	}
+	// 跨天滚动：BudgetUsedToday 是按「自然日」累计的，若归属日不是今天，自动清零重新计。
+	// 归一化阶段做一遍兜底（读盘即滚），运行期再由 hub 维护循环到点滚动（不重启也生效）。
+	a.rollBudgetDay(todayKey())
+}
+
+// todayKey 返回本地时区的自然日键（YYYY-MM-DD），作为「日预算周期」的边界标识。
+func todayKey() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// TodayKey 是 todayKey 的导出版，供 hub 包跨包做日预算跨天判定（候选筛选 / 维护循环）。
+func TodayKey() string { return todayKey() }
+
+// rollBudgetDay 当预算归属日不是指定日时清零当天累计（跨天滚动）。
+// 返回是否发生了滚动（调用方可据此触发落盘 / 重新入池）。
+func (a *Account) rollBudgetDay(dayKey string) bool {
+	if a.DailyBudget <= 0 {
+		return false // 没设预算，无滚动可言
+	}
+	if a.BudgetDay != dayKey {
+		a.BudgetDay = dayKey
+		a.BudgetUsedToday = 0
+		return true
+	}
+	return false
+}
+
+// AddBudgetUsage 累加一次用量（记账成功后调用）。返回 (是否已达标、是否发生跨天重置)。
+func (a *Account) AddBudgetUsage(delta float64) (exhausted bool, rolled bool) {
+	rolled = a.rollBudgetDay(todayKey())
+	if delta > 0 {
+		a.BudgetUsedToday += delta
+	}
+	if a.DailyBudget > 0 && a.BudgetUsedToday >= a.DailyBudget {
+		exhausted = true
+	}
+	return exhausted, rolled
+}
+
+// BudgetExhausted 该账号当天日预算是否已用尽（未设预算恒为 false）。
+func (a *Account) BudgetExhausted() bool {
+	return a.DailyBudget > 0 && a.BudgetUsedToday >= a.DailyBudget
+}
+
+// BudgetRemaining 当天剩余日预算（未设预算返回 0 表示「无限额」）。
+func (a *Account) BudgetRemaining() float64 {
+	if a.DailyBudget <= 0 {
+		return 0
+	}
+	if r := a.DailyBudget - a.BudgetUsedToday; r > 0 {
+		return r
+	}
+	return 0
 }
 
 // ---- 原子写 ----
@@ -798,19 +1223,8 @@ func (s *Store) saveBindingsLocked() error {
 	if err := writeJSON(s.path("bindings.json"), s.Bindings); err != nil {
 		return err
 	}
-	s.bindingsDirty = false
+	s.bindingsDirty.Store(false)
 	return nil
-}
-
-// FlushBindings batches affinity persistence. Failed writes remain dirty for retry.
-func (s *Store) FlushBindings() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.gcBindingsLocked()
-	if !s.bindingsDirty {
-		return nil
-	}
-	return s.saveBindingsLocked()
 }
 
 // SaveJobs 落盘视频任务映射。
@@ -930,6 +1344,25 @@ func (s *Store) FlushAccounts() {
 	_ = s.saveAccountsLocked()
 }
 
+// RollDailyBudgets 把所有账号的日预算归属日滚动到指定自然日（本地时区今天）。
+// 归属日 != dayKey 的账号当天累计清零重新计。返回发生滚动的账号 ID 列表
+// （调用方据此决定是否落盘 + 记录 BudgetDayRollovers 指标）。
+// 维护循环（30s 一跳）到点调用一次即可，无需重启。
+func (s *Store) RollDailyBudgets(dayKey string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var rolled []string
+	for _, a := range s.Accounts {
+		if a.rollBudgetDay(dayKey) {
+			rolled = append(rolled, a.ID)
+		}
+	}
+	if len(rolled) > 0 {
+		_ = s.saveAccountsLocked()
+	}
+	return rolled
+}
+
 // MutateAccountNoSave 在写锁内改账号但不落盘（由调用方负责标 dirty / 定时落盘）。
 func (s *Store) MutateAccountNoSave(id string, fn func(*Account) bool) bool {
 	s.mu.Lock()
@@ -1026,12 +1459,16 @@ func (s *Store) DeleteAccount(id string) bool {
 func (s *Store) RPMFor(a *Account, poolClass string) float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return rpmFor(a, poolClass)
+	return rpmFor(a, poolClass, s.Settings.FreeTextRPM)
 }
 
-func rpmFor(a *Account, poolClass string) float64 {
+func rpmFor(a *Account, poolClass string, freeTextRPM float64) float64 {
 	if v, ok := a.RPMOverrides[poolClass]; ok && v > 0 {
 		return v
+	}
+	// agnes 免费档文本池的 RPM 改为可配置项（FreeTextRPM）；0 表示用档位表。
+	if a.AccessType == "free" && poolClass == "text" && freeTextRPM > 0 {
+		return freeTextRPM
 	}
 	table, ok := RPMTable[a.AccessType]
 	if !ok {
@@ -1107,6 +1544,18 @@ func (s *Store) MutateKey(value string, fn func(*DownstreamKey) bool) bool {
 		}
 	}
 	return false
+}
+
+// FlushKeys 批量落盘下游密钥（#20：维护循环周期调用）。
+// 仅当 ChargeKey 在内存改过（keysDirty=true）才真正写一次盘，把「每请求全量
+// saveKeysLocked」降为「30s 一次」；与 FlushAccounts 的兜底写盘同口径。
+func (s *Store) FlushKeys() {
+	if !s.keysDirty.CompareAndSwap(true, false) {
+		return // 无脏数据
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.saveKeysLocked()
 }
 
 // KeysSnapshot 返回密钥列表深拷贝。
@@ -1204,8 +1653,10 @@ func (s *Store) QuotaExceeded(k *DownstreamKey) string {
 	return ""
 }
 
-// ChargeKey 记账（按天滚动）。
-func (s *Store) ChargeKey(value string) {
+// ChargeKey 记账（按天滚动）。tokens 为该次请求消耗的 token 总量（解析不到则为 0）。
+// #20：热路径不再同步全量落盘（原 saveKeysLocked 每请求一次 Open/Write/Close），
+// 改为内存累加 + 标 keysDirty，由维护循环 FlushKeys 周期批量写盘。
+func (s *Store) ChargeKey(value string, tokens int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	today := time.Now().Format("2006-01-02")
@@ -1214,10 +1665,13 @@ func (s *Store) ChargeKey(value string) {
 			if k.UsedDate != today {
 				k.UsedDate = today
 				k.UsedToday = 0
+				k.UsedTokensToday = 0
 			}
 			k.UsedTotal++
 			k.UsedToday++
-			_ = s.saveKeysLocked()
+			k.UsedTokensTotal += tokens
+			k.UsedTokensToday += tokens
+			s.keysDirty.Store(true)
 			return
 		}
 	}
@@ -1226,6 +1680,8 @@ func (s *Store) ChargeKey(value string) {
 // ---- 粘性绑定 ----
 
 // Bind 写入绑定。
+// #20 补漏：热路径（Pick 每个粘性会话请求都会调）不再同步 saveBindingsLocked，
+// 改为内存写 + 标 bindingsDirty，由维护循环 FlushBindings 30s 批量落盘。
 func (s *Store) Bind(sessionKey, accountID string) {
 	if sessionKey == "" {
 		return
@@ -1236,7 +1692,20 @@ func (s *Store) Bind(sessionKey, accountID string) {
 		s.Bindings = map[string]Binding{}
 	}
 	s.Bindings[sessionKey] = Binding{AccountID: accountID, Updated: float64(time.Now().UnixNano()) / 1e9}
-	s.bindingsDirty = true
+	s.gcBindingsLocked()
+	s.bindingsDirty.Store(true)
+}
+
+// FlushBindings 批量落盘粘性绑定（#20 补漏：维护循环周期调用）。
+// 仅当热路径 Bind 改过（bindingsDirty=true）才真正写一次盘；与 FlushKeys 同口径。
+func (s *Store) FlushBindings() {
+	if !s.bindingsDirty.CompareAndSwap(true, false) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcBindingsLocked()
+	_ = s.saveBindingsLocked()
 }
 
 // BindingsGet 读取绑定。
@@ -1256,7 +1725,7 @@ func (s *Store) gcBindingsLocked() {
 	for k, v := range s.Bindings {
 		if v.Updated < cutoff {
 			delete(s.Bindings, k)
-			s.bindingsDirty = true
+			s.bindingsDirty.Store(true)
 		}
 	}
 }
@@ -1268,12 +1737,26 @@ func (s *Store) BindingsSnapshot() map[string]Binding {
 	return cloneMap(s.Bindings)
 }
 
+// BindingsCountByAccount 统计每个账号当前被多少个活跃任务（粘性会话）绑定。
+// 供调度器做「任务分散」：新任务优先选没人绑定的账号，避免并发任务的
+// 压力全部挤在同一个号的通道上。绑定有 SessionTTL 过期 GC，不会把已结束
+// 的旧任务永久算进占用。
+func (s *Store) BindingsCountByAccount() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]int, len(s.Bindings))
+	for _, b := range s.Bindings {
+		out[b.AccountID]++
+	}
+	return out
+}
+
 // ClearBindings 清空全部绑定。
 func (s *Store) ClearBindings() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Bindings = map[string]Binding{}
-	s.bindingsDirty = true
+	s.bindingsDirty.Store(true)
 	_ = s.saveBindingsLocked()
 }
 
@@ -1509,23 +1992,97 @@ func (s *Store) saveChatLogsLocked() error { return writeJSON(s.path("chat_logs.
 
 // ---- 用量日志 ----
 
-// AppendUsage 追加一行 JSONL（失败不影响主链路）。
+// AppendUsage 记录一行 usage（#20：热路径不再每请求 Open/Write/Close）。
+// 改为入内存缓冲 usageBuf，由维护循环 FlushUsage 批量落盘（一次 Open/Write 多行
+// 一次 Close）。usageLineCount 仍按记录数原子自增，用于触发滚动截断。
 func (s *Store) AppendUsage(record map[string]any) {
-	buf, err := json.Marshal(record)
-	if err != nil {
+	if record == nil {
 		return
 	}
 	s.usageMu.Lock()
-	defer s.usageMu.Unlock()
-	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	s.usageBuf = append(s.usageBuf, record)
+	s.usageMu.Unlock()
+
+	// 行数计数只作「是否该截断」的触发器，真正截断在 FlushUsage 批量落盘后
+	// 于磁盘态上执行（此处文件里还没有这批缓冲行，不能据此截断）。
+	s.usageLineCount.Add(1)
+}
+
+// FlushUsage 批量把 usageBuf 里的记录一次性追加到 usage.jsonl（#20：维护循环周期调用）。
+// 一次 Open/Write 多行 + 一次 Close，把「每请求一次磁盘往返」降为「30s 一次批量写」。
+// 与 429 不写盘同口径：挂机期间若进程被杀，最多丢最近一个 flush 周期（≤30s）的日志。
+func (s *Store) FlushUsage() {
+	s.usageMu.Lock()
+	if len(s.usageBuf) == 0 {
+		s.usageMu.Unlock()
+		return
+	}
+	batch := s.usageBuf
+	s.usageBuf = nil
+	s.usageMu.Unlock()
+
+	f, err := os.OpenFile(s.path("usage.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		// 写盘失败：记录放回缓冲头部，下轮重试（不丢数据）。
+		s.usageMu.Lock()
+		s.usageBuf = append(batch, s.usageBuf...)
+		s.usageMu.Unlock()
+		return
+	}
+	var sb strings.Builder
+	for _, rec := range batch {
+		line, err := json.Marshal(rec)
+		if err != nil {
+			continue
+		}
+		sb.Write(line)
+		sb.WriteByte('\n')
+	}
+	if sb.Len() > 0 {
+		_, _ = f.WriteString(sb.String())
+	}
+	_ = f.Close()
+
+	// 批量落盘完成后，基于磁盘态做一次截断（P1-1 滚动日志防磁盘写满）。
+	maxLines := s.Settings.UsageLogMaxLines
+	if maxLines > 0 && s.usageLineCount.Load()%int64(maxLines) == 0 {
+		s.truncateUsageLog(maxLines)
+	}
+}
+
+// truncateUsageLog 把 usage.jsonl 截断为最近 keep 行，并更新计数。
+func (s *Store) truncateUsageLog(keep int) {
+	path := s.path("usage.jsonl")
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
-	defer f.Close()
-	_, _ = f.Write(append(buf, '\n'))
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > keep {
+		lines = lines[len(lines)-keep:]
+	}
+	out := strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	if out != "" {
+		out += "\n"
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(out), 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+	s.usageLineCount.Store(countLines(path))
 }
 
-// TailUsage 读取最近 n 条日志（倒序）。
+// countLines 统计文件的换行数（作为行数的近似基线）。
+func countLines(path string) int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return int64(strings.Count(string(data), "\n"))
+}
+
+// TailUsage 读取最近 n 条日志（倒序，只读磁盘）。
 //
 // 只读文件尾部一段：旧实现每次都把整个 usage.jsonl 读进内存，而控制台每次刷新都调它。
 func (s *Store) TailUsage(n int) []map[string]any {
@@ -1572,6 +2129,38 @@ func (s *Store) TailUsage(n int) []map[string]any {
 		if json.Unmarshal([]byte(line), &rec) == nil {
 			out = append(out, rec)
 		}
+	}
+	return out
+}
+
+// TailUsageLive 控制台日志页专用（#20 修复）：把「尚未落盘的内存缓冲」也算进最近
+// 记录，避免异步批量落盘后，刚发完请求的 user_request（用户输入）要等 30s 才在
+// 日志页可见。pending 里的记录尚未上盘，与磁盘内容不重叠；结果倒序（最新在前），
+// 取最近 n 条。
+func (s *Store) TailUsageLive(n int) []map[string]any {
+	if n <= 0 {
+		n = 200
+	}
+	// 1) 内存未落盘缓冲（append 顺序：旧→新）
+	s.usageMu.Lock()
+	pending := make([]map[string]any, len(s.usageBuf))
+	copy(pending, s.usageBuf)
+	pendingCount := len(pending)
+	s.usageMu.Unlock()
+
+	// 2) 磁盘尾部：多读 pending 的份数，保证合并后仍有 n 条可选
+	disk := s.TailUsage(n + pendingCount)
+
+	out := make([]map[string]any, 0, n)
+	// pending 倒序遍历即「新→旧」，先取它（比磁盘里更近）
+	for i := pendingCount - 1; i >= 0 && len(out) < n; i-- {
+		out = append(out, pending[i])
+	}
+	for _, rec := range disk {
+		if len(out) >= n {
+			break
+		}
+		out = append(out, rec)
 	}
 	return out
 }
@@ -1697,4 +2286,43 @@ func subtleEqual(a, b string) bool {
 		diff |= a[i] ^ b[i]
 	}
 	return diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// 原始请求全量捕获（RawCapture）——排障与「请求字段全量分析」专用
+// ---------------------------------------------------------------------------
+
+// CaptureRawRequest 把客户端发来的【完整原始请求体】（未截断）落到 data/raw_capture/
+// 目录，每个请求一个文件，文件名带纳秒时间戳。
+// 用于排障与「请求字段全量分析」。最多保留 100 个文件，超出删除最旧，避免写爆磁盘。
+// 调用方应先判断 st.RawCaptureEnabled，避免每请求无谓走读锁。
+func (s *Store) CaptureRawRequest(raw []byte) {
+	if len(raw) == 0 {
+		return
+	}
+	dir := filepath.Join(s.Dir, "raw_capture")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	// 限制文件数：超过 100 则删除最旧文件（按文件名排序，纳秒时间戳天然升序）。
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) >= 100 {
+		olds := make([]string, 0, len(entries))
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			olds = append(olds, filepath.Join(dir, e.Name()))
+		}
+		sort.Strings(olds)
+		for i := 0; i < len(olds)-99; i++ {
+			_ = os.Remove(olds[i])
+		}
+	}
+	name := filepath.Join(dir, fmt.Sprintf("req_%d.json", time.Now().UnixNano()))
+	_ = os.WriteFile(name, raw, 0o644)
+}
+
+// RawCaptureDir 返回原始请求捕获目录（data/raw_capture）。供控制台「导出分析」端点读取。
+func (s *Store) RawCaptureDir() string {
+	return filepath.Join(s.Dir, "raw_capture")
 }

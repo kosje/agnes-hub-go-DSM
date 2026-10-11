@@ -16,8 +16,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -95,13 +97,63 @@ func (s *Server) manualUpdateHint() string {
 func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
 
 // ServeHTTP 实现 http.Handler。
+//
+// P0-2：最外层套 recover 兜底。任何 handler 内 panic（如某条解析/编码路径遇到畸形数据）
+// 都会被接住并回 500，而不是让标准库 net/http 关闭连接——关键是若该请求在独立 goroutine
+// 里 panic（见下方流式路径的 recoverGoroutine），没有兜底会直接终止整个进程、带走所有
+// 在途任务。这里是「挂机无人值守」的地基。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer recoverHandler(s, w, r)
 	if !s.sameOrigin(r) {
 		writeJSON(w, 403, map[string]any{"error": map[string]any{"type": "permission_error",
 			"message": "跨来源请求被拒绝（Origin 与网关地址不一致）"}}, nil)
 		return
 	}
+	// 转发类端点（/v1/*）在这里记一次「已进入网关」。
+	//
+	// 为什么必须要有这个计数：请求从到达 HTTP 层到真正进入 relay.Do（那里才有的
+	// requests_total / 到达密度 / 用量日志）之间存在一段**完全不可观测的窗口**——
+	// 读取请求体、JSON 解析、意图判定。若连接在这里卡住（客户端没有把 body 发完、
+	// 超大上下文传输中断等），所有下游指标都会显示「什么都没发生」，控制台负载为 0，
+	// 而客户端那边一直转圈。有了 pending/accepted，就能一眼区分：
+	//   - pending = 0 且 accepted 不涨 → 请求压根没到网关（看客户端/网络）
+	//   - pending 持续 > 0           → 卡在网关内的某个环节（看这段代码之间）
+	if strings.HasPrefix(r.URL.Path, "/v1/") && s.Hub != nil {
+		s.Hub.Metrics.Pending.Add(1)
+		s.Hub.Metrics.Accepted.Add(1)
+		defer s.Hub.Metrics.Pending.Add(-1)
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// recoverHandler 是 ServeHTTP 的 panic 兜底：记录堆栈、计数、回 500。
+func recoverHandler(s *Server, w http.ResponseWriter, r *http.Request) {
+	if e := recover(); e != nil {
+		if s.Hub != nil {
+			s.Hub.Metrics.PanicsTotal.Add(1)
+		}
+		log.Printf("[panic-recovered] handler %s %s: %v\n%s", r.Method, r.URL.Path, e, debug.Stack())
+		// 若响应头尚未写出则回 500；已写出（中途 panic）则只能断开，连接由 http 处理。
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		_, _ = w.Write([]byte(`{"error":{"message":"网关内部错误（已降级，不影响其他请求）","type":"internal_error"}}`))
+	}
+}
+
+// recoverGoroutine 在独立的 helper goroutine 里 recover，避免该 goroutine panic 终止整个进程。
+func recoverGoroutine(hub *hub.Hub, what string) (e any) {
+	defer func() {
+		e = recover()
+		if e != nil {
+			if hub != nil {
+				hub.Metrics.PanicsTotal.Add(1)
+			}
+			log.Printf("[panic-recovered] goroutine %s: %v\n%s", what, e, debug.Stack())
+		}
+	}()
+	return e
 }
 
 func (s *Server) routes() {
@@ -410,10 +462,31 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if ver == "" {
 		ver = "dev"
 	}
+	// P1-4 富健康度：不仅报「进程活着」，还报「网关到底还能不能干活」——
+	// 队列深度、熔断中账号数、最近 60s 429 速率、距最近一次成功的时长、panic 数。
+	// 外部探活脚本可据此做比 200 更有语义的判定（例如 breaker_open_count>0 且
+	// last_success_age_ms 很大 → 虽然进程活着，但所有账号都在熔断，实际不可用）。
+	lastSuccessAgeMS := s.Hub.LastSuccessAgeMS()
 	writeJSON(w, 200, map[string]any{
-		"ok": true, "accounts": enabled,
-		"uptime_sec": int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
-		"version":    ver,
+		"ok":                 true,
+		"accounts":           enabled,
+		"uptime_sec":         int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
+		"version":            ver,
+		"available_accounts": enabled,
+		"queue_depth":        s.Hub.QueueDepth(),
+		"breaker_open":       s.Hub.BreakerOpenCount(),
+		"last_success_age_ms": lastSuccessAgeMS,
+		"upstream_429_rate_per_min": s.Hub.Upstream429RatePerMin(),
+		"panics_total":       s.Hub.PanicsTotal(),
+		// 「请求到网关了吗？」的第一现场。请求从进来（这里计数）到真正进入 relay
+		// （那里的 requests_total / 到达密度）之间有一段原本完全不可见的窗口：
+		// 读请求体、JSON 解析、意图判定。pending 持续不为 0 说明卡在这段里，
+		// accepted 不涨则说明请求压根没到网关。
+		"pending":  s.Hub.Metrics.Pending.Load(),
+		"accepted": s.Hub.Metrics.Accepted.Load(),
+		// #21 排队可观测：此刻发起一次文本请求，预计要排队等多久（取 text 池所有
+		// 启用账号 pacer 的最大投影等待）。探活脚本可据此预判「会不会堵」。
+		"text_projected_wait_ms": s.Hub.PoolMaxProjectedWaitMS("text"),
 	}, nil)
 }
 
@@ -496,7 +569,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h := s.Hub
-	m := &h.Metrics
+	m := &h.Metrics // 取指针，避免拷贝含 sync/atomic 的 Metrics（vet 提示）
 	startedAt := h.Metrics.StartedAt.Unix()
 	settings := h.Settings()
 
@@ -569,6 +642,37 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# HELP agnes_hub_breaker_revived Breakers revived after cooldown\n")
 	sb.WriteString("# TYPE agnes_hub_breaker_revived counter\n")
 	sb.WriteString(fmt.Sprintf("agnes_hub_breaker_revived %d\n", m.BreakerRevived.Load()))
+
+	// P1-4 富健康度：panic 总数 / 最近 60s 429 速率 / 排队深度 / 熔断中账号数。
+	sb.WriteString("# HELP agnes_hub_panics_total Recovered panics (degraded, not crashed)\n")
+	sb.WriteString("# TYPE agnes_hub_panics_total counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_panics_total %d\n", m.PanicsTotal.Load()))
+
+	// 韧性层观测：截断续写 / 软失败换号重发 / 软失败放弃续救（预算耗尽转 502） / 流式恢复。
+	sb.WriteString("# HELP agnes_hub_continuations MAX_TOKENS 截断自动续写轮数\n")
+	sb.WriteString("# TYPE agnes_hub_continuations counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_continuations %d\n", m.Continuations.Load()))
+	sb.WriteString("# HELP agnes_hub_soft_fail_retries HTTP 200 但内容不可用的换号重发次数\n")
+	sb.WriteString("# TYPE agnes_hub_soft_fail_retries counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_soft_fail_retries %d\n", m.SoftFailRetries.Load()))
+	sb.WriteString("# HELP agnes_hub_soft_fail_gave_up 软失败预算耗尽、放弃续救并转 502 的次数\n")
+	sb.WriteString("# TYPE agnes_hub_soft_fail_gave_up counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_soft_fail_gave_up %d\n", m.SoftFailGaveUp.Load()))
+	sb.WriteString("# HELP agnes_hub_resumed_streams 流式 auto-resume 次数\n")
+	sb.WriteString("# TYPE agnes_hub_resumed_streams counter\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_resumed_streams %d\n", m.ResumedStreams.Load()))
+
+	sb.WriteString("# HELP agnes_hub_upstream_429_rate_per_min Upstream 429s in the last 60s\n")
+	sb.WriteString("# TYPE agnes_hub_upstream_429_rate_per_min gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_upstream_429_rate_per_min %d\n", h.Upstream429RatePerMin()))
+
+	sb.WriteString("# HELP agnes_hub_queue_depth Requests currently queued across all pacers\n")
+	sb.WriteString("# TYPE agnes_hub_queue_depth gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_queue_depth %d\n", h.QueueDepth()))
+
+	sb.WriteString("# HELP agnes_hub_breaker_open_count Accounts currently circuit-opened\n")
+	sb.WriteString("# TYPE agnes_hub_breaker_open_count gauge\n")
+	sb.WriteString(fmt.Sprintf("agnes_hub_breaker_open_count %d\n", h.BreakerOpenCount()))
 
 	sb.WriteString("# HELP agnes_hub_wait_ms_total Total wait time in milliseconds\n")
 	sb.WriteString("# TYPE agnes_hub_wait_ms_total counter\n")
@@ -651,12 +755,17 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		writeErr(w, e)
 		return
 	}
-	body, _, e := readBody(r)
+	body, rawBody, e := readBody(r)
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
+	// #27：原始请求全量捕获（排障/请求字段分析用）：把 WorkBuddy 发来的完整原始
+	// 请求体（未截断、未改写）落盘，便于逐字段翻译分析。默认关闭。
+	if settings.RawCaptureEnabled {
+		s.Store.CaptureRawRequest(rawBody)
+	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])
 
@@ -676,6 +785,9 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 			decision.Modality = intent.Text
 		}
 	}
+
+	// #24 负载画像遥测埋点：每请求记一次模态 + 流式标记，供 LoadProfile/接入方自动检测。
+	s.Hub.NoteRequest(decision.Modality, wantsStream)
 
 	switch decision.Modality {
 	case intent.Image:
@@ -712,12 +824,20 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		bodyFor = s.bodyForAccount(body, poolClass, intent.Text, settings)
 	} else {
 		resolved := pool.ResolveModel(requested, settings.ModelAliases)
-		clone := cloneBody(body)
-		clone["model"] = resolved
-		buf, _ := json.Marshal(clone)
 		requiredModel = resolved
 		decision.ModelUsed = resolved
-		bodyFor = func(*config.Account) ([]byte, string) { return buf, resolved }
+		if resolved == requested {
+			// P2-2：客户端已显式给对模型名（别名解析原样返回），body 的 model 字段
+			// 已是 resolved，无需改写 —— 直接复用原始请求体，省一次 clone + Marshal
+			// 的热路径开销（高频对话路径，且 rawBody 里 model==resolved 语义等价）。
+			bodyFor = func(*config.Account) ([]byte, string) { return rawBody, resolved }
+		} else {
+			// 命中别名：body 里的 model 仍是旧名，必须改写后才转发。
+			clone := cloneBody(body)
+			clone["model"] = resolved
+			buf, _ := json.Marshal(clone)
+			bodyFor = func(*config.Account) ([]byte, string) { return buf, resolved }
+		}
 	}
 
 	sessionKey := s.Hub.SessionKey(headerMap(r), item.Key)
@@ -726,8 +846,17 @@ func (s *Server) handleTextish(w http.ResponseWriter, r *http.Request, path stri
 		RequiredModel: requiredModel, Method: http.MethodPost, Path: path,
 		BodyFor: bodyFor, Anthropic: path == "/v1/messages",
 		Idempotent: true, // 文本对话可安全重试
+		// Body 仅用于日志「用户提出的完整请求」展示；实际转发由 BodyFor 生成
+		// （relay.Do 中 BodyFor 非 nil 时优先），故此处填原始请求体不影响请求本身。
+		Body: rawBody,
+		// Stream：客户端要流式时用「空闲看门狗」替代固定墙钟超时，长回答不断流。
+		Stream: wantsStream,
+		// MAX_TOKENS 截断自动续写：文本 chat 路径开启，上游截断时网关内自动
+		// 续写拼接，客户端任务不再中断（生图/视频路径不适用，保持 false）。
+		Continuable: true,
 	}
-	s.logUsage(item, decision, poolClass, r, path, wantsStream)
+	// #20：删除请求受理前的「accepted」双写——排队行为已由 done 记录的
+	// wait_ms / attempts / stream 完整反推，不再为此每请求多一次磁盘写。
 	s.proxy(w, r, item, opts, decision, wantsStream)
 }
 
@@ -741,14 +870,21 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request, path, modal
 		writeErr(w, e)
 		return
 	}
-	body, _, e := readBody(r)
+	body, rawBody, e := readBody(r)
 	if e != nil {
 		writeErr(w, e)
 		return
 	}
 	settings := s.Store.SettingsSnapshot()
+	// #27：原始请求全量捕获（排障/请求字段分析用），未截断、未改写的原始体落盘。
+	if settings.RawCaptureEnabled {
+		s.Store.CaptureRawRequest(rawBody)
+	}
 	requested := strings.TrimSpace(asStr(body["model"]))
 	wantsStream := truthy(body["stream"])
+
+	// #24 负载画像遥测埋点：媒体端点（图像/视频）同样记一次模态 + 流式标记。
+	s.Hub.NoteRequest(modality, wantsStream)
 
 	decision := intent.Decide(path, body, firstNonEmpty(requested, settings.AutoModelName),
 		autoIntentConfig(settings), s.rules, settings.ModelAliases, pool.ModalityOfModel, modality)
@@ -895,7 +1031,6 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts)
 
 	extra := decision.Headers()
 	s.accountHeaders(r, extra, result.Account)
@@ -908,7 +1043,8 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 		writeJSON(w, result.Status, errorPayload(result.Status, raw), extra)
 		return
 	}
-	s.Store.ChargeKey(item.Key)
+	s.Store.ChargeKey(item.Key, extractUsage(raw))
+	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 
 	// 记录图片生成结果（便于控制台查看历史）
 	requestID := config.NewID("img")
@@ -1014,7 +1150,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts)
+	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 
 	extra := decision.Headers()
 	s.accountHeaders(r, extra, result.Account)
@@ -1037,7 +1173,7 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 		Owner:     keyOwner(item),
 	}
 	s.Store.PutJob(job)
-	s.Store.ChargeKey(item.Key)
+	s.Store.ChargeKey(item.Key, extractUsage(raw))
 	extra["X-Agnes-Hub-Job-Id"] = job.JobID
 
 	jobInfo := map[string]any{
@@ -1200,6 +1336,10 @@ loop:
 }
 
 // waitForVideo 轮询等待视频完成，返回 video_url 或空串。
+//
+// P2-1：轮询间隔用指数退避（base → 2×base → … 封顶 30s）。视频生成通常需数分钟，
+// 早期密集轮询对「拿到结果」几乎没有额外收益，反而持续打上游；退避后上游压力显著下降，
+// 同时仍能在任务完成时以 ≤30s 粒度感知到（挂机场景友好，不长时间漏掉结果）。
 func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job *config.VideoJob, maxSec int) string {
 	settings := s.Store.SettingsSnapshot()
 	deadline := time.Now().Add(time.Duration(maxSec) * time.Second)
@@ -1207,6 +1347,7 @@ func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job 
 	if interval < time.Second {
 		interval = 5 * time.Second
 	}
+	const capInterval = 30 * time.Second
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -1214,11 +1355,15 @@ func (s *Server) waitForVideo(ctx context.Context, account *config.Account, job 
 		case <-time.After(interval):
 		}
 		body := s.pollUpstream(ctx, account, job)
-		if body == nil {
-			continue
+		if body != nil {
+			if url := extractVideoURL(body); url != "" {
+				return url
+			}
 		}
-		if url := extractVideoURL(body); url != "" {
-			return url
+		// 指数退避：每轮成功尝试后把下一轮间隔翻倍，封顶 capInterval。
+		interval *= 2
+		if interval > capInterval {
+			interval = capInterval
 		}
 	}
 	return ""
@@ -1393,14 +1538,21 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 	if !wantsStream {
 		result, err := relay.Do(ctx, s.Hub, s.Client, opts)
 		if err != nil {
+			s.logUsageError(item, decision, opts.PoolClass, opts.Path, false, nil, 0, 0, decision.Prompt.Text, 502, err.Error())
 			writeErr(w, relayError(err))
 			return
 		}
 		raw := result.ReadAll()
 		if result.Status < 400 {
-			s.Store.ChargeKey(item.Key)
+			s.Store.ChargeKey(item.Key, extractUsage(raw))
+			// 用量型账号（如 CF）把本次消耗记账到日预算，烧光自动出局（次日回池）。
+			if s.Hub != nil && result.Account != nil {
+				s.Hub.ChargeBudget(result.Account.ID, extractNeurons(raw))
+			}
+			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
+		} else {
+			s.logUsageError(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
 		}
-		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts)
 		headers := passthroughHeaders(result.Header)
 		for k, v := range decision.Headers() {
 			headers[k] = v
@@ -1412,7 +1564,10 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		headers["X-Agnes-Hub-Wait-Ms"] = strconv.FormatInt(result.WaitMS, 10)
 		headers["X-Agnes-Hub-Attempts"] = strconv.Itoa(result.Attempts)
 		if result.Status >= 400 {
-			writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
+			if result.Status == http.StatusTooManyRequests {
+				s.ensure429RetryAfter(headers, opts.PoolClass) // #21：429 透传补 Retry-After
+			}
+			writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 			return
 		}
 		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
@@ -1433,6 +1588,18 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
+		defer func() {
+			// P0-2：relay.Do 内部任何 panic（罕见畸形数据/空指针）都不得终止整个进程。
+			// 正常路径下 body 已发送 outcome、defer 什么都不做；仅 panic 时在此补发一个
+			// 带错误的 outcome，保证主 select 一定能收到、不会永久阻塞。
+			if e := recover(); e != nil {
+				if s.Hub != nil {
+					s.Hub.Metrics.PanicsTotal.Add(1)
+				}
+				log.Printf("[panic-recovered] stream relay: %v\n%s", e, debug.Stack())
+				ch <- outcome{err: fmt.Errorf("网关内部错误：请求处理 panic（已降级）")}
+			}
+		}()
 		result, err := relay.Do(ctx2, s.Hub, s.Client, opts)
 		ch <- outcome{result: result, err: err}
 	}()
@@ -1464,6 +1631,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		select {
 		case out := <-ch:
 			if out.err != nil {
+				s.logUsageError(item, decision, opts.PoolClass, opts.Path, true, nil, 0, 0, decision.Prompt.Text, 502, out.err.Error())
 				writeSSEFrame(w, flusher, map[string]any{
 					"error": map[string]any{"message": out.err.Error(), "type": "agnes_hub_queue"}})
 				return
@@ -1476,17 +1644,18 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 					payload = map[string]any{"error": map[string]any{
 						"message": string(raw), "type": "upstream_error"}}
 				}
-				writeSSEFrame(w, flusher, payload)
-				s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
-				return
-			}
-			s.Store.ChargeKey(item.Key)
-			writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub wait_ms=%d attempts=%d model=%s",
-				result.WaitMS, result.Attempts, result.ModelUsed))
-			_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
-			result.Close()
-			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
+			writeSSEFrame(w, flusher, payload)
+			s.logUsageError(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
 			return
+		}
+		writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub account=%s wait_ms=%d attempts=%d model=%s",
+			safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
+		tail := &sseTail{w: &flushWriter{w: w, f: flusher}, cap: 1 << 16}
+		_, _ = io.Copy(tail, result.Stream)
+		result.Close()
+		s.Store.ChargeKey(item.Key, tail.usage())
+		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
+		return
 		case <-ticker.C:
 			writeSSEComment(w, flusher, "agnes-hub waiting for rate-limit slot")
 		case <-ctx.Done():
@@ -1500,19 +1669,23 @@ func (s *Server) finishStream(w http.ResponseWriter, r *http.Request, item *conf
 	err error, decision intent.Result, opts relay.Options, streamMode bool) {
 
 	if err != nil {
+		s.logUsageError(item, decision, opts.PoolClass, opts.Path, streamMode, nil, 0, 0, decision.Prompt.Text, 502, err.Error())
 		writeErr(w, relayError(err))
 		return
 	}
 	if result.Status >= 400 {
 		raw := result.ReadAll()
+		s.logUsageError(item, decision, opts.PoolClass, opts.Path, streamMode, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
 		headers := passthroughHeaders(result.Header)
 		for k, v := range decision.Headers() {
 			headers[k] = v
 		}
-		writeJSON(w, result.Status, errorPayload(result.Status, raw), headers)
+		if result.Status == http.StatusTooManyRequests {
+			s.ensure429RetryAfter(headers, opts.PoolClass) // #21：429 透传补 Retry-After
+		}
+		writeJSON(w, result.Status, decodeOrRaw(raw), headers)
 		return
 	}
-	s.Store.ChargeKey(item.Key)
 	headers := passthroughHeaders(result.Header)
 	for k, v := range decision.Headers() {
 		headers[k] = v
@@ -1529,9 +1702,11 @@ func (s *Server) finishStream(w http.ResponseWriter, r *http.Request, item *conf
 	}
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
-	_, _ = io.Copy(&flushWriter{w: w, f: flusher}, result.Stream)
+	tail := &sseTail{w: &flushWriter{w: w, f: flusher}, cap: 1 << 16}
+	_, _ = io.Copy(tail, result.Stream)
 	result.Close()
-	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts)
+	s.Store.ChargeKey(item.Key, tail.usage())
+	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 }
 
 type flushWriter struct {
@@ -1583,22 +1758,42 @@ func (s *Server) writeSyntheticSSE(w http.ResponseWriter, envelope map[string]an
 // 日志与错误
 // ---------------------------------------------------------------------------
 
-func (s *Server) logUsage(item *config.DownstreamKey, decision intent.Result, poolClass string,
-	r *http.Request, path string, stream bool) {
-	// 流式请求在拿到最终结果前先记一条「受理」记录，便于排障时看到排队行为
-	s.Store.AppendUsage(map[string]any{
-		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "accepted",
-		"endpoint": path, "pool_class": poolClass, "intent": decision.Modality,
-		"intent_by": decision.Source, "key_name": item.Name, "stream": stream,
-	})
-}
-
-func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result, poolClass,
-	path string, stream bool, account *config.Account, waitMS int64, attempts int) {
+// logUsageError 把失败请求（上游 4xx/5xx、relay 内部错误）也记入 usage.jsonl（phase=error）。
+// 此前只记成功请求，「502 上游连接失败」类问题在网关侧完全无痕，事后无法排查。
+func (s *Server) logUsageError(item *config.DownstreamKey, decision intent.Result, poolClass,
+	path string, stream bool, account *config.Account, waitMS int64, attempts int,
+	userRequest string, status int, errMsg string) {
 	acctName, acctID := "", ""
 	if account != nil {
 		acctName, acctID = account.Name, account.ID
 	}
+	ur := requestLog(intent.CleanUserMessage(userRequest), s.Store.SettingsSnapshot().UsageRequestLogBytes)
+	s.Store.AppendUsage(map[string]any{
+		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "error",
+		"status": status, "error": requestLog(errMsg, 400),
+		"endpoint": path, "pool_class": poolClass,
+		"intent": decision.Modality, "intent_by": decision.Source,
+		"intent_score": decision.Score, "intent_reason": decision.Reason,
+		"model_requested": decision.ModelRequested, "model_used": decision.ModelUsed,
+		"key_name": item.Name, "account": acctName, "account_id": acctID,
+		"wait_ms": waitMS, "attempts": attempts, "stream": stream,
+		"user_request": ur,
+	})
+}
+
+// ---------------------------------------------------------------------------
+
+func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result, poolClass,
+	path string, stream bool, account *config.Account, waitMS int64, attempts int,
+	userRequest string) {
+	acctName, acctID := "", ""
+	if account != nil {
+		acctName, acctID = account.Name, account.ID
+	}
+	// 用户提出的完整请求：先剥离 WorkBuddy 注入的 <system-reminder> 等系统开销、
+	// 只保留 <user_query> 内的真实用户输入（CleanUserMessage 对普通 chat 请求零副作用），
+	// 再截断到配置上限（UsageRequestLogBytes，默认 512），避免图文/视频 base64 把日志撑爆。
+	ur := requestLog(intent.CleanUserMessage(userRequest), s.Store.SettingsSnapshot().UsageRequestLogBytes)
 	s.Store.AppendUsage(map[string]any{
 		"ts": time.Now().Format("2006-01-02 15:04:05"), "phase": "done",
 		"endpoint": path, "pool_class": poolClass,
@@ -1607,7 +1802,111 @@ func (s *Server) logUsageFull(item *config.DownstreamKey, decision intent.Result
 		"model_requested": decision.ModelRequested, "model_used": decision.ModelUsed,
 		"key_name": item.Name, "account": acctName, "account_id": acctID,
 		"wait_ms": waitMS, "attempts": attempts, "stream": stream,
+		"user_request": ur,
 	})
+}
+
+// requestLog 把用户完整请求收敛到安全长度（长请求含 base64，只保留前 maxBytes 字节）。
+// maxBytes 来自配置 UsageRequestLogBytes（默认 512）；<=0 时兜底 512。
+func requestLog(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = 512
+	}
+	if len(s) > maxBytes {
+		return s[:maxBytes] + " …(truncated)"
+	}
+	return s
+}
+
+// mustJSON 把任意值编码为 JSON 字符串（用于把解码后的请求体重新序列化进日志）。
+func mustJSON(v any) string {
+	if v == nil {
+		return ""
+	}
+	buf, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+// extractUsage 从 OpenAI 格式响应体解析 token 用量（total_tokens）；解析不到返回 0。
+func extractUsage(raw []byte) int64 {
+	var probe struct {
+		Usage struct {
+			TotalTokens      int64 `json:"total_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			PromptTokens     int64 `json:"prompt_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(raw, &probe) == nil {
+		if probe.Usage.TotalTokens > 0 {
+			return probe.Usage.TotalTokens
+		}
+		// 某些上游只给 prompt/completion 不给 total：相加兜底。
+		if probe.Usage.PromptTokens > 0 || probe.Usage.CompletionTokens > 0 {
+			return probe.Usage.PromptTokens + probe.Usage.CompletionTokens
+		}
+	}
+	return 0
+}
+
+// extractNeurons 从 OpenAI 兼容响应体解析 Cloudflare 的用量计费字段 usage.neurons。
+// 非 Cloudflare 上游没有该字段，解析不到返回 0 —— 对其他账号（agnles 等）零影响，
+// 只有配了 daily_budget + budget_unit=neurons 的用量型账号才会计账。
+func extractNeurons(raw []byte) float64 {
+	var probe struct {
+		Usage struct {
+			Neurons float64 `json:"neurons"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return 0
+	}
+	return probe.Usage.Neurons
+}
+
+// sseTail 在转发 SSE 流给客户端的同时，保留末尾片段用于解析流末的 usage。
+type sseTail struct {
+	w   io.Writer
+	buf []byte
+	cap int
+}
+
+func (t *sseTail) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.cap {
+		t.buf = t.buf[len(t.buf)-t.cap:]
+	}
+	return n, nil
+}
+
+// usage 逐 data: 行解析 SSE，取最后一个成功解析出 usage 的 total_tokens。
+func (t *sseTail) usage() int64 {
+	var total int64
+	for _, line := range strings.Split(string(t.buf), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var probe struct {
+			Usage struct {
+				TotalTokens int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(payload), &probe) == nil && probe.Usage.TotalTokens > 0 {
+			total = probe.Usage.TotalTokens
+		}
+	}
+	return total
 }
 
 func relayError(err error) *apiError {
@@ -1639,6 +1938,24 @@ func passthroughHeaders(in http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// ensure429RetryAfter #21：上游 429 透传时，若上游没带 Retry-After（免费号 agnes
+// 常见），按该池此刻的投影等待补一个兜底值，避免客户端「拿到 429 却不知等多久」。
+// 已有 Retry-After 则保留上游值（不覆盖）。
+func (s *Server) ensure429RetryAfter(headers map[string]string, poolClass string) {
+	if headers == nil || headers["Retry-After"] != "" {
+		return
+	}
+	ms := s.Hub.PoolMaxProjectedWaitMS(poolClass)
+	sec := int(ms/1000) + 1
+	if sec < 1 {
+		sec = 1
+	}
+	if sec > 60 {
+		sec = 60
+	}
+	headers["Retry-After"] = strconv.Itoa(sec)
 }
 
 func safeHeader(v string) string {

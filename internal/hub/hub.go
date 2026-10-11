@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,36 @@ type Metrics struct {
 	Spillovers     atomic.Int64
 	BreakerOpened  atomic.Int64
 	BreakerRevived atomic.Int64
-	StartedAt      time.Time
+	// Continuations 累计 MAX_TOKENS 截断自动续写轮数（观测截断频率与续写开销）。
+	Continuations atomic.Int64
+	// SoftFailRetries 累计「HTTP 200 但内容不可用」的换号重发次数（空内容 /
+	// 内嵌 error / 非法 JSON / 审查类拒绝）——观测上游的隐性失败率。
+	SoftFailRetries atomic.Int64
+	// SoftFailGaveUp 累计「软失败预算耗尽、放弃续救」的次数：此时网关不再把
+	// 无内容的 200 伪装成成功，而是返回带原因的 502 让客户端干净停止。
+	SoftFailGaveUp atomic.Int64
+	// Pending 记录「已进入网关、但还没走完」的转发类请求数（/v1/*）。
+	// 它与 requests_total 之间那段时间（读 body / 解析 / 意图判定）原本完全
+	// 不可见：pending 持续不为 0 说明请求卡在网关内部，是排障「客户端转圈但
+	// 控制台看不出任何负载」的第一现场。
+	Pending atomic.Int64
+	// Accepted 累计收到的转发类请求数（含尚未走完的），与 requests_total 的
+	// 差值即为「已到达但未进入 relay」的数量。
+	Accepted atomic.Int64
+	// ResumedStreams 累计流式 auto-resume 次数（SSE 未正常结束即断流 / 中途
+	// error 帧 / 传输层异常时自动重连续写），观测上游断流的频繁程度。
+	ResumedStreams atomic.Int64
+	// PanicsTotal 记录被 recover 兜住并已降级（而非进程崩溃）的 panic 次数，
+	// 供 /metrics 观测与「挂机健康度」判断（见 P0-2）。
+	PanicsTotal atomic.Int64
+	// LastSuccessNS 全局最近一次上游成功的 UnixNano 时间戳，
+	// 供 /healthz 的 last_success_age_ms（「最近多久有流量真正跑通」）观测。
+	LastSuccessNS atomic.Int64
+	// BudgetExhausted 累计「因日预算耗尽而从候选池剔除」的次数（观测日预算门禁命中频率）。
+	BudgetExhausted atomic.Int64
+	// BudgetDayRollovers 累计「跨天自动清零日预算」次数（观测滚动是否生效）。
+	BudgetDayRollovers atomic.Int64
+	StartedAt     time.Time
 }
 
 // Hub 是调度器。
@@ -73,8 +103,67 @@ type Hub struct {
 	// 多账号是否真正被吃到。单 goroutine 写入（调度主循环），控制台读取时加锁。
 	Arrivals arrivalRing
 
+	// Recent429 记录最近 60s 内真实命中上游 429 的时间戳（有界环形），
+	// 供 /healthz 的 upstream_429_rate_per_min（「最近一分钟到底有多少次限流」）。
+	Recent429 rate429Ring
+
+	// #22 两级队列：highWaiting 统计「某账号 × 某池」当前处于 Reserve 领槽区间的
+	// 非流式（高优先级）请求数。流式（低优先级）在领槽前会限时等它清零，从而让
+	// 短促的工具调用（非流式）在文本池里优先于长回答（流式）拿到节拍槽位。
+	// 只用 h.mu 保护（短临界区，不嵌套），与 Pacer() 共享同一把锁互斥安全。
+	highWaiting map[string]int
+
+	// #24 负载画像遥测：近 120s 模态分布 + 流式比，供接入方自动检测匹配情景。
+	load loadWindow
+
+	// #24 AutoScenario 冷却防抖：最近一次自动切换情景的时间 + 当时的目标情景。
+	// 同一情景 60s 内不重复切（避免在两个情景边界来回抖动）。
+	autoMu          sync.Mutex
+	lastAutoSwitch  time.Time
+	lastAutoScenario string
+
 	// Metrics 是运行指标（/healthz 与控制台观测）。
 	Metrics Metrics
+
+	// hist 是动态图表的每秒历史序列（任务管理器风格实时图数据源）。
+	hist *History
+}
+
+// rate429Ring 记录最近 60s 内 429 时间戳，PerMinute() 返回窗口内命中次数。
+const RATE429_WINDOW = 60 * time.Second
+
+type rate429Ring struct {
+	mu    sync.Mutex
+	items [512]time.Time
+	n     int
+	pos   int
+}
+
+// record 记录一次 429。
+func (r *rate429Ring) record() {
+	r.mu.Lock()
+	now := time.Now()
+	r.items[r.pos%len(r.items)] = now
+	r.pos++
+	if r.n < len(r.items) {
+		r.n++
+	}
+	r.mu.Unlock()
+}
+
+// PerMinute 返回最近 60s 内 429 命中次数（惰性滑出窗口）。
+func (r *rate429Ring) PerMinute() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	c := 0
+	for i := 0; i < r.n; i++ {
+		idx := (r.pos - r.n + i + len(r.items)) % len(r.items)
+		if now.Sub(r.items[idx]) <= RATE429_WINDOW {
+			c++
+		}
+	}
+	return c
 }
 
 // arrivalRing 是固定容量环形时间戳数组（并发安全）。
@@ -147,6 +236,101 @@ func (r *arrivalRing) TotalCount() int64 {
 	return r.total
 }
 
+// ---------------------------------------------------------------------------
+// 负载画像遥测（#24：接入方自动检测匹配情景的数据来源）
+// ---------------------------------------------------------------------------
+
+// loadWindow 用两个 60s 桶累计近 120s 的请求模态分布（text/image/video）与流式占比。
+// 只按「当前桶起点」整体 60s 滚动（桶0 满 60s 整体挪到桶1、桶0 清零），单 goroutine
+// 写入（NoteRequest）+ 控制台/维护循环读取时加锁，避免按秒细桶的精度开销。
+type loadWindow struct {
+	mu     sync.Mutex
+	modal  [2][3]int64 // [text, image, video]
+	stream [2]int64
+	total  [2]int64
+	start  [2]time.Time
+}
+
+const (
+	modalText, modalImage, modalVideo = 0, 1, 2
+)
+
+// record 记一次请求（modality 为 text/image/video 之一，其余按 text 计）。
+func (w *loadWindow) record(modality string, stream bool) {
+	idx := modalText
+	switch modality {
+	case "image":
+		idx = modalImage
+	case "video":
+		idx = modalVideo
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	now := time.Now()
+	// 桶0 满 60s → 整体滚动到桶1，桶0 清零重起
+	if !w.start[0].IsZero() && now.Sub(w.start[0]) >= 60*time.Second {
+		w.modal[1] = w.modal[0]
+		w.stream[1] = w.stream[0]
+		w.total[1] = w.total[0]
+		w.start[1] = w.start[0]
+		w.modal[0] = [3]int64{0, 0, 0}
+		w.stream[0] = 0
+		w.total[0] = 0
+		w.start[0] = now
+	}
+	if w.start[0].IsZero() {
+		w.start[0] = now
+	}
+	w.modal[0][idx]++
+	w.total[0]++
+	if stream {
+		w.stream[0]++
+	}
+}
+
+// profile 把两桶（近 120s）合并成模态占比 + 流式比。
+func (w *loadWindow) profile() (total int, text, image, video, stream int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	text = int(w.modal[0][modalText] + w.modal[1][modalText])
+	image = int(w.modal[0][modalImage] + w.modal[1][modalImage])
+	video = int(w.modal[0][modalVideo] + w.modal[1][modalVideo])
+	stream = int(w.stream[0] + w.stream[1])
+	total = int(w.total[0] + w.total[1])
+	return
+}
+
+// NoteRequest 记录一次请求的模态与是否流式（relay 入口埋点，轻量）。
+func (h *Hub) NoteRequest(modality string, stream bool) {
+	h.load.record(modality, stream)
+}
+
+// LoadProfile 采集接入方实时负载画像（近 120s 模态分布 + 流式比 + 当前并发 + 429 率），
+// 供 config.RecommendScenario 自动匹配情景。
+func (h *Hub) LoadProfile() config.LoadProfile {
+	total, text, image, video, stream := h.load.profile()
+	ratio := func(n int) float64 {
+		if total <= 0 {
+			return 0
+		}
+		return float64(n) / float64(total)
+	}
+	var streamRatio float64
+	// 流式占比只对文本请求有意义（流式只会出现在文本池）
+	if text > 0 {
+		streamRatio = float64(stream) / float64(text)
+	}
+	return config.LoadProfile{
+		TotalRecent:     total,
+		TextRatio:       ratio(text),
+		ImageRatio:      ratio(image),
+		VideoRatio:      ratio(video),
+		StreamRatio:     streamRatio,
+		ConcurrencyNow:  h.InflightTotal(),
+		Upstream429Rate: h.Upstream429RatePerMin(),
+	}
+}
+
 // New 构造调度器。
 func New(store *config.Store) *Hub {
 	h := &Hub{
@@ -159,6 +343,7 @@ func New(store *config.Store) *Hub {
 		poolFactors:   map[string]float64{},
 		successes:     map[string]int{},
 		pendingFactor: map[string]bool{},
+		highWaiting:   map[string]int{}, // #22 两级队列：非流式领槽区间计数
 	}
 	h.Metrics.StartedAt = time.Now()
 	h.Reload()
@@ -263,7 +448,7 @@ func (h *Hub) learnedFactorOf(a *config.Account) float64 {
 }
 
 func (h *Hub) effectiveRPMLocked(a *config.Account, poolClass string, s config.Settings) float64 {
-	base := baseRPM(a, poolClass)
+	base := baseRPM(a, poolClass, s.FreeTextRPM)
 	factor := h.poolFactors[key(a.ID, poolClass)]
 	if factor <= 0 {
 		factor = 1
@@ -275,9 +460,13 @@ func (h *Hub) effectiveRPMLocked(a *config.Account, poolClass string, s config.S
 	return math.Max(0.01, base*safety*h.learnedFactorOf(a)*factor)
 }
 
-func baseRPM(a *config.Account, poolClass string) float64 {
+func baseRPM(a *config.Account, poolClass string, freeTextRPM float64) float64 {
 	if v, ok := a.RPMOverrides[poolClass]; ok && v > 0 {
 		return v
+	}
+	// agnes 免费档文本池的 RPM 改为可配置项（FreeTextRPM）；0 表示用档位表。
+	if a.AccessType == "free" && poolClass == "text" && freeTextRPM > 0 {
+		return freeTextRPM
 	}
 	table, ok := config.RPMTable[a.AccessType]
 	if !ok {
@@ -320,6 +509,22 @@ func (h *Hub) Semaphore(a *config.Account, modality string) chan struct{} {
 	ch := make(chan struct{}, maxInt(1, h.concurrencyFor(a, modality, h.Settings())))
 	h.sems[k] = ch
 	return ch
+}
+
+// ReloadPacer 只收紧/放宽「单个账号 × 单个池」的节拍器，避免 429 高频路径上做
+// 全量快照 Reload()（O(账号数 × 池数) 的重新初始化，429 风暴时每个请求都拖一次）。
+// 调用前必须已更新完 poolFactors（本方法只读当前因子重算 effectiveRPM）。
+func (h *Hub) ReloadPacer(a *config.Account, poolClass string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s := h.Settings()
+	k := key(a.ID, poolClass)
+	rpm := h.effectiveRPMLocked(a, poolClass, s)
+	if p, ok := h.pacers[k]; ok {
+		p.Reconfigure(rpm, s.PacingWindowSec)
+	} else {
+		h.pacers[k] = pacer.New(rpm, s.PacingWindowSec)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +609,13 @@ func (h *Hub) Candidates(poolClass string, exclude map[string]bool, requiredMode
 		if !h.Capable(a, poolClass) {
 			continue
 		}
+		// 日预算门禁：当天日预算（neurons / tokens）耗尽的账号自动从候选池剔除，
+		// 次日 00:00 跨天滚动清零后自动回池。这是「用量型账号烧光 → 流量全涌向速率型
+		// 账号 → 次日用量型自动复活」的自动切换核心。读的是快照深拷贝（最多滞后 30s，
+		// 对天级预算尺度无影响），无需额外锁。
+		if a.BudgetExhausted() {
+			continue
+		}
 		base = append(base, a)
 	}
 	if requiredModel != "" && len(base) > 0 {
@@ -465,6 +677,14 @@ func (h *Hub) StartMaintenance(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		// P0-2：维护循环是「挂机无人值守」的关键后台任务，任何一次 panic 都不得让
+		// 它退出（否则 30s 的熔断复活 / 因子落盘全停）。每轮单独 recover。
+		defer func() {
+			if e := recover(); e != nil {
+				h.Metrics.PanicsTotal.Add(1)
+				log.Printf("[panic-recovered] maintenance loop: %v\n%s", e, debug.Stack())
+			}
+		}()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -473,7 +693,17 @@ func (h *Hub) StartMaintenance(ctx context.Context) <-chan struct{} {
 				h.flushFactors()
 				return
 			case <-ticker.C:
-				h.flushFactors()
+				func() {
+					defer func() {
+						if e := recover(); e != nil {
+							h.Metrics.PanicsTotal.Add(1)
+							log.Printf("[panic-recovered] maintenance tick: %v\n%s", e, debug.Stack())
+						}
+					}()
+					h.rollDailyBudgets()
+					h.flushFactors()
+					h.maybeAutoScenario()
+				}()
 			}
 		}
 	}()
@@ -500,9 +730,72 @@ func (h *Hub) flushFactors() {
 	// 兜底：把统计字段（RateLimited / LastError / 熔断状态等）批量写一次，
 	// 热路径里改这些字段的代码一律走 MutateAccountNoSave，这里统一落盘。
 	h.store.FlushAccounts()
-	if err := h.store.FlushBindings(); err != nil {
-		log.Printf("保存会话绑定失败：%v", err)
+	// #20 热路径异步落盘：批量写下游密钥（ChargeKey 只改内存）+ 批量追加 usage 日志
+	// （AppendUsage 只入内存缓冲）+ 批量写粘性绑定（Bind 只改内存）。挂机丢 ≤30s 可接受。
+	h.store.FlushKeys()
+	h.store.FlushUsage()
+	h.store.FlushBindings()
+}
+
+// rollDailyBudgets 维护循环调用：跨天时把各账号的日预算归属日滚动到「今天」，
+// 耗尽的账号当天累计清零、次日自动重新入池（配合 Candidates 的预算门禁实现
+// 「烧光自动出局 / 次日自动复活」）。同一自然日只滚动一次（幂等），正常挂机
+// 一天顶多触发一次（30s 一跳里绝大多数是空转）。
+func (h *Hub) rollDailyBudgets() {
+	day := config.TodayKey()
+	rolled := h.store.RollDailyBudgets(day)
+	if len(rolled) > 0 {
+		h.Metrics.BudgetDayRollovers.Add(int64(len(rolled)))
+		log.Printf("[budget-roll] 跨天滚动 %d 个账号的日预算：%v", len(rolled), rolled)
+		h.Reload() // 让 pacer/sem 与候选池拾取清零后的账号
 	}
+}
+
+// maybeAutoScenario 维护循环调用（#24）：AutoScenario 开启时，按实时负载画像推荐
+// 最贴合的情景并自动切换，带 60s 冷却防抖（同一目标情景不重复切、避免边界抖动）。
+// 只改全局旋钮 + 热重载，账号级 RPMOverrides 仍优先；控制台可随时关闭 AutoScenario
+// 改回人工选定。
+func (h *Hub) maybeAutoScenario() {
+	s := h.Settings()
+	if !s.AutoScenario {
+		return
+	}
+	profile := h.LoadProfile()
+	if profile.TotalRecent == 0 {
+		return // 无负载数据不动
+	}
+	recommended, reason := config.RecommendScenario(profile)
+	// 已是目标情景：不重复切
+	if s.Scenario == recommended.Name {
+		return
+	}
+	// 冷却防抖：距上次自动切换（且目标不变）不足 60s 则不切
+	h.autoMu.Lock()
+	if !h.lastAutoSwitch.IsZero() && h.lastAutoScenario == recommended.Name &&
+		time.Since(h.lastAutoSwitch) < 60*time.Second {
+		h.autoMu.Unlock()
+		return
+	}
+	h.lastAutoSwitch = time.Now()
+	h.lastAutoScenario = recommended.Name
+	h.autoMu.Unlock()
+
+	// 落盘情景 + 热重载（ApplyScenario 改全局旋钮，Reload 重算 pacer/sem）
+	h.store.UpdateSettings(func(st *config.Settings) {
+		if config.ApplyScenario(st, recommended.Name) {
+			st.AutoScenario = true // 保持开关不被清空
+		}
+	})
+	h.Reload() // 让 cfg 缓存 + pacer/sem 拾取新情景旋钮
+	log.Printf("[auto-scenario] 负载画像(%s) → 自动切情景「%s」：%s",
+		describeProfile(profile), recommended.Name, reason)
+}
+
+// describeProfile 把负载画像渲染成一行摘要（日志/控制台用）。
+func describeProfile(p config.LoadProfile) string {
+	return fmt.Sprintf("近120s %d 请求, 文%.0f%%/图%.0f%%/视%.0f%%, 流式%.0f%%, 并发%d, 429/min %d",
+		p.TotalRecent, p.TextRatio*100, p.ImageRatio*100, p.VideoRatio*100,
+		p.StreamRatio*100, p.ConcurrencyNow, p.Upstream429Rate)
 }
 
 // BindFactor 立即把某个 (账号 × 池) 因子落盘（控制台重置时用）。
@@ -547,6 +840,9 @@ func (h *Hub) SessionKey(headers map[string]string, downstreamKey string) string
 		return ""
 	}
 	session := strings.TrimSpace(headers["x-agnes-session"])
+	if session == "" {
+		session = strings.TrimSpace(headers["x-baipiao-session"]) // 旧品牌头，兼容老客户端
+	}
 	if session == "" {
 		session = strings.TrimSpace(headers["x-session-id"])
 	}
@@ -593,10 +889,13 @@ func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requir
 	bestAcc := (*config.Account)(nil)
 	bestScore := pickScore{}
 	init := false
+	bindCnt := h.store.BindingsCountByAccount() // 账号 → 活跃任务（会话）绑定数
 	for _, a := range h.Candidates(poolClass, exclude, requiredModel) {
 		sc := pickScore{
 			priority:    a.Priority,
+			budgetTier:  h.budgetTier(a, s.RoutingMode),
 			regionMatch: config.IsCNHost(a.BaseURL) == primaryCN,
+			sessions:    bindCnt[a.ID],
 			wait:        h.Pacer(a, poolClass).ProjectedWait(),
 			inflight:    h.Inflight(a.ID),
 		}
@@ -610,7 +909,9 @@ func (h *Hub) pickWithPriority(poolClass string, exclude map[string]bool, requir
 // pickScore 是候选账号的排序评分；betterThan 越大越优。
 type pickScore struct {
 	priority    int
+	budgetTier  int // 0 = 更优先（按 RoutingMode 决定速率型/用量型谁先被吃），1 = 兜底
 	regionMatch bool
+	sessions    int           // 该账号当前被多少个活跃任务（粘性会话）绑定；新任务优先分散到没人用的号
 	wait        time.Duration
 	inflight    int
 }
@@ -619,13 +920,47 @@ func (s pickScore) betterThan(o pickScore) bool {
 	if s.priority != o.priority {
 		return s.priority > o.priority
 	}
+	// 路由偏好（RoutingMode）：同一优先级内，先吃「更该用的那一类」。
+	if s.budgetTier != o.budgetTier {
+		return s.budgetTier < o.budgetTier
+	}
 	if s.regionMatch != o.regionMatch {
 		return s.regionMatch // 同优先级内首选区域更优
+	}
+	// 任务分散：并发多个任务时各自粘到不同账号，避免所有压力挤在同一个号的通道上
+	// （同一任务仍靠软粘性保持稳定绑定，不受此影响）。
+	if s.sessions != o.sessions {
+		return s.sessions < o.sessions
 	}
 	if s.wait != o.wait {
 		return s.wait < o.wait
 	}
 	return s.inflight < o.inflight
+}
+
+// budgetTier 依据 RoutingMode 给账号打「预算偏好层」：
+//
+//	- rate_first（默认）：速率型（无日预算，agnles）tier 0 主力，用量型（有日预算，CF）tier 1 兜底；
+//	- budget_first：用量型 tier 0 先烧免费配额，速率型 tier 1 兜底；
+//	- balanced / 未知：一律 tier 0（不做偏好，纯按区域/等待/在途排，等同旧行为）。
+//
+// 注意：预算已耗尽的账号在 Candidates 阶段已被剔除，这里只处理「仍有余量的两类」。
+func (h *Hub) budgetTier(a *config.Account, mode string) int {
+	hasBudget := a.DailyBudget > 0
+	switch mode {
+	case "budget_first":
+		if hasBudget {
+			return 0
+		}
+		return 1
+	case "rate_first":
+		if hasBudget {
+			return 1
+		}
+		return 0
+	default: // balanced / 空值
+		return 0
+	}
 }
 
 // Pick 选择账号。
@@ -757,12 +1092,90 @@ func (h *Hub) TrackInflight(accountID string, delta int) {
 	h.inflight[accountID] = maxInt(0, h.inflight[accountID]+delta)
 }
 
+// InflightTotal 全部账号当前在途请求总数（优雅停机据此判断「等待在途完成」）。
+func (h *Hub) InflightTotal() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	total := 0
+	for _, n := range h.inflight {
+		total += n
+	}
+	return total
+}
+
+// ---------------------------------------------------------------------------
+// 富健康度观测（P1-4：/healthz 不仅报 ok，还报「网关到底能不能干活」）
+// ---------------------------------------------------------------------------
+
+// QueueDepth 当前排队的请求总数（所有池的 pacer.Waiting() 之和）。
+func (h *Hub) QueueDepth() int {
+	h.mu.Lock()
+	total := 0
+	for _, p := range h.pacers {
+		total += p.Waiting()
+	}
+	h.mu.Unlock()
+	return total
+}
+
+// BreakerOpenCount 当前处于熔断（已禁用、等待复活）中的账号数。
+func (h *Hub) BreakerOpenCount() int {
+	nowSec := float64(time.Now().UnixNano()) / 1e9
+	n := 0
+	for _, a := range h.store.AccountsSnapshot() {
+		if !a.Enabled && a.ReviveAt > 0 && nowSec < a.ReviveAt {
+			n++
+		}
+	}
+	return n
+}
+
+// LastSuccessAgeMS 距全局最近一次上游成功的毫秒数；从未成功则 -1。
+func (h *Hub) LastSuccessAgeMS() int64 {
+	ns := h.Metrics.LastSuccessNS.Load()
+	if ns == 0 {
+		return -1
+	}
+	return time.Since(time.Unix(0, ns)).Milliseconds()
+}
+
+// Upstream429RatePerMin 最近 60s 真实命中上游 429 的次数（富健康度信号）。
+func (h *Hub) Upstream429RatePerMin() int {
+	return h.Recent429.PerMinute()
+}
+
+// PoolMaxProjectedWaitMS 取某池所有「启用」账号 pacer 的最大投影等待（毫秒）。
+// #21：供 /healthz 的 text_projected_wait_ms（排队可观测）与上游 429 兜底
+// Retry-After（按池深度算，而非写死 5s）复用。无启用账号或该池无流量则返回 0。
+func (h *Hub) PoolMaxProjectedWaitMS(poolClass string) int64 {
+	max := int64(0)
+	for _, a := range h.store.AccountsSnapshot() {
+		if !a.Enabled {
+			continue
+		}
+		if w := h.Pacer(a, poolClass).ProjectedWait().Milliseconds(); w > max {
+			max = w
+		}
+	}
+	return max
+}
+
+// PanicsTotal 已被 recover 兜住的 panic 次数。
+func (h *Hub) PanicsTotal() int64 {
+	return h.Metrics.PanicsTotal.Load()
+}
+
 // ---------------------------------------------------------------------------
 // 领槽位
 // ---------------------------------------------------------------------------
 
 // Acquire 等待并领取一个发送槽位，返回排队等待时长。
-func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) (time.Duration, error) {
+//
+// lowPriority：#22 两级队列。文本池内「非流式（工具/短调用）= 高优先级、流式（长生成）
+// = 低优先级」。开启 TextTwoLevelQueue 且池为 text 时，流式请求（lowPriority=true）在
+// 领槽前会限时等本账号非流式请求的领槽区间（highWaiting）清零，让短促调用优先拿到
+// 节拍槽位；领到的仍是下一个空闲槽（绝不超车已领槽位），RPM 安全节拍不变。
+func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string, lowPriority bool) (time.Duration, error) {
 	s := h.Settings()
 	maxWait := time.Duration(s.QueueMaxWaitMS) * time.Millisecond
 	limitMS := s.QueueMaxWaitMS
@@ -780,6 +1193,45 @@ func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) 
 		case <-ctx.Done():
 			return time.Since(started), ctx.Err()
 		}
+	}
+	// #22 两级队列：仅文本池 + 开启开关 + 本请求为低优先级（流式）时，先限时让位。
+	// 轮询 highWaiting[k]==0（尊重 ctx 与剩余预算），避免高优先级（非流式）还在领槽时
+	// 流式请求插队抢占节拍。等待本身计入总排队时长。
+	if lowPriority && s.TextTwoLevelQueue && poolClass == "text" {
+		k := key(a.ID, poolClass)
+		highWaitingClear := func() bool {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.highWaiting[k] == 0
+		}
+		if !highWaitingClear() {
+			deadline := started.Add(maxWait)
+			for !highWaitingClear() {
+				remain := time.Until(deadline)
+				if remain <= 0 {
+					break // 预算耗尽，不再让位（继续按剩余 0 预算领槽，由 Reserve 判定）
+				}
+				select {
+				case <-time.After(min(remain, 50*time.Millisecond)):
+				case <-ctx.Done():
+					return time.Since(started), ctx.Err()
+				}
+			}
+		}
+	}
+	// 高优先级（非流式）在领槽区间内标记 highWaiting，让后到的低优先级让位。
+	k := key(a.ID, poolClass)
+	if !lowPriority {
+		h.mu.Lock()
+		h.highWaiting[k]++
+		h.mu.Unlock()
+		defer func() {
+			h.mu.Lock()
+			if h.highWaiting[k] > 0 {
+				h.highWaiting[k]--
+			}
+			h.mu.Unlock()
+		}()
 	}
 	remaining := maxWait - time.Since(started)
 	if maxWait > 0 && remaining <= 0 {
@@ -825,6 +1277,7 @@ func (h *Hub) Acquire(ctx context.Context, a *config.Account, poolClass string) 
 func (h *Hub) OnRateLimited(a *config.Account, poolClass string) {
 	s := h.Settings()
 	h.Metrics.Upstream429.Add(1)
+	h.Recent429.record() // P1-4：富健康度——最近 60s 429 速率
 
 	floor := s.MinLearnedFactor
 	if floor <= 0 {
@@ -866,7 +1319,10 @@ func (h *Hub) OnRateLimited(a *config.Account, poolClass string) {
 		}
 		return true
 	})
-	h.Reload()
+	// P1-3/P2-4：429 高频路径只收紧受影响的「单个账号 × 单个池」节拍器，
+	// 不再做全量快照 Reload()（O(账号×池) 重新初始化，429 风暴时拖慢换号循环）。
+	// 账号集 / 设置在此路径不会变，仅这一个池因子变了，单 pacer reload 即可覆盖。
+	h.ReloadPacer(a, poolClass)
 }
 
 // OnSuccess 按「成功次数」回升校准因子（而非按墙钟 —— 墙钟回升在低流量账号上
@@ -981,6 +1437,35 @@ func (h *Hub) NoteSuccess(a *config.Account) {
 		return true
 	})
 	h.Metrics.RequestsOK.Add(1)
+	// P1-4：全局最近成功时间戳（/healthz last_success_age_ms）。
+	h.Metrics.LastSuccessNS.Store(time.Now().UnixNano())
+}
+
+// ChargeBudget 记录一次成功请求消耗的预算（neurons 或 tokens），推进日预算累计。
+//
+// 走热路径：只改内存（MutateAccountNoSave），由 30s 维护循环
+// flushFactors → FlushAccounts 批量落盘；挂机丢 ≤30s 可接受。
+// 当账号日预算从「未耗尽」翻转为「耗尽」时，记一条 BudgetExhausted 指标 + 日志。
+// 该账号随后在下一轮 Candidates 筛选中被预算门禁自动剔除（次日 00:00 回池）。
+// 没设日预算的账号（DailyBudget<=0）恒为 no-op，对 agnes 零影响。
+func (h *Hub) ChargeBudget(accountID string, delta float64) {
+	if accountID == "" || delta <= 0 {
+		return
+	}
+	var wasExhausted, nowExhausted bool
+	_ = h.store.MutateAccountNoSave(accountID, func(a *config.Account) bool {
+		if a.DailyBudget <= 0 {
+			return false // 没设日预算，不记账
+		}
+		wasExhausted = a.BudgetExhausted()
+		_, _ = a.AddBudgetUsage(delta)
+		nowExhausted = a.BudgetExhausted()
+		return true
+	})
+	if !wasExhausted && nowExhausted {
+		h.Metrics.BudgetExhausted.Add(1)
+		log.Printf("[budget] 账号 %s 当日预算耗尽，自动出局（次日 00:00 回池）", accountID)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1519,13 @@ func (h *Hub) Snapshot() map[string]any {
 			"queue_timeout":   h.Metrics.QueueTimeout.Load(),
 			"queue_overflow":  h.Metrics.QueueOverflow.Load(),
 			"spillovers":      h.Metrics.Spillovers.Load(),
+			"continuations":   h.Metrics.Continuations.Load(),
+			"soft_fail_retries": h.Metrics.SoftFailRetries.Load(),
+			"soft_fail_gave_up": h.Metrics.SoftFailGaveUp.Load(),
+			"resumed_streams":   h.Metrics.ResumedStreams.Load(),
+			// 已进入网关但未走完的转发请求数（区分「客户端没发」与「卡在网关内」）
+			"pending":  h.Metrics.Pending.Load(),
+			"accepted": h.Metrics.Accepted.Load(),
 			"breaker_opened":  h.Metrics.BreakerOpened.Load(),
 			"breaker_revived": h.Metrics.BreakerRevived.Load(),
 			"wait_ms_total":   h.Metrics.WaitMS.Load(),

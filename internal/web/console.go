@@ -116,6 +116,7 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("GET /api/settings", s.apiGetSettings)
 	m.HandleFunc("POST /api/settings", s.apiSetSettings)
 	m.HandleFunc("GET /api/export", s.apiExport)
+	m.HandleFunc("GET /api/export/capture-analysis", s.apiExportCaptureAnalysis)
 	m.HandleFunc("POST /api/import", s.apiImport)
 
 	m.HandleFunc("POST /api/intent/preview", s.apiIntentPreview)
@@ -125,6 +126,9 @@ func (s *Server) consoleRoutes() {
 	m.HandleFunc("GET /api/rpm-table", s.apiRPMTable)
 	// 媒体基地址自检：回显「按当前这次请求推算出的基地址」，专治反向代理部署。
 	m.HandleFunc("GET /api/media-base", s.apiMediaBase)
+	// 实时动态图表（任务管理器风格）与情景参数包。
+	m.HandleFunc("GET /api/metrics-history", s.apiMetricsHistory)
+	m.HandleFunc("GET /api/scenarios", s.apiListScenarios)
 
 	m.HandleFunc("GET /api/update/status", s.apiUpdateStatus)
 	m.HandleFunc("GET /api/update/check", s.apiUpdateCheck)
@@ -829,7 +833,9 @@ func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 200
 	}
-	writeJSON(w, 200, map[string]any{"logs": s.Store.TailUsage(limit)}, nil)
+	// #20 修复：走 TailUsageLive，把尚未批量落盘（30s 周期）的内存缓冲也计入，
+	// 否则刚发完请求的 user_request（用户输入）在日志页会延迟 30s 才可见。
+	writeJSON(w, 200, map[string]any{"logs": s.Store.TailUsageLive(limit)}, nil)
 }
 
 func (s *Server) apiBindings(w http.ResponseWriter, r *http.Request) {
@@ -1543,6 +1549,54 @@ func (s *Server) apiRPMTable(w http.ResponseWriter, r *http.Request) {
 		"access_types": config.AccessTypes,
 		"note":         "官方限流表按「模型类型」而非单个模型 ID 给出；标称值与实际可执行值不一致，故默认留安全余量",
 	}, nil)
+}
+
+// apiMetricsHistory 返回实时图表用的历史序列（任务管理器风格动态图数据源）。
+func (s *Server) apiMetricsHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w, r)
+		return
+	}
+	win := r.URL.Query().Get("win")
+	if win != "coarse" {
+		win = "fine"
+	}
+	writeJSON(w, 200, s.Hub.MetricsHistory(win), nil)
+}
+
+// apiListScenarios 返回全部情景参数包（供控制台「运行情景」卡片渲染）。
+func (s *Server) apiListScenarios(w http.ResponseWriter, r *http.Request) {
+	if !s.authed(r) {
+		s.deny(w, r)
+		return
+	}
+	current := s.Store.SettingsSnapshot()
+	var recommend map[string]any
+	if s.Hub != nil {
+		profile := s.Hub.LoadProfile()
+		recommended, reason := config.RecommendScenario(profile)
+		recommend = map[string]any{
+			"name":     recommended.Name,
+			"reason":   reason,
+			"profile":  profile,
+			"describe": describeLoadProfile(profile),
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"current":                  current.Scenario,
+		"auto_scenario":            current.AutoScenario,
+		"rate_limit_retry_max":     current.RateLimitRetryMax,
+		"rate_limit_wait_budget_ms": current.RateLimitWaitBudgetMS,
+		"scenarios":                config.ScenarioPresets(),
+		"recommend":                recommend,
+	}, nil)
+}
+
+// describeLoadProfile 把负载画像渲染成一行中文摘要（控制台「自动检测」区块用）。
+func describeLoadProfile(p config.LoadProfile) string {
+	return fmt.Sprintf("近120s %d 请求，文 %.0f%% / 图 %.0f%% / 视 %.0f%%，流式 %.0f%%，并发 %d，429/min %d",
+		p.TotalRecent, p.TextRatio*100, p.ImageRatio*100, p.VideoRatio*100,
+		p.StreamRatio*100, p.ConcurrencyNow, p.Upstream429Rate)
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ package relay
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -24,7 +25,10 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agneshub/internal/config"
@@ -40,6 +44,168 @@ var RetryableStatus = map[int]bool{
 // AuthFailStatus 不可重试、必须熔断的状态码。
 var AuthFailStatus = map[int]bool{401: true, 403: true, 402: true}
 
+// contentPolicyRe 匹配客户端（WorkBuddy）注入的 <content_policy>...</content_policy> 段。
+// 只在开关 StripContentPolicy 开启时对上传体做整段剥离：这是纯字节替换（远轻于 gzip 的
+// ~1ms），目的是省 token 而非省速度。
+//
+// 注意：绝不能用 contentPolicyRe.ReplaceAll 裸替换。当上下文里出现多个标签字面量
+// （如编码会话把本文件源码带进对话时），(?s).*? 会把一个 JSON 字符串里的开标签与
+// **另一个字符串里**的闭标签配对，吞掉中间的 " } , : 等结构字符，转发出去的请求体
+// 变成非法 JSON，上游报 400 "invalid character '{' looking for beginning of object
+// key string"（v1.0.26 线上实证）。必须走 stripContentPolicy 做 JSON 字符串感知剥离。
+var contentPolicyRe = regexp.MustCompile(`(?s)<content_policy>.*?</content_policy>`)
+
+// stripContentPolicy 返回剥离 <content_policy> 块后的请求体。JSON 安全：
+//  1. 只删除「完整落在单个 JSON 字符串字面量内部」的匹配段 —— 字符串中段删除
+//     永远不会破坏结构；跨字符串边界/位于结构位置的匹配一律原样保留
+//     （顶多多花点 token，绝不弄坏请求）。
+//  2. 兜底：删除后跑 json.Valid 校验，非法则整体放弃剥离、返回原体。
+//
+// 返回新切片，不修改 body 底层数组（bodyFor 可能对多个账号返回同一 rawBody，
+// 原地删除会污染后续重试）。
+func stripContentPolicy(body []byte) []byte {
+	matches := contentPolicyRe.FindAllSubmatchIndex(body, -1)
+	if matches == nil {
+		return body
+	}
+	spans := jsonStringSpans(body)
+	var dels [][2]int // 待删除区间（升序、互不重叠）
+	for _, m := range matches {
+		s, e := m[0], m[1]
+		for _, sp := range spans {
+			if s >= sp[0] && e <= sp[1] {
+				dels = append(dels, [2]int{s, e})
+				break
+			}
+		}
+	}
+	if len(dels) == 0 {
+		return body
+	}
+	out := make([]byte, 0, len(body))
+	prev := 0
+	for _, d := range dels {
+		out = append(out, body[prev:d[0]]...)
+		prev = d[1]
+	}
+	out = append(out, body[prev:]...)
+	if !json.Valid(out) {
+		return body // 兜底：任何意外情况都宁可多发 token，不发坏体
+	}
+	return out
+}
+
+// jsonStringSpans 扫描 body，返回所有 JSON 字符串字面量的内容区间 [内容起点, 结束引号处)。
+// 正确处理 \" 与 \\ 转义。body 不是合法 JSON 时返回的区间无意义，但配合上面的
+// json.Valid 兜底不会造成危害。
+func jsonStringSpans(body []byte) [][2]int {
+	var spans [][2]int
+	inStr, esc := false, false
+	start := 0
+	for i, c := range body {
+		if !inStr {
+			if c == '"' {
+				inStr, start = true, i+1
+			}
+			continue
+		}
+		switch {
+		case esc:
+			esc = false
+		case c == '\\':
+			esc = true
+		case c == '"':
+			spans = append(spans, [2]int{start, i})
+			inStr = false
+		}
+	}
+	return spans
+}
+
+// normalizeContentArray 把 OpenAI 风格请求里 messages[].content 为 array（多模态 blocks）
+// 的情况归一化为 string，以适配 agnes OpenAI 端「content 必须是 string」的 schema
+// （v1.0.26 线上实证：客户端发 content 为 array 时上游报 400 "Type mismatch of
+// '/messages/N/content', 'array' not in 'string'"）。
+//
+// 安全原则与 stripContentPolicy 一致，宁可不归一化也不弄坏/丢内容：
+//   - 仅当 content 是 array 且其中每个元素都能安全转成文本（text 块或纯字符串）才转；
+//   - 只要遇到 image_url / audio / 未知类型等无法安全文本化的块，整体保留原 array
+//     （顶多让上游报 schema 错，绝不丢弃或编造内容）；
+//   - 解析 / 序列化 / 校验任一步失败都返回原体。
+//
+// 用 map[string]any 保留所有顶层字段，只替换 messages[].content，避免窄结构
+// re-marshal 丢掉 model/tools/stream 等字段。仅 OpenAI 风格路径调用（非 Anthropic——
+// Anthropic 协议本就以 array blocks 表达 content，不能动）。
+func normalizeContentArray(body []byte) []byte {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	msgs, ok := doc["messages"].([]any)
+	if !ok {
+		return body
+	}
+	changed := false
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := m["content"]
+		if !ok {
+			continue // 无 content 字段（如空 assistant），不动
+		}
+		arr, ok := content.([]any)
+		if !ok {
+			continue // content 已是 string（或 null），无需处理
+		}
+		joined, safe := flattenTextBlocks(arr)
+		if !safe {
+			continue // 含非文本块，保留原 array
+		}
+		m["content"] = joined
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	if !json.Valid(out) {
+		return body
+	}
+	return out
+}
+
+// flattenTextBlocks 把 OpenAI 多模态 content 数组扁平化为纯文本。
+// 仅当每个元素都是 text 块（{"type":"text","text":...}）或纯字符串时安全返回 true；
+// 一旦遇到 image_url / audio / 其他 type 或缺少 text 的块，返回 false（调用方保留原 array）。
+// 多个 text 块按出现顺序直接拼接（块间不加额外分隔，保守不改变语义）。
+func flattenTextBlocks(arr []any) (string, bool) {
+	var sb strings.Builder
+	for _, el := range arr {
+		switch v := el.(type) {
+		case string:
+			sb.WriteString(v)
+		case map[string]any:
+			if t, _ := v["type"].(string); t == "text" {
+				txt, ok := v["text"].(string)
+				if !ok {
+					return "", false // text 块但 text 非字符串，不安全
+				}
+				sb.WriteString(txt)
+			} else {
+				return "", false // 非 text 块（image_url 等），保留 array
+			}
+		default:
+			return "", false
+		}
+	}
+	return sb.String(), true
+}
+
 // hopByHop 逐跳首部，不能原样透传。
 var hopByHop = map[string]bool{
 	"connection": true, "keep-alive": true, "proxy-authenticate": true,
@@ -52,12 +218,38 @@ var hopByHop = map[string]bool{
 //
 // 不设 Client.Timeout（视频任务提交后响应可能很慢），改为由 ctx 控制；
 // http.Client 的原生流式能力让我们无需缓冲即可透传 SSE。
+// 账号数未知时用默认连接池（向后兼容测试 / 旧调用）。
 func BuildClient() *http.Client {
+	return BuildClientForAccounts(0)
+}
+
+// BuildClientForAccounts 按当前账号数自适应连接池（P2-3）。
+//
+// 每个账号通常指向独立的上游 host，连接池 idle 上限按账号数线性放宽，
+// 避免多账号并发时 idle 连接被回收重建（TLS 握手成本）；单 host 上限
+// 保底 60（与历史默认一致），账号数越多总 idle 池越大。
+func BuildClientForAccounts(accountCount int) *http.Client {
+	if accountCount < 0 {
+		accountCount = 0
+	}
+	// 总 idle 池：历史默认 200，随账号数放宽（每账号 8 路），下限 200。
+	maxIdle := 200
+	if need := accountCount * 8; need > maxIdle {
+		maxIdle = need
+	}
+	// 单 host idle：保底 60；账号共用同一 base_url 的场景下随账号数再加。
+	maxIdlePerHost := 60
+	if need := accountCount; need > 60 {
+		maxIdlePerHost = 60 + (need-60)/4 // 多账号共 host 时温和放宽
+	}
 	transport := &http.Transport{
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 60,
-		IdleConnTimeout:     90 * time.Second,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        maxIdle,
+		MaxIdleConnsPerHost: maxIdlePerHost,
+		// agentic 编码任务两轮请求间常有 >90s 的停顿（人在读/思考），idle 连接过早
+		// 回收会让下一轮白白重建一次 TLS 握手。放宽到 5 分钟：短停顿复用既有连接，
+		// 长停顿才重建。NAS 单进程 + 最多 7 账号，idle conn 上限量级很小，持有成本低。
+		IdleConnTimeout:   5 * time.Minute,
+		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -160,6 +352,17 @@ type Options struct {
 	// Idempotent 声明该请求可否安全重试。GET 轮询与纯文本对话为 true，
 	// 生图 / 视频提交为 false（重试会造成重复扣费与重复建任务）。
 	Idempotent bool
+	// Stream 标记这是一次流式（SSE）请求。为 true 时，请求超时时钟改由
+	// 「空闲看门狗」驱动（只要上游还在持续吐字节就不断开，仅在连续
+	// StreamIdleTimeoutMS 无任何新字节时才断开），避免长文本回答被固定的
+	// 整请求墙钟超时中途掐断。非流式请求忽略此字段，仍走 RequestTimeoutMS。
+	Stream bool
+	// Continuable 声明该响应可做 MAX_TOKENS 截断自动续写（文本 chat 路径）。
+	// 仅 OpenAI 兼容格式支持；生图/视频轮询必须为 false。
+	Continuable bool
+	// Exclude 是本次转发要排除的账号 ID（用于「同一条流换号重发」，避免又
+	// 挑回刚刚失败的那个号）。由续写层在「本段没有任何产出」的场景下设置。
+	Exclude map[string]bool
 }
 
 // Result 是一次转发的产物。
@@ -203,7 +406,37 @@ func (r *Result) ReadAll() []byte {
 }
 
 // Do 带排队 / 重试 / 换账号的转发入口。
+// 外层包一层 MAX_TOKENS 截断自动续写（仅 Continuable 路径）：
+// 上游以 finish_reason=length / MAX_TOKENS 截断时，网关自动追加续写消息、
+// 重新排队再请求并拼接结果，客户端不再因截断而任务中断。
 func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Result, error) {
+	res, err := doOnce(ctx, h, client, opts)
+	if err != nil || !opts.Continuable || res == nil || res.Status >= 400 {
+		return res, err
+	}
+	rounds := h.Settings().ContinuationMaxRounds
+	if rounds <= 0 {
+		return res, err
+	}
+	if opts.Stream {
+		if res.Stream == nil {
+			return res, err
+		}
+		origBodyFor := opts.BodyFor
+		if origBodyFor == nil {
+			b := opts.Body
+			origBodyFor = func(*config.Account) ([]byte, string) { return b, "" }
+		}
+		cs := newContinuationStream(ctx, h, client, opts, res, origBodyFor, rounds)
+		return &Result{Status: res.Status, Header: res.Header, Stream: cs,
+			Account: res.Account, ModelUsed: res.ModelUsed, WaitMS: res.WaitMS, Attempts: res.Attempts}, nil
+	}
+	body := res.ReadAll()
+	return continuationResult(ctx, h, client, opts, res, body), nil
+}
+
+// doOnce 是一次「排队 → 选号 → 上游请求 → 网关内重试」的完整会话（原 Do）。
+func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Result, error) {
 	if opts.Method == "" {
 		opts.Method = http.MethodPost
 	}
@@ -212,21 +445,63 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 	if retryMax < 0 {
 		retryMax = 0
 	}
+	// #25：429（限流/达到最大额度）走一条独立的「网关内长预算」重试路径。
+	// 它是「受理前拒绝、重试安全」，网关会换账号 + 重新排队 + 感知 Retry-After 退避地
+	// 自动重试，直到成功或耗尽预算，期间不透传 429 给客户端，从而不中断在途任务。
+	// RateLimitRetryMax=0 沿用 RetryMax；RateLimitWaitBudgetMS=0 表示不限等待预算。
+	rateLimitRetries := s.RateLimitRetryMax
+	if rateLimitRetries == 0 {
+		rateLimitRetries = retryMax
+	}
+	rateLimitBudgetMS := int64(s.RateLimitWaitBudgetMS)
 
 	exclude := map[string]bool{}
+	for id := range opts.Exclude {
+		exclude[id] = true
+	}
 	var totalWait int64
-	var last *Result
+	var rl429Used int    // 已用 429 内部重试次数
+	var rl429WaitMS int64 // 429 内部重试累计退避等待（ms），受预算约束
+	// softUsed：「HTTP 200 但内容不可用」的换号重发次数（空内容 / 内嵌 error /
+	// 非法 JSON / 审查类拒绝）。这类失败比错误码更隐蔽——客户端一收到就停，
+	// 网关必须自己换号再试，实在没有号可用才把最后的结果交出去。
+	var softUsed int
+	softMax := s.SoftFailRetryMax
+	if softMax < 0 {
+		softMax = 0
+	}
+	// lastFail 记录最近一次可重试失败的真实结果。当所有候选都被 exclude 光、
+	// Pick 无号可用时，返回它而不是「无可用账号」——客户端至少能拿到上游的
+	// 真实原因（例如 429 + Retry-After），而不是一个让任务直接停摆的 502。
+	var lastFail *Result
+	// lastSoftKind 记录 lastFail 是否为「软失败（无内容）」——若所有账号都被
+	// exclude 光导致 Pick 失败，且最后一次正是软失败，则不把它伪装成成功透传，
+	// 同样返回带原因的 502 让客户端干净停止。
+	var lastSoftKind respKind
 	// 记录一次到达，供控制台「到达密度 vs 节拍」观测。
 	h.Arrivals.Add()
+	// #24：记录一次负载画像（模态 + 是否流式），供接入方自动检测匹配情景。
+	h.NoteRequest(opts.PoolClass, opts.Stream)
 
-	for attempt := 0; attempt <= retryMax; attempt++ {
+	for attempt := 0; ; attempt++ {
 		picked, err := h.Pick(opts.SessionKey, opts.PoolClass, opts.Pinned, opts.RequiredModel, exclude)
 		if err != nil {
+			// 已重试过若干次后被「排除」到无号可用：交还最后那次的真实上游结果，
+			// 而不是让客户端撞上一个毫无信息量的「无可用账号」错误。
+			if lastFail != nil && ctx.Err() == nil {
+				// 但若最后一次失败正是「软失败无内容」，不要把它伪装成成功 200
+				// 透传——同样返回带原因的 502，让客户端干净停止并看到原因。
+				if lastSoftKind.needRefire() {
+					h.Metrics.SoftFailGaveUp.Add(1)
+					return softFailGiveUp(lastFail, lastSoftKind, softUsed+1), nil
+				}
+				return lastFail, nil
+			}
 			return nil, err
 		}
 		account := picked.Account
 
-		wait, err := h.Acquire(ctx, account, opts.PoolClass)
+		wait, err := h.Acquire(ctx, account, opts.PoolClass, opts.Stream) // #22：流式=低优先级让位非流式
 		if err != nil {
 			return nil, err
 		}
@@ -249,13 +524,49 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		if err != nil {
 			return nil, err
 		}
-		last = result
 		// Count failed upstream attempts exactly once, including attempts followed by failover.
 		if result.Status >= 400 {
 			h.Metrics.RequestsError.Add(1)
 		}
 
 		if !retry {
+			// ── 韧性层：HTTP < 400 但「内容不可用」时换号重发 ──────────────
+			// 空内容 / body 内嵌 error / 非法 JSON / 审查类拒绝，这些都会有合法
+			// 状态码，但客户端一收到就停。网关必须自己换号再试一轮。
+			// 仅对 Continuable（文本 chat）生效：视频轮询的 {status:"queued"}
+			// 没有 choices，一旦放行会被误判成「空内容」无限重发。
+			if result.Status < 400 && opts.Continuable && !opts.Stream && softMax > 0 {
+				raw := result.ReadAll()
+				result.Body = raw
+				kind := classifyResponse(raw)
+				if kind == respTruncated {
+					// max_tokens 截断：重发同一请求还是在同一处截断，
+					// 必须交给外层「自动续写」，这里直接返回。
+					h.Metrics.WaitMS.Add(result.WaitMS)
+					return result, nil
+				}
+				if kind.needRefire() {
+					if softUsed < softMax {
+						softUsed++
+						result.Close()
+						h.NoteError(account, "soft_fail: "+kind.String())
+						h.Metrics.RequestsError.Add(1)
+						h.Metrics.SoftFailRetries.Add(1)
+					exclude[account.ID] = true
+					lastFail = result
+					lastSoftKind = kind
+						// 退避按「软失败自身的轮次」计，不与 5xx 重试共用计数——
+						// 否则一次空内容会把后续延迟推到秒级，客户端白等。
+						sleepBackoff(ctx, s, softUsed-1)
+						continue
+					}
+					// 软失败预算耗尽：不要再把「无内容的 200」伪装成成功透传给
+					// 客户端——那会让客户端吞下空回复却不停止，变成静默挂死。
+					// 改为返回带原因的 502，让客户端干净停止并看到为什么。
+					h.Metrics.SoftFailGaveUp.Add(1)
+					return softFailGiveUp(result, kind, softUsed+1), nil
+				}
+			}
 			if result.Status < 400 {
 				h.NoteSuccess(account)
 				h.OnSuccess(account, opts.PoolClass)
@@ -272,6 +583,24 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		}
 
 		exclude[account.ID] = true
+		lastFail = result
+
+		// #25：429（限流/达到最大额度）走「网关内长预算自动重试」——换账号 + 重新排队 +
+		// 感知 Retry-After 退避，直到成功或预算耗尽，期间不透传 429 给客户端，
+		// 从而不中断客户端在途任务。预算耗尽才把最后一次 429 透传（由 server 补 Retry-After）。
+		if result.Status == http.StatusTooManyRequests {
+			budgetGone := rateLimitBudgetMS > 0 && rl429WaitMS >= rateLimitBudgetMS
+			if rl429Used >= rateLimitRetries || budgetGone {
+				h.Metrics.WaitMS.Add(result.WaitMS)
+				return result, nil
+			}
+			w := sleep429(ctx, h, s, opts.PoolClass, result.Header, rl429Used)
+			rl429WaitMS += w.Milliseconds()
+			rl429Used++
+			continue
+		}
+
+		// 非 429 的可重试失败（408/5xx/401/403）：走普通 retryMax 预算。
 		if attempt < retryMax {
 			sleepBackoff(ctx, s, attempt)
 			continue
@@ -279,10 +608,28 @@ func Do(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) (*Re
 		h.Metrics.WaitMS.Add(result.WaitMS)
 		return result, nil
 	}
-	if last == nil {
-		return nil, errors.New("没有可用账号完成该请求")
+}
+
+// softFailGiveUp 在软失败预算（soft_fail_retry_max）耗尽后，把「无内容的 200」
+// 换成带原因的 502，让客户端能干净停止并看到原因，而不是吞下空回复后静默挂死。
+// tried 是返回该不可用内容的尝试总次数（首轮 + 已发生的换号重发轮数）。
+func softFailGiveUp(r *Result, kind respKind, tried int) *Result {
+	r.Close()
+	msg := fmt.Sprintf(
+		"agnes-hub: upstream content unavailable after %d account attempt(s) (%s). "+
+			"All tried accounts returned unusable content; please retry or reconfigure accounts.",
+		tried, kind.String())
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "agnes_upstream_content_unavailable",
+		},
+	})
+	return &Result{
+		Status: http.StatusBadGateway,
+		Header: http.Header{"Content-Type": {"application/json"}},
+		Body:   body,
 	}
-	return last, nil
 }
 
 // attemptOnce 单次尝试。返回 (结果, 是否应重试, 致命错误)。
@@ -291,22 +638,75 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 
 	url := UpstreamURL(account, opts.Path)
 
-	// 请求超时只管「发出请求 → 收到响应头」这一段，防止上游 hang 住耗尽连接池。
+	// P0: 请求超时保护。
+	//   - 非流式：整请求墙钟超时（RequestTimeoutMS），上游 hang 住会耗尽连接池，必须限时；
+	//   - 流式：改为「空闲看门狗」——从请求发起起计时，只要 StreamIdleTimeoutMS 内没有
+	//     任何新字节（含首字节）就断开；持续吐字则不断开。避免长文本回答被固定 30s
+	//     墙钟超时在途掐断（这是挂机场景下「任务不断流」的关键）。
 	//
 	// 不能用 context.WithTimeout 包住整个请求：context 的截止时间会一直作用到读完
-	// 响应体，于是超过 30 s 的流式回答会被拦腰截断（客户端只看到半截、没有 [DONE]），
-	// 慢一点的非流式回答被当成上游失败，再被重试到别的账号上重复计费。
+	// 响应体，于是超过 30 s 的流式回答会被拦腰截断（客户端只看到半截、没有 [DONE]）。
 	// 收到响应头之后，正文的生命周期交给调用方的 ctx（客户端断开即取消）。
 	s := h.Settings()
+	timeoutMS := s.RequestTimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = 30000 // 默认 30s
+	}
+	idleMS := s.StreamIdleTimeoutMS
+	if idleMS <= 0 {
+		idleMS = 60000 // 默认 60s 空闲才断开
+	}
+
+	// ---- #29 效率增强（内容零改动，仅改传输/缓存提示）----
+	// P0：Anthropic 路径注入 cache_control，让上游对反复出现的静态前缀
+	//     （system + tools）做前缀缓存，避免每轮重算 prefill。
+	// P1：对上传请求体做 gzip，削减 ~500KB 的网关→上游带宽
+	//     （需上游支持解压 gzip 请求体，故默认关闭、确认后再开）。
+	if opts.Anthropic && s.AnthropicPromptCache {
+		if mod, ok := addAnthropicCacheControl(body); ok {
+			body = mod
+		}
+	}
+	// 剥离客户端注入的 <content_policy> 段（省 token；纯字节替换，远轻于 gzip 的 ~1ms）。
+	// stripContentPolicy 内部做 JSON 字符串感知 + json.Valid 兜底，不会破坏请求体。
+	if s.StripContentPolicy {
+		body = stripContentPolicy(body)
+	}
+	// 归一化 OpenAI 路径 content：WorkBuddy 发来的 messages[].content 可能是 array
+	// （多模态 blocks），而 agnes 的 OpenAI 端 schema 要求 content 为 string（v1.0.26
+	// 线上实证：array 触发 400 "Type mismatch ... 'array' not in 'string'"）。仅 OpenAI
+	// 路径（!Anthropic）归一化；纯文本块安全合并，含图/音块则保留原 array（不丢不编造）。
+	if !opts.Anthropic {
+		body = normalizeContentArray(body)
+	}
+	sendBody := body
+	gzipEncode := false
+	if s.UpstreamRequestGzip {
+		if gz, ok := gzipBytes(body); ok {
+			sendBody = gz
+			gzipEncode = true
+		}
+	}
+
+	// 超时只管「发出请求 → 收到响应头」这一段，防止上游 hang 住耗尽连接池。
+	//
+	// 不能用 context.WithTimeout 包住整个请求：context 的截止时间会一直作用到读完
+	// 响应体，于是超过 30 s 的流式/慢速回答会被拦腰截断（客户端只看到半截、没有 [DONE]），
+	// 慢一点的非流式回答被当成上游失败，再被重试到别的账号上重复计费。
+	// 收到响应头之后，正文的生命周期交给调用方的 ctx（客户端断开即取消）。
 	reqCtx, cancel := context.WithCancel(ctx)
 
-	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, opts.Method, url, bytes.NewReader(sendBody))
 	if err != nil {
-		cancel()
+		cancel() // P2：request 构造失败时也取消 context，避免泄漏（vet 提示）。
 		return nil, false, err
 	}
 	for k, values := range ClientHeaders(account, opts.ExtraHeaders, opts.Anthropic) {
 		req.Header[k] = values
+	}
+	// P1：已对请求体做 gzip 压缩，声明编码并让 Go 按压缩后字节数自动设 Content-Length。
+	if gzipEncode {
+		req.Header.Set("Content-Encoding", "gzip")
 	}
 
 	// 单账号并发上限（按模态分离，避免视频轮询挤占文本请求）
@@ -314,23 +714,29 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	select {
 	case sem <- struct{}{}:
 	case <-ctx.Done():
-		cancel()
+		cancel() // 取消请求 context（ctx 已被外部取消，显式释放派生 context 避免泄漏）
 		return nil, false, ctx.Err()
 	}
 
 	// 计时从拿到并发名额之后开始：排队等名额的时间不该吃掉上游的超时预算。
-	// RequestTimeoutMS<=0 表示不限时（与配置项注释一致）。
+	// 非流式：headerTimer 只管「发出请求 → 收到响应头」这一段（RequestTimeoutMS<=0 不限时）。
+	// 流式：改用空闲看门狗，只要 StreamIdleTimeoutMS 内持续有新字节就不中断（挂机不断流）。
 	var headerTimer *time.Timer
-	if s.RequestTimeoutMS > 0 {
-		headerTimer = time.AfterFunc(time.Duration(s.RequestTimeoutMS)*time.Millisecond, cancel)
+	var wd *streamWatchdog
+	if opts.Stream {
+		wd = newStreamWatchdog(cancel, time.Duration(idleMS)*time.Millisecond)
+		wd.arm()
+	} else if timeoutMS > 0 {
+		headerTimer = time.AfterFunc(time.Duration(timeoutMS)*time.Millisecond, cancel)
 	}
+
 	resp, err := client.Do(req)
 	if headerTimer != nil && !headerTimer.Stop() {
 		// 计时器已经触发：reqCtx 已被取消，即使 Do 恰好成功，正文也读不了了。
 		if err == nil {
 			resp.Body.Close()
 		}
-		err = fmt.Errorf("上游 %d ms 内未返回响应", s.RequestTimeoutMS)
+		err = fmt.Errorf("上游 %d ms 内未返回响应", timeoutMS)
 	}
 	if err != nil && ctx.Err() != nil {
 		// 客户端已断开：不是上游的错，不记账号错误、不换号重试（旧实现会让后续
@@ -341,6 +747,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	}
 	if err != nil {
 		<-sem
+		if wd != nil {
+			wd.stop()
+		}
 		cancel()
 		h.NoteError(account, fmt.Sprintf("%T: %v", err, err))
 		return &Result{
@@ -352,12 +761,20 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	}
 
 	status := resp.StatusCode
+	if wd != nil {
+		// 响应头已到达：重置空闲计时，进入「流式体」阶段继续看门狗。
+		wd.arm()
+	}
 
 	if status == 402 {
-		// 402 Payment Required：额度耗尽。冷却该账号并换号重试 —— 402 是受理前拒绝，
-		// 换号不会造成重复副作用。
+		// 402 Payment Required：该账号额度耗尽。不再「不重试」——
+		// 额度是【按账号】的，池子里别的号往往还有额度，必须换号再试；
+		// 全部耗尽后 Pick 会失败，由 doOnce 交还最后那次真实的 402。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.OnQuotaExhausted(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
@@ -370,6 +787,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if AuthFailStatus[status] { // 401 / 403
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.OnAuthFailure(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
@@ -382,6 +802,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if status == http.StatusTooManyRequests {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.OnRateLimited(account, opts.PoolClass)
@@ -394,6 +817,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	if RetryableStatus[status] {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		resp.Body.Close()
+		if wd != nil {
+			wd.stop()
+		}
 		<-sem
 		cancel()
 		h.NoteError(account, fmt.Sprintf("HTTP %d: %s", status, string(raw)))
@@ -407,7 +833,13 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	// 注意：成功路径【绝不】在此提前关闭 body 或取消 reqCtx，否则调用方读取 body 时
 	// 连接已关闭 / context 已取消，会读到空体（表现为网关回 {}）。
 	// 直到调用方读完 body 触发 Close()，才在此 release 里 cancel()。
-	wrapped := &releaseOnClose{ReadCloser: resp.Body, release: func() {
+	var streamBody io.ReadCloser = resp.Body
+	if opts.Stream {
+		// 流式：body 上套 idleStreamBody（读到字节就 wd.arm() 重置看门狗），
+		// 与前面 client.Do 阶段启动的看门狗衔接，连续 idleMS 无任何字节才断开。
+		streamBody = &idleStreamBody{ReadCloser: resp.Body, wd: wd}
+	}
+	wrapped := &releaseOnClose{ReadCloser: streamBody, release: func() {
 		cancel() // body 读取完毕后才取消 context
 		select {
 		case <-sem:
@@ -469,6 +901,72 @@ var RefusedBeforeAccept = map[int]bool{
 	http.StatusTooManyRequests: true,
 }
 
+// streamWatchdog 是流式请求的「空闲看门狗」：从请求发起起计时，只要 interval 内没有
+// 任何字节（包括首字节/响应头迟迟未到）就调用 cancel 断开上游；arm() 在「有字节到达」
+// 时重置计时。它是挂机场景下「长回答不断流」的关键——非流式请求用固定墙钟超时，
+// 流式请求改用它：上游只要还在正常吐字，整条 SSE 流可持续任意久，不会被 30s 墙钟在途掐断。
+type streamWatchdog struct {
+	cancel   context.CancelFunc
+	interval time.Duration
+	mu       sync.Mutex
+	timer    *time.Timer
+	stopped  bool
+}
+
+func newStreamWatchdog(cancel context.CancelFunc, interval time.Duration) *streamWatchdog {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	return &streamWatchdog{cancel: cancel, interval: interval}
+}
+
+// arm 启动或重置一次空闲计时（从此刻起 interval 内无事件则 cancel）。
+func (g *streamWatchdog) arm() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return
+	}
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.timer = time.AfterFunc(g.interval, g.cancel)
+}
+
+// stop 永久停止看门狗（请求结束 / 出错时）。幂等。
+func (g *streamWatchdog) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return
+	}
+	g.stopped = true
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+}
+
+// idleStreamBody 把「读到字节就重置看门狗」包进 io.ReadCloser，交给 releaseOnClose。
+type idleStreamBody struct {
+	io.ReadCloser
+	wd *streamWatchdog
+}
+
+func (s *idleStreamBody) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if n > 0 {
+		s.wd.arm()
+	}
+	return n, err
+}
+
+func (s *idleStreamBody) Close() error {
+	if s.wd != nil {
+		s.wd.stop()
+	}
+	return s.ReadCloser.Close()
+}
+
 func sleepBackoff(ctx context.Context, s config.Settings, attempt int) {
 	base := time.Duration(s.RetryBaseBackoffMS) * time.Millisecond
 	capDelay := time.Duration(s.RetryMaxBackoffMS) * time.Millisecond
@@ -483,9 +981,122 @@ func sleepBackoff(ctx context.Context, s config.Settings, attempt int) {
 	}
 }
 
+// parseRetryAfter 解析上游 429 的 Retry-After 头（秒数或 HTTP 日期），返回建议等待秒数；
+// 未带该头（免费号 agnes 常不带）时返回 0，由调用方用池投影等待兜底。
+func parseRetryAfter(header http.Header) float64 {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if sec, err := strconv.ParseFloat(raw, 64); err == nil {
+		if sec < 0 {
+			return 0
+		}
+		return sec
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		sec := t.Sub(time.Now()).Seconds()
+		if sec < 0 {
+			sec = 0
+		}
+		return sec
+	}
+	return 0
+}
+
+// sleep429 是一次 429 内部重试前的等待：优先用上游 Retry-After（钳到 [0,120]s），
+// 否则用该池当前投影等待（下一空闲槽）+ 一轮指数退避兜底；全程可被 ctx 取消。
+// 返回实际等待的时长（用于累计 429 等待预算）。
+func sleep429(ctx context.Context, h *hub.Hub, s config.Settings, poolClass string, header http.Header, attempt int) time.Duration {
+	waitSec := parseRetryAfter(header)
+	if waitSec <= 0 {
+		// 免费号常不带 Retry-After：用池投影等待（下一空闲槽）作为下限，避免拍满节拍。
+		projMS := h.PoolMaxProjectedWaitMS(poolClass)
+		if float64(projMS)/1000.0 > waitSec {
+			waitSec = float64(projMS) / 1000.0
+		}
+		// 再叠一轮温和指数退避（base * 2^attempt，钳到 cap），避免全员同节拍重试。
+		exp := int(attempt)
+		mult := 1 << uint(exp)
+		backoffMS := float64(s.RetryBaseBackoffMS) * float64(mult)
+		if capMS := float64(s.RetryMaxBackoffMS); backoffMS > capMS {
+			backoffMS = capMS
+		}
+		waitSec += backoffMS / 1000.0
+	}
+	if waitSec > 120 {
+		waitSec = 120 // 单次等待上限，防止 Retry-After 异常大值挂死
+	}
+	jitter := 0.85 + rand.Float64()*0.3
+	d := time.Duration(float64(waitSec) * jitter * 1000) * time.Millisecond
+	if d <= 0 {
+		return 0
+	}
+	start := time.Now()
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
+	return time.Since(start)
+}
+
 func errorBody(message, etype string) []byte {
 	buf, _ := json.Marshal(map[string]any{
 		"error": map[string]any{"message": message, "type": etype},
 	})
 	return buf
+}
+
+// gzipBytes 把请求体压缩为 gzip（#29 P1）。失败返回 (nil, false)，调用方应原样发送。
+func gzipBytes(in []byte) ([]byte, bool) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(in); err != nil {
+		return nil, false
+	}
+	if err := gz.Close(); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// addAnthropicCacheControl 在 Anthropic 风格请求体上注入前缀缓存断点（#29 P0）：
+// 把顶层 system 标为可缓存块（ephemeral），使上游对重复出现的巨大静态前缀
+// （system + tools）不再每轮重算 prefill。仅当上游兼容 Anthropic cache_control
+// 时才有收益；不兼容时该字段被忽略，内容不受影响。agnes 主路径的 system 位于
+// messages 内（OpenAI 风格），此处找不到顶层 system 时安全 no-op。
+func addAnthropicCacheControl(body []byte) ([]byte, bool) {
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body, false
+	}
+	changed := false
+	if sys, ok := doc["system"]; ok {
+		switch v := sys.(type) {
+		case string:
+			doc["system"] = []any{map[string]any{
+				"type":          "text",
+				"text":          v,
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}}
+			changed = true
+		case []any:
+			if len(v) > 0 {
+				if blk, ok := v[len(v)-1].(map[string]any); ok {
+					if _, has := blk["cache_control"]; !has {
+						blk["cache_control"] = map[string]any{"type": "ephemeral"}
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body, false
+	}
+	return out, true
 }

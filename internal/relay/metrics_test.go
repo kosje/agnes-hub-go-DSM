@@ -26,7 +26,9 @@ func TestErrorMetricCountsEveryFailedAttemptOnce(t *testing.T) {
 			}))
 			defer up.Close()
 			store, h, _ := newRelayEnv(t, 1000, up.URL)
-			_ = store.UpdateSettings(func(s *config.Settings) { s.RetryMax = 0 })
+			// RetryMax=0 让普通可重试失败立即返回；RateLimitRetryMax=0 让 429 也立即
+			// 返回（429 走独立的长预算重试，不共用 RetryMax）。
+			_ = store.UpdateSettings(func(s *config.Settings) { s.RetryMax = 0; s.RateLimitRetryMax = 0 })
 			h.Reload()
 			client := BuildClient()
 			if status == 0 {
