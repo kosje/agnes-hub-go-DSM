@@ -1,4 +1,4 @@
-# agnes-hub-go
+# Agens-Hub
 
 Agnes AI 的**多账号聚合中转 + RPM 限流排队网关**。
 
@@ -519,12 +519,12 @@ git add docs && git commit -m "chore: 更新套件源" && git push
 **第 2 步 · 添加套件源**：
 
 1. 同一个 **设置** 窗口 → 切到 **套件来源** 标签 → 点 **新增**
-2. **名称**：随便填，比如 `Agnes Hub`
+2. **名称**：随便填，比如 `Agens-Hub`
 3. **位置**：`https://kosje.github.io/agnes-hub-go-DSM/catalog.json`
 4. 点 **确定**
 
 **第 3 步 · 安装**：切到套件中心的 **「社群」** 标签页（不是「所有套件」），
-就能看到 Agnes Hub，点「安装」即可。以后有新版本会在这里直接提示更新。
+就能看到 Agens-Hub，点「安装」即可。以后有新版本会在这里直接提示更新。
 
 **为什么地址里没有架构信息**：群晖 catalog 的条目里没有架构字段 —— 架构过滤是服务端
 按请求的 `arch` 参数做的（见 SynoCommunity/spkrepo 的 `views/nas.py`）。GitHub Pages

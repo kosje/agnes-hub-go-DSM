@@ -249,7 +249,7 @@ WIZARD_INSTALL = [{
     "step_title": "设置管理员密码",
     "items": [{
         "type": "password",
-        "desc": "用于登录 Agnes Hub 控制台（至少 6 位）。安装后也可以在控制台里修改。",
+        "desc": "用于登录 Agens-Hub 控制台（至少 6 位）。安装后也可以在控制台里修改。",
         "subitems": [
             {"key": "wizard_admin_password", "desc": "管理员密码",
              "validator": {"allowBlank": False, "minLength": 6}},
@@ -764,8 +764,8 @@ def build_info(arch, spk_ver, checksum, extractsize_kb):
     lines = [
         'package="%s"' % APP_ID,
         'version="%s"' % spk_ver,
-        'dname="Agnes Hub"',
-        'displayname="Agnes Hub"',
+        'dname="Agens-Hub"',
+        'displayname="Agens-Hub"',
         'desc="%s"' % DESCRIPTION,
         'description="%s"' % DESCRIPTION,
         'arch="%s"' % PACKAGE_ARCHES[arch],
@@ -833,7 +833,7 @@ def prepare_arch(arch, binary_src, spk_ver, icon_src):
                              for n in DSM_ICON_SIZES])
     with open(os.path.join(ui_dir, "config"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({".url": {DSM_APP_NAME: {
-            "title": "Agnes Hub",
+            "title": "Agens-Hub",
             "desc": "Agnes AI 多账号聚合中转 + RPM 限流排队网关",
             "icon": "images/icon_{0}.png",
             "type": "url",
@@ -902,6 +902,18 @@ def validate_build_provenance(binary):
     if subprocess.check_output(
             ["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, text=True).strip():
         raise ValueError("打包前请先提交源码，工作树必须干净")
+
+
+def validate_ui_branding():
+    """合并上游后若恢复旧品牌，阻止把错误面板名称打进正式套件。"""
+    ui_dir = os.path.join(ROOT, "internal", "web", "static")
+    for name in ("console.html", "chat.html", "chat.main.js"):
+        with open(os.path.join(ui_dir, name), encoding="utf-8") as fh:
+            text = fh.read()
+        if re.search(r"baipiao|白嫖", text, flags=re.IGNORECASE):
+            raise ValueError("%s 含上游旧品牌文字，请在打包前清理" % name)
+        if name == "console.html" and "<title>Agens-Hub 控制台</title>" not in text:
+            raise ValueError("控制台品牌必须为 Agens-Hub 控制台")
 
 
 def build_spk(bundle, out_path):
@@ -1019,6 +1031,7 @@ def main():
         return
 
     targets = select_targets(args.arch)
+    validate_ui_branding()
 
     go_version = read_version()
     spk_ver = spk_version(go_version)

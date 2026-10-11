@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.30"
+var version = "1.0.31"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
 // 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
@@ -168,7 +168,7 @@ func main() {
 	}
 
 	fmt.Println("==============================================================")
-	fmt.Printf("  agnes-hub-go %s  已启动\n", version)
+	fmt.Printf("  Agens-Hub %s  已启动\n", version)
 	fmt.Println("--------------------------------------------------------------")
 	fmt.Printf("  控制台    http://%s/console\n", displayAddr(*host, *port))
 	fmt.Printf("  接口基址  http://%s/v1\n", displayAddr(*host, *port))
@@ -238,7 +238,7 @@ func main() {
 	if err := store.FlushPending(); err != nil {
 		log.Printf("停止服务时保存数据失败：%v", err)
 	}
-	fmt.Println("Agnes Hub 已停止。")
+	fmt.Println("Agens-Hub 已停止。")
 }
 
 // buildListeners 按平台拆分到 listener_linux.go / listener_other.go：

@@ -52,6 +52,9 @@ PRIMARY_ARCH = "x86_64"
 
 # 套件中心里显示的变更说明（HTML）。发新版时改这里。
 CHANGELOG = (
+    "【1.0.31】恢复 Agens-Hub 品牌<br>"
+    "· 登录页、控制台主标题与浏览器标签恢复为 Agens-Hub 控制台，清理上游旧品牌文字<br>"
+    "· 对话页、套件与桌面快捷方式显示名统一；版本链接指向本项目<br><br>"
     "【1.0.30】修复续写、流式兼容与数据保存，建议升级<br>"
     "· 修复 SSE 事件粘连、结束帧丢失及单并发账号续写卡死；多轮续写保留完整上下文<br>"
     "· 原生流式协议保持透传，Anthropic 工具调用不再误判为空回复<br>"
@@ -183,7 +186,7 @@ CHANGELOG = (
     "<br>"
     "【1.0.12-0002 / 1.0.12-0001】<br>"
     "· 【重要】修复生图打不通（/api/chat 前缀没摘）与 agnes-auto 不被识别为 auto<br>"
-    "· 控制台品牌改为 Agnes Hub；修复网页顶栏 logo 升级后不更新"
+    "· 控制台品牌改为 Agens-Hub；修复网页顶栏 logo 升级后不更新"
 )
 
 CATALOG_FIELDS_NOTE = "SynoCommunity/spkrepo 的 build_entry_data 与 sspks 的字段清单"
@@ -216,7 +219,7 @@ def make_entry(spk_path, link, thumb_urls):
     return {
         "package": info.get("package", APP_ID),
         "version": version,
-        "dname": "Agnes Hub",
+        "dname": "Agens-Hub",
         "desc": DESCRIPTION,
         "price": 0,
         # 群晖只在下载量超过 1000 时才显示，第三方源填 0 即可
@@ -268,7 +271,7 @@ LANDING = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agnes Hub — 群晖 DSM 套件源</title>
+<title>Agens-Hub — 群晖 DSM 套件源</title>
 <style>
   :root {{ color-scheme: light dark; }}
   body {{ max-width: 860px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem;
@@ -292,7 +295,7 @@ LANDING = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Agnes Hub — 群晖 DSM 套件源</h1>
+<h1>Agens-Hub — 群晖 DSM 套件源</h1>
 <p class="sub">Agnes AI 多账号聚合中转 + RPM 限流排队网关，打包为群晖套件。</p>
 
 <h2>在群晖上添加套件源</h2>
@@ -310,7 +313,7 @@ LANDING = """<!DOCTYPE html>
 <ol>
   <li>同一个 <strong>设置</strong> 窗口，切到 <strong>套件来源</strong> 标签</li>
   <li>点 <strong>新增</strong></li>
-  <li><strong>名称</strong>：随便填，比如 <code>Agnes Hub</code></li>
+  <li><strong>名称</strong>：随便填，比如 <code>Agens-Hub</code></li>
   <li><strong>位置</strong>：填下面这个地址</li>
 </ol>
 <table>
@@ -323,7 +326,7 @@ LANDING = """<!DOCTYPE html>
 
 <p><strong>第 3 步 · 安装</strong></p>
 <p>添加成功后，切到套件中心的 <strong>「社群」</strong> 标签页（不是「所有套件」），
-就能看到 Agnes Hub，点「安装」即可。以后有新版本会直接在这里提示更新。</p>
+就能看到 Agens-Hub，点「安装」即可。以后有新版本会直接在这里提示更新。</p>
 
 <div class="note">
   <strong>为什么地址里没有架构信息</strong>：群晖 catalog 的条目里没有架构字段 ——

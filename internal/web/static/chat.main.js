@@ -46,7 +46,7 @@ function renderMustChange(){
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
-      <h1>Agnes AI 助手</h1>
+      <h1>Agens-Hub AI 助手</h1>
       <p class="muted">管理员仍在使用初始密码</p>
       <div class="hint">为安全起见，请先到 <a href="/console">控制台</a> 修改初始密码，再回到本页。</div>
     </div>
@@ -59,7 +59,7 @@ function renderLoginForm(hasChatPassword, chatMode){
   document.getElementById("app").innerHTML=`
   <div class="login">
     <div class="card">
-      <h1>Agnes AI 助手</h1>
+      <h1>Agens-Hub AI 助手</h1>
       <p class="muted">AI 对话 · 生图 · 生视频</p>
       <div id="toast" class="hide"></div>
       <label>${chatMode?"Chat 访问密码":"管理员密码"}</label>
@@ -88,7 +88,7 @@ function renderLoginForm(hasChatPassword, chatMode){
 function renderApp(){
   document.getElementById("app").innerHTML=`
   <div class="topbar">
-    <h1><img class="logo" src="/logo.png" alt="Agnes">Agnes AI 助手</h1>
+    <h1><img class="logo" src="/logo.png" alt="Agens-Hub">Agens-Hub AI 助手</h1>
     <span id="topbarInfo" class="topbar-info">加载中...</span>
     <button class="sm" id="btnRefresh">刷新</button>
     <button class="sm danger" id="btnLogout">退出</button>

@@ -4,7 +4,7 @@ rem 不开 enabledelayedexpansion：脚本里没有用到 !var!，而开着它会把路径里的「!」
 rem 装在带「!」的目录下时 cd 与数据目录都会指错。
 setlocal
 cd /d "%~dp0"
-title Agnes Hub
+title Agens-Hub
 
 set "BIN=agnes-hub-go.exe"
 rem 用绝对路径启动：设置了 NoDefaultCurrentDirectoryInExePath 这项 Windows 加固选项时，
@@ -15,7 +15,7 @@ set "PORT=4142"
 set "DATADIR=%~dp0data"
 
 echo ============================================================
-echo   Agnes Hub   AI 多账号聚合中转 + RPM 限流排队网关
+echo   Agens-Hub   AI 多账号聚合中转 + RPM 限流排队网关
 echo ============================================================
 echo.
 
@@ -84,6 +84,6 @@ ver >nul
 set "CODE=%ERRORLEVEL%"
 
 echo.
-echo Agnes Hub 已退出，退出码 %CODE%。
+echo Agens-Hub 已退出，退出码 %CODE%。
 pause
 exit /b %CODE%
