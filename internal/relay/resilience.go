@@ -157,6 +157,15 @@ func classifyGeminiResp(m map[string]any) respKind {
 			return respBlocked
 		}
 	}
+	if content, ok := c["content"].(map[string]any); ok {
+		if parts, ok := content["parts"].([]any); ok {
+			for _, part := range parts {
+				if p, ok := part.(map[string]any); ok && p["functionCall"] != nil {
+					return respOK
+				}
+			}
+		}
+	}
 	if strings.TrimSpace(geminiText(c["content"])) == "" {
 		return respEmpty
 	}

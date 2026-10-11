@@ -33,3 +33,17 @@ func TestCheckOnlyFetchesReleaseMetadata(t *testing.T) {
 		t.Fatal("version check changed running version")
 	}
 }
+
+func TestFailedVersionCheckIsRemembered(t *testing.T) {
+	u := New(Config{Repo: "kosje/agnes-hub-go-DSM"}, "1.0.33", nil)
+	u.client.Transport = releaseTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 403, Body: io.NopCloser(strings.NewReader("rate limited")), Header: make(http.Header)}, nil
+	})
+	r, err := u.Check(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Error == "" || u.LastCheck() == nil || u.LastCheck().Error == "" {
+		t.Fatal("failure not visible in cached status")
+	}
+}

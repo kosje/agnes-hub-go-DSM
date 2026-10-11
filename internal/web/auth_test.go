@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"agneshub/internal/config"
 	"agneshub/internal/hub"
 	"agneshub/internal/relay"
 )
@@ -197,7 +198,8 @@ func TestCrossOriginWriteRejected(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("同源写请求应放行，实际 %d：%s", resp.StatusCode, raw)
 	}
-	// 反向代理把 Host 改写成不带端口的主机名（NPM 默认）时，按主机名比对
+	// A bare proxy hostname cannot authorize arbitrary ports. An explicit
+	// public address restores a valid proxy origin without weakening the check.
 	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+"/api/settings", strings.NewReader(`{"keepalive_ms":300}`))
 	req.Host = "hub.example.com"
 	req.Header.Set("Origin", "https://hub.example.com:52325")
@@ -207,8 +209,21 @@ func TestCrossOriginWriteRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	r2.Body.Close()
+	if r2.StatusCode != 403 {
+		t.Errorf("未配置完整反代来源时应 403，实际 %d", r2.StatusCode)
+	}
+	h.store.UpdateSettings(func(st *config.Settings) { st.PublicBaseURL = "https://hub.example.com:52325" })
+	req, _ = http.NewRequest(http.MethodPost, h.ts.URL+"/api/settings", strings.NewReader(`{"keepalive_ms":300}`))
+	req.Host = "hub.example.com"
+	req.Header.Set("Origin", "https://hub.example.com:52325")
+	req.AddCookie(h.cookie())
+	r2, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2.Body.Close()
 	if r2.StatusCode != 200 {
-		t.Errorf("经反代（Host 无端口）的同主机请求应放行，实际 %d", r2.StatusCode)
+		t.Errorf("已配置完整反代来源时应 200，实际 %d", r2.StatusCode)
 	}
 }
 

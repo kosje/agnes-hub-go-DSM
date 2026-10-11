@@ -765,6 +765,7 @@ type Store struct {
 	keysDirty atomic.Bool
 	// usageMu protects the in-memory buffer; usageFileMu protects the disk state.
 	usageMu     sync.Mutex
+	captureMu   sync.Mutex
 	usageFileMu sync.Mutex // Serializes append, truncate, prune and live snapshots.
 	usageBuf    []map[string]any
 	// #20 补漏：bindingsDirty 由热路径 Bind（Pick 每个粘性会话请求都会调）打标，
@@ -953,13 +954,13 @@ func normalizeSettings(v *Settings) {
 	if v.OptimizationMode == "" {
 		v.OptimizationMode = d.OptimizationMode
 	}
-	if v.ImageRecordRetention <= 0 {
+	if v.ImageRecordRetention < 0 {
 		v.ImageRecordRetention = d.ImageRecordRetention
 	}
-	if v.ImageMaxCapacity <= 0 {
+	if v.ImageMaxCapacity < 0 {
 		v.ImageMaxCapacity = d.ImageMaxCapacity
 	}
-	if v.VideoMaxCapacity <= 0 {
+	if v.VideoMaxCapacity < 0 {
 		v.VideoMaxCapacity = d.VideoMaxCapacity
 	}
 	if v.FreeTextRPM <= 0 {
@@ -2254,26 +2255,43 @@ func (s *Store) CaptureRawRequest(raw []byte) {
 	if len(raw) == 0 {
 		return
 	}
+	s.captureMu.Lock()
+	defer s.captureMu.Unlock()
 	dir := filepath.Join(s.Dir, "raw_capture")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
-	// 限制文件数：超过 100 则删除最旧文件（按文件名排序，纳秒时间戳天然升序）。
-	if entries, err := os.ReadDir(dir); err == nil && len(entries) >= 100 {
+	f, err := os.CreateTemp(dir, ".capture-*.part")
+	if err != nil {
+		return
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	_, writeErr := f.Write(raw)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		return
+	}
+	name := filepath.Join(dir, fmt.Sprintf("req_%d_%s.json", time.Now().UnixNano(), randHex(4)))
+	if os.Rename(tmp, name) != nil {
+		return
+	}
+	// Only complete captures are visible to analysis; concurrent writers share
+	// this lock so the 100-file bound also holds after the final request.
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 100 {
 		olds := make([]string, 0, len(entries))
 		for _, e := range entries {
-			if e.IsDir() {
+			if e.IsDir() || !strings.HasPrefix(e.Name(), "req_") || !strings.HasSuffix(e.Name(), ".json") {
 				continue
 			}
 			olds = append(olds, filepath.Join(dir, e.Name()))
 		}
 		sort.Strings(olds)
-		for i := 0; i < len(olds)-99; i++ {
+		for i := 0; i < len(olds)-100; i++ {
 			_ = os.Remove(olds[i])
 		}
 	}
-	name := filepath.Join(dir, fmt.Sprintf("req_%d.json", time.Now().UnixNano()))
-	_ = os.WriteFile(name, raw, 0o644)
 }
 
 // RawCaptureDir 返回原始请求捕获目录（data/raw_capture）。供控制台「导出分析」端点读取。

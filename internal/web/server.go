@@ -22,6 +22,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agneshub/internal/config"
@@ -34,12 +35,13 @@ import (
 
 // Server 组装全部路由。
 type Server struct {
-	Store   *config.Store
-	Hub     *hub.Hub
-	Client  *http.Client
-	mux     *http.ServeMux
-	rules   intent.Rules
-	Updater *updater.Updater
+	handlers sync.WaitGroup
+	Store    *config.Store
+	Hub      *hub.Hub
+	Client   *http.Client
+	mux      *http.ServeMux
+	rules    intent.Rules
+	Updater  *updater.Updater
 	// Version 由 main 注入，供 /healthz 与版本检查接口显示。
 	Version string
 	// ReleaseRepo 是控制台「查看全部版本」要跳转的 GitHub 仓库（owner/name），
@@ -103,6 +105,8 @@ func (s *Server) UpdaterInstance() *updater.Updater { return s.Updater }
 // 里 panic（见下方流式路径的 recoverGoroutine），没有兜底会直接终止整个进程、带走所有
 // 在途任务。这里是「挂机无人值守」的地基。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handlers.Add(1)
+	defer s.handlers.Done()
 	defer recoverHandler(s, w, r)
 	if !s.sameOrigin(r) {
 		writeJSON(w, 403, map[string]any{"error": map[string]any{"type": "permission_error",
@@ -125,6 +129,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mux.ServeHTTP(w, r)
 }
+
+// Call after the HTTP server stops accepting connections and closes/cancels
+// timed-out requests; accounting from their handlers must finish before flush.
+func (s *Server) WaitHandlers() { s.handlers.Wait() }
 
 // recoverHandler 是 ServeHTTP 的 panic 兜底：记录堆栈、计数、回 500。
 func recoverHandler(s *Server, w http.ResponseWriter, r *http.Request) {
@@ -468,16 +476,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// last_success_age_ms 很大 → 虽然进程活着，但所有账号都在熔断，实际不可用）。
 	lastSuccessAgeMS := s.Hub.LastSuccessAgeMS()
 	writeJSON(w, 200, map[string]any{
-		"ok":                 true,
-		"accounts":           enabled,
-		"uptime_sec":         int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
-		"version":            ver,
-		"available_accounts": enabled,
-		"queue_depth":        s.Hub.QueueDepth(),
-		"breaker_open":       s.Hub.BreakerOpenCount(),
-		"last_success_age_ms": lastSuccessAgeMS,
+		"ok":                        true,
+		"accounts":                  enabled,
+		"uptime_sec":                int(time.Since(s.Hub.Metrics.StartedAt).Seconds()),
+		"version":                   ver,
+		"available_accounts":        enabled,
+		"queue_depth":               s.Hub.QueueDepth(),
+		"breaker_open":              s.Hub.BreakerOpenCount(),
+		"last_success_age_ms":       lastSuccessAgeMS,
 		"upstream_429_rate_per_min": s.Hub.Upstream429RatePerMin(),
-		"panics_total":       s.Hub.PanicsTotal(),
+		"panics_total":              s.Hub.PanicsTotal(),
 		// 「请求到网关了吗？」的第一现场。请求从进来（这里计数）到真正进入 relay
 		// （那里的 requests_total / 到达密度）之间有一段原本完全不可见的窗口：
 		// 读请求体、JSON 解析、意图判定。pending 持续不为 0 说明卡在这段里，
@@ -548,7 +556,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // 指标里有全部账号的 ID、名称与健康状态，旧版本对任何人开放。
 func (s *Server) metricsAllowed(r *http.Request) bool {
 	if ip := net.ParseIP(clientIP(r)); ip != nil && ip.IsLoopback() {
-		return true
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = strings.Trim(r.Host, "[]")
+		}
+		hostIP := net.ParseIP(host)
+		localHost := strings.EqualFold(host, "localhost") || (hostIP != nil && hostIP.IsLoopback())
+		proxied := false
+		for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP"} {
+			if r.Header.Get(name) != "" {
+				proxied = true
+			}
+		}
+		if localHost && !proxied {
+			return true
+		}
 	}
 	if s.authed(r) {
 		return true
@@ -1043,6 +1065,11 @@ func (s *Server) serveAutoImage(w http.ResponseWriter, r *http.Request, item *co
 		writeJSON(w, result.Status, errorPayload(result.Status, raw), extra)
 		return
 	}
+	if !validImageResult(raw) {
+		s.logUsageError(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, 502, "无有效图片产出")
+		writeErr(w, invalidMediaResponse())
+		return
+	}
 	s.Store.ChargeKey(item.Key, extractUsage(raw))
 	s.logUsageFull(item, decision, poolClass, "/v1/images/generations", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 
@@ -1150,7 +1177,6 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 	}
 	raw := result.ReadAll()
 	decision.ModelUsed = result.ModelUsed
-	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 
 	extra := decision.Headers()
 	s.accountHeaders(r, extra, result.Account)
@@ -1163,6 +1189,12 @@ func (s *Server) serveAutoVideo(w http.ResponseWriter, r *http.Request, item *co
 
 	payload := decodeMap(raw)
 	videoID := extractVideoID(payload)
+	if !validVideoResult(raw) {
+		s.logUsageError(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, 502, "无有效视频任务号")
+		writeErr(w, invalidMediaResponse())
+		return
+	}
+	s.logUsageFull(item, decision, poolClass, "/v1/videos", chatShape, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 	job := &config.VideoJob{
 		JobID:     config.NewID("job"),
 		VideoID:   videoID,
@@ -1545,10 +1577,6 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 		raw := result.ReadAll()
 		if result.Status < 400 {
 			s.Store.ChargeKey(item.Key, extractUsage(raw))
-			// 用量型账号（如 CF）把本次消耗记账到日预算，烧光自动出局（次日回池）。
-			if s.Hub != nil && result.Account != nil {
-				s.Hub.ChargeBudget(result.Account.ID, extractNeurons(raw))
-			}
 			s.logUsageFull(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
 		} else {
 			s.logUsageError(item, decision, opts.PoolClass, opts.Path, false, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
@@ -1580,29 +1608,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 	if keepalive <= 0 {
 		keepalive = 5 * time.Second
 	}
-	type outcome struct {
-		result *relay.Result
-		err    error
-	}
-	ch := make(chan outcome, 1)
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		defer func() {
-			// P0-2：relay.Do 内部任何 panic（罕见畸形数据/空指针）都不得终止整个进程。
-			// 正常路径下 body 已发送 outcome、defer 什么都不做；仅 panic 时在此补发一个
-			// 带错误的 outcome，保证主 select 一定能收到、不会永久阻塞。
-			if e := recover(); e != nil {
-				if s.Hub != nil {
-					s.Hub.Metrics.PanicsTotal.Add(1)
-				}
-				log.Printf("[panic-recovered] stream relay: %v\n%s", e, debug.Stack())
-				ch <- outcome{err: fmt.Errorf("网关内部错误：请求处理 panic（已降级）")}
-			}
-		}()
-		result, err := relay.Do(ctx2, s.Hub, s.Client, opts)
-		ch <- outcome{result: result, err: err}
-	}()
+	ch := s.relayAsync(ctx2, opts)
 
 	select {
 	case out := <-ch:
@@ -1644,18 +1652,12 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, item *config.Down
 					payload = map[string]any{"error": map[string]any{
 						"message": string(raw), "type": "upstream_error"}}
 				}
-			writeSSEFrame(w, flusher, payload)
-			s.logUsageError(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
+				writeSSEFrame(w, flusher, payload)
+				s.logUsageError(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text, result.Status, string(raw))
+				return
+			}
+			s.copyBilledStream(w, r, item, result, decision, opts, flusher)
 			return
-		}
-		writeSSEComment(w, flusher, fmt.Sprintf("agnes-hub account=%s wait_ms=%d attempts=%d model=%s",
-			safeHeader(result.Account.Name), result.WaitMS, result.Attempts, result.ModelUsed))
-		tail := &sseTail{w: &flushWriter{w: w, f: flusher}, cap: 1 << 16}
-		_, _ = io.Copy(tail, result.Stream)
-		result.Close()
-		s.Store.ChargeKey(item.Key, tail.usage())
-		s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
-		return
 		case <-ticker.C:
 			writeSSEComment(w, flusher, "agnes-hub waiting for rate-limit slot")
 		case <-ctx.Done():
@@ -1702,11 +1704,7 @@ func (s *Server) finishStream(w http.ResponseWriter, r *http.Request, item *conf
 	}
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
-	tail := &sseTail{w: &flushWriter{w: w, f: flusher}, cap: 1 << 16}
-	_, _ = io.Copy(tail, result.Stream)
-	result.Close()
-	s.Store.ChargeKey(item.Key, tail.usage())
-	s.logUsageFull(item, decision, opts.PoolClass, opts.Path, true, result.Account, result.WaitMS, result.Attempts, decision.Prompt.Text)
+	s.copyBilledStream(w, r, item, result, decision, opts, flusher)
 }
 
 type flushWriter struct {
@@ -1832,23 +1830,29 @@ func mustJSON(v any) string {
 
 // extractUsage 从 OpenAI 格式响应体解析 token 用量（total_tokens）；解析不到返回 0。
 func extractUsage(raw []byte) int64 {
-	var probe struct {
-		Usage struct {
-			TotalTokens      int64 `json:"total_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
-			PromptTokens     int64 `json:"prompt_tokens"`
-		} `json:"usage"`
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return 0
 	}
-	if json.Unmarshal(raw, &probe) == nil {
-		if probe.Usage.TotalTokens > 0 {
-			return probe.Usage.TotalTokens
+	if g, ok := m["usageMetadata"].(map[string]any); ok {
+		if n := usageNumber(g, "totalTokenCount"); n > 0 {
+			return n
 		}
-		// 某些上游只给 prompt/completion 不给 total：相加兜底。
-		if probe.Usage.PromptTokens > 0 || probe.Usage.CompletionTokens > 0 {
-			return probe.Usage.PromptTokens + probe.Usage.CompletionTokens
+		return usageNumber(g, "promptTokenCount") + usageNumber(g, "candidatesTokenCount")
+	}
+	u, _ := m["usage"].(map[string]any)
+	if nested, ok := m["message"].(map[string]any); ok {
+		if mu, ok := nested["usage"].(map[string]any); ok {
+			u = mu
 		}
 	}
-	return 0
+	if n := usageNumber(u, "total_tokens"); n > 0 {
+		return n
+	}
+	if n := usageNumber(u, "prompt_tokens") + usageNumber(u, "completion_tokens"); n > 0 {
+		return n
+	}
+	return usageNumber(u, "input_tokens") + usageNumber(u, "output_tokens")
 }
 
 // extractNeurons 从 OpenAI 兼容响应体解析 Cloudflare 的用量计费字段 usage.neurons。
@@ -1868,13 +1872,20 @@ func extractNeurons(raw []byte) float64 {
 
 // sseTail 在转发 SSE 流给客户端的同时，保留末尾片段用于解析流末的 usage。
 type sseTail struct {
-	w   io.Writer
-	buf []byte
-	cap int
+	w                                                         io.Writer
+	buf                                                       []byte
+	cap                                                       int
+	lineBuf                                                   []byte
+	frameData                                                 []string
+	frameBytes                                                int
+	observed                                                  bool
+	failedFrame                                               bool
+	inputTokens, outputTokens, segmentTokens, completedTokens int64
 }
 
 func (t *sseTail) Write(p []byte) (int, error) {
 	n, err := t.w.Write(p)
+	t.observe(p[:n])
 	if err != nil {
 		return n, err
 	}
@@ -1887,26 +1898,8 @@ func (t *sseTail) Write(p []byte) (int, error) {
 
 // usage 逐 data: 行解析 SSE，取最后一个成功解析出 usage 的 total_tokens。
 func (t *sseTail) usage() int64 {
-	var total int64
-	for _, line := range strings.Split(string(t.buf), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		var probe struct {
-			Usage struct {
-				TotalTokens int64 `json:"total_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal([]byte(payload), &probe) == nil && probe.Usage.TotalTokens > 0 {
-			total = probe.Usage.TotalTokens
-		}
-	}
-	return total
+	t.finishObserver()
+	return t.completedTokens + t.segmentTokens
 }
 
 func relayError(err error) *apiError {

@@ -653,9 +653,6 @@ func (s *Server) mediaCacheLimits(k mediaKind) (keepCount int, keepBytes int64) 
 	settings := s.Store.SettingsSnapshot()
 	if k.dirName == videoKind.dirName {
 		keepCount = settings.VideoMaxCapacity
-		if keepCount <= 0 {
-			keepCount = 200
-		}
 		// 视频必须同时卡总字节：一段 1080P 视频 10~30 MB，只卡条数的话
 		// 200 条能吃掉好几个 GB。0 表示不限。
 		if mb := settings.VideoCacheMaxMB; mb > 0 {
@@ -664,9 +661,6 @@ func (s *Server) mediaCacheLimits(k mediaKind) (keepCount int, keepBytes int64) 
 		return keepCount, keepBytes
 	}
 	keepCount = settings.ImageMaxCapacity
-	if keepCount <= 0 {
-		keepCount = 500
-	}
 	return keepCount, 0
 }
 
@@ -693,7 +687,7 @@ func (s *Server) pruneMediaCache(k mediaKind) {
 			continue
 		}
 		// 正在下载中的临时文件由下载方自己负责清理，不要在这里误删。
-		if strings.HasSuffix(e.Name(), ".part") {
+		if strings.HasSuffix(e.Name(), ".part") || !validMediaName(k, e.Name()) {
 			continue
 		}
 		info, err := e.Info()
@@ -702,7 +696,7 @@ func (s *Server) pruneMediaCache(k mediaKind) {
 		}
 		files = append(files, fileInfo{e.Name(), info.ModTime(), info.Size()})
 	}
-	if len(files) <= keepCount && keepBytes <= 0 {
+	if (keepCount <= 0 || len(files) <= keepCount) && keepBytes <= 0 {
 		return
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
@@ -710,7 +704,7 @@ func (s *Server) pruneMediaCache(k mediaKind) {
 	var total int64
 	for i, f := range files {
 		total += f.size
-		if i < keepCount && (keepBytes <= 0 || total <= keepBytes) {
+		if (keepCount <= 0 || i < keepCount) && (keepBytes <= 0 || total <= keepBytes) {
 			continue
 		}
 		_ = os.Remove(filepath.Join(dir, f.name))

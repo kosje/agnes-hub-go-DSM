@@ -204,30 +204,46 @@ func (s *Server) sameOrigin(r *http.Request) bool {
 		return site == "" || site == "same-origin" || site == "none"
 	}
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return false // 包括 "null"（沙箱 iframe、file:// 页面）
 	}
-	candidates := []string{r.Host, firstHeaderValue(r.Header.Get("X-Forwarded-Host"))}
-	if pub := strings.TrimSpace(s.Store.SettingsSnapshot().PublicBaseURL); pub != "" {
-		if pu, err := url.Parse(pub); err == nil {
-			candidates = append(candidates, pu.Host)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	candidates := []string{scheme + "://" + r.Host}
+	forwardedScheme := firstHeaderValue(r.Header.Get("X-Forwarded-Proto"))
+	if forwardedScheme == "http" || forwardedScheme == "https" {
+		forwardedHost := firstHeaderValue(r.Header.Get("X-Forwarded-Host"))
+		if forwardedHost == "" {
+			forwardedHost = r.Host
 		}
+		candidates = append(candidates, forwardedScheme+"://"+forwardedHost)
+	}
+	if pub := strings.TrimSpace(s.Store.SettingsSnapshot().PublicBaseURL); pub != "" {
+		candidates = append(candidates, pub)
 	}
 	for _, c := range candidates {
-		c = strings.TrimSpace(c)
-		if c == "" {
-			continue
-		}
-		if strings.EqualFold(c, u.Host) {
-			return true
-		}
-		// 反向代理（如 NPM 默认配置）会把 Host 改写成不带端口的 $host，
-		// 此时只能按主机名比对。直连网关时 Host 一定带端口，走不到这里。
-		if _, _, err := net.SplitHostPort(c); err != nil && strings.EqualFold(c, u.Hostname()) {
+		if expected, err := url.Parse(strings.TrimSpace(c)); err == nil && originKey(expected) == originKey(u) {
 			return true
 		}
 	}
 	return false
+}
+
+func originKey(u *url.URL) string {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return strings.ToLower(u.Scheme + "://" + net.JoinHostPort(u.Hostname(), port))
 }
 
 // ---------------------------------------------------------------------------

@@ -58,12 +58,21 @@ function settings(){sandbox.fixture=store;vm.runInContext('state.settings=fixtur
   const saved=requests.filter(r=>r.url==='/api/settings' && r.body).at(-1).body;
   assert.equal(saved.public_base_url, 'https://hub.example.com:52325');
   assert.equal(saved.client_media_url,'');
+  assert(!Object.hasOwn(saved,'scenario'),'general save must not reapply a preset');
+  assert.equal(saved.stream_idle_timeout_ms,60000);
+  assert.equal(saved.continuation_max_rounds,2);
+  assert.equal(saved.soft_fail_retry_max,2);
+  assert.equal(saved.stream_auto_resume,true);
   assert.equal(saved.auto_intent.video_stream_wait_sec,900);
   assert(!Object.hasOwn(saved,'chat_password_clear'));
   node('s_baseurl').value='https://nas.example.com:5443';node('s_cmedia').value='local';
   await node('btnSaveSettings').onclick();settings();
   assert.equal(node('s_baseurl').value,'https://nas.example.com:5443');
   assert.equal(node('s_cmedia').value,'local');
+  assert(ctx.viewKeys().includes('https://nas.example.com:5443/v1'),'client setup hint must use configured address');
+  const keepStore={...store};store={...store,image_max_capacity:0,video_max_capacity:0,image_record_retention_days:0,auto_scenario:true};settings();
+  assert.equal(String(node('s_img_cap').value),'0');assert.equal(String(node('s_vid_cap').value),'0');assert(node('s_auto_scenario').checked);
+  store=keepStore;settings();
   await node('btnMediaBase').onclick();assert(node('mediaBaseBox').innerHTML.includes('https://nas.example.com:5443'));
   // Both export buttons must honor their label, especially redaction.
   await node('btnExport').onclick();assert.equal(opened.at(-1),'/api/export?redact=1');

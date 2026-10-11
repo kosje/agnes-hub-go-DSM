@@ -251,6 +251,9 @@ func (s *Server) apiListAccounts(w http.ResponseWriter, r *http.Request) {
 			"consecutive_failures": a.ConsecutiveFailures,
 			"default_model":        a.DefaultModel,
 			"priority":             a.Priority,
+			"daily_budget":         a.DailyBudget,
+			"budget_unit":          a.BudgetUnit,
+			"budget_used_today":    a.BudgetUsedToday,
 			"rpm_overrides":        a.RPMOverrides,
 		})
 	}
@@ -286,6 +289,10 @@ func (s *Server) apiCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apiKey := strings.TrimSpace(asStr(body["api_key"]))
+	if e := validateBudgetPatch(body); e != nil {
+		writeErr(w, e)
+		return
+	}
 	if apiKey == "" {
 		writeErr(w, badRequest("api_key 不能为空"))
 		return
@@ -296,6 +303,13 @@ func (s *Server) apiCreateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	account := s.Store.AddAccount(asStr(body["name"]), apiKey,
 		asStr(body["access_type"]), asStr(body["base_url"]), manifest)
+	if value, ok := body["daily_budget"]; ok {
+		s.Store.MutateAccount(account.ID, func(a *config.Account) bool {
+			a.DailyBudget = parseFloat(asStr(value))
+			a.BudgetUnit = "neurons"
+			return true
+		})
+	}
 	if v, ok := body["priority"]; ok {
 		if n := asInt(v); n > 0 {
 			s.Store.MutateAccount(account.ID, func(a *config.Account) bool { a.Priority = n; return true })
@@ -362,6 +376,10 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if e := validateBudgetPatch(body); e != nil {
+		writeErr(w, e)
+		return
+	}
 	found := s.Store.MutateAccount(id, func(a *config.Account) bool {
 		changed := false
 		setStr := func(key string, dst *string) {
@@ -379,6 +397,11 @@ func (s *Server) apiUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		setStr("base_url", &a.BaseURL)
 		setStr("access_type", &a.AccessType)
 		setStr("default_model", &a.DefaultModel)
+		if value, ok := body["daily_budget"]; ok {
+			a.DailyBudget = parseFloat(asStr(value))
+			a.BudgetUnit = "neurons"
+			changed = true
+		}
 		setBool("enabled", &a.Enabled)
 		if _, ok := body["enabled"]; ok {
 			// 管理员亲手启用 / 停用，一律以此为准：清掉熔断的复活计划与退避计数。
@@ -1089,6 +1112,10 @@ func (s *Server) apiSetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Chat 访问密码：设置用 chat_password，清除必须显式传 chat_password_clear=true ——
+	if e := validateSettingsPatch(body); e != nil {
+		writeErr(w, e)
+		return
+	}
 	// 不能把「没填」当成「清除」，否则每次保存其它设置都会把密码冲掉。
 	chatPW, setChatPW := "", false
 	if pw, ok := body["chat_password"]; ok {
@@ -1124,6 +1151,11 @@ func (s *Server) apiSetSettings(w http.ResponseWriter, r *http.Request) {
 // applySettings 把控制台提交的字段写入设置（只认白名单，忽略未知键）。
 // 注意：此函数在 UpdateSettings 锁内调用，不能访问 s。
 func applySettings(st *config.Settings, p map[string]any) {
+	// Presets are applied only when explicitly requested. An ordinary form save
+	// must not reapply the current preset and overwrite fine-tuned values.
+	if name, ok := p["scenario"]; ok {
+		config.ApplyScenario(st, asStr(name))
+	}
 	f := func(key string, dst *float64) {
 		if v, ok := p[key]; ok {
 			*dst = parseFloat(asStr(v))
@@ -1158,6 +1190,22 @@ func applySettings(st *config.Settings, p map[string]any) {
 	s2("affinity_mode", &st.AffinityMode)
 	s2("region_priority", &st.RegionPriority)
 	i("request_timeout_ms", &st.RequestTimeoutMS)
+	i("stream_idle_timeout_ms", &st.StreamIdleTimeoutMS)
+	i("continuation_max_rounds", &st.ContinuationMaxRounds)
+	i("soft_fail_retry_max", &st.SoftFailRetryMax)
+	i("rate_limit_retry_max", &st.RateLimitRetryMax)
+	i("rate_limit_wait_budget_ms", &st.RateLimitWaitBudgetMS)
+	f("free_text_rpm", &st.FreeTextRPM)
+	b("text_two_level_queue", &st.TextTwoLevelQueue)
+	b("auto_scenario", &st.AutoScenario)
+	b("stream_auto_resume", &st.StreamAutoResume)
+	b("upstream_request_gzip", &st.UpstreamRequestGzip)
+	b("anthropic_prompt_cache", &st.AnthropicPromptCache)
+	b("strip_content_policy", &st.StripContentPolicy)
+	b("raw_capture_enabled", &st.RawCaptureEnabled)
+	i("usage_log_max_lines", &st.UsageLogMaxLines)
+	i("usage_request_log_bytes", &st.UsageRequestLogBytes)
+	s2("routing_mode", &st.RoutingMode)
 	s2("default_image_tier", &st.DefaultImageTier)
 	s2("optimization_mode", &st.OptimizationMode)
 	i("image_record_retention_days", &st.ImageRecordRetention)
@@ -1583,12 +1631,12 @@ func (s *Server) apiListScenarios(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, map[string]any{
-		"current":                  current.Scenario,
-		"auto_scenario":            current.AutoScenario,
-		"rate_limit_retry_max":     current.RateLimitRetryMax,
+		"current":                   current.Scenario,
+		"auto_scenario":             current.AutoScenario,
+		"rate_limit_retry_max":      current.RateLimitRetryMax,
 		"rate_limit_wait_budget_ms": current.RateLimitWaitBudgetMS,
-		"scenarios":                config.ScenarioPresets(),
-		"recommend":                recommend,
+		"scenarios":                 config.ScenarioPresets(),
+		"recommend":                 recommend,
 	}, nil)
 }
 
@@ -1885,6 +1933,7 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 		SessionKey: sessionKey, PoolClass: poolClass,
 		RequiredModel: requiredModel, Method: http.MethodPost, Path: "/v1/chat/completions",
 		BodyFor: bodyFor, Idempotent: true,
+		Stream: wantsStream, Continuable: true,
 	}
 
 	ctx := r.Context()
@@ -1914,23 +1963,17 @@ func (s *Server) handleChatProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 流式路径
-	type outcome struct {
-		result *relay.Result
-		err    error
-	}
-	ch := make(chan outcome, 1)
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		result, err := relay.Do(ctx2, s.Hub, s.Client, opts)
-		ch <- outcome{result: result, err: err}
-	}()
+	ch := s.relayAsync(ctx2, opts)
 
 	select {
 	case out := <-ch:
 		s.finishChatStream(w, r, out.result, out.err, decision, opts)
 		return
 	case <-time.After(time.Duration(settings.KeepaliveMS) * time.Millisecond):
+	case <-ctx.Done():
+		return
 	}
 
 	// 心跳路径
@@ -2216,7 +2259,15 @@ func (s *Server) serveChatMedia(w http.ResponseWriter, r *http.Request,
 	// video_id），后面的轮询根本无从发起。
 	var job *config.VideoJob
 	if decision.Modality == intent.Video {
+		if !validVideoResult(raw) {
+			writeErr(w, invalidMediaResponse())
+			return
+		}
 		job = s.recordVideoJob(result, raw)
+	}
+	if decision.Modality == intent.Image && !validImageResult(raw) {
+		writeErr(w, invalidMediaResponse())
+		return
 	}
 
 	// 对话入口：调用方只认 chat 响应结构，必须回译。

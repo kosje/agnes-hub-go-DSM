@@ -420,6 +420,7 @@ function viewAccounts(){
           <div style="flex:1"><label>分组（可选）</label><input id="aGroup" placeholder="cn-free"></div>
           <div style="flex:1"><label>单账号并发</label><input id="aConc" type="number" value="8" min="1"></div>
           <div style="flex:1"><label>兜底模型（可选）</label><input id="aDefaultModel" placeholder="留空=auto"></div>
+          <div style="flex:1"><label>每日用量预算（neurons，0=关闭）</label><input id="aBudget" type="number" min="0" value="0"></div>
           <div style="flex:1"><label>优先级（数字越大越优先，默认 0）</label><input id="aPriority" type="number" value="0" min="0"></div>
         </div>
         <details style="margin-top:8px">
@@ -485,6 +486,7 @@ function bindAccountEvents(){
         group:document.getElementById("aGroup").value, max_concurrency:Number(document.getElementById("aConc").value)||8,
         priority:Number(document.getElementById("aPriority").value)||0,
         default_model:document.getElementById("aDefaultModel").value,
+        daily_budget:Number(document.getElementById("aBudget").value),budget_unit:"neurons",
         model_manifest:manifest, rpm_overrides:rpm
       })});
       toast("账号已添加","good"); await refresh();
@@ -594,6 +596,7 @@ function editAccountModal(acc){
           <div style="flex:1"><label>优先级（越大越优先）</label><input id="ePriority" type="number" value="${acc.priority||0}" min="0"></div>
         </div>
         <div><label>兜底模型（可选）</label><input id="eDefaultModel" value="${esc(acc.default_model||"")}" placeholder="留空=auto"></div>
+        <div><label>每日用量预算（neurons，0=关闭）</label><input id="eBudget" type="number" min="0" value="${acc.daily_budget??0}"><div class="hint">仅适用于返回 usage.neurons 的上游。今日已用 ${esc(acc.budget_used_today??0)}；额度耗尽当天停用，次日恢复。</div></div>
         ${manifestEditor("eMf", mf)}
         <details open><summary>各池 RPM 覆盖（留空 = 按类型档位表）</summary>
           <div class="row" style="margin-top:8px">
@@ -623,7 +626,8 @@ function editAccountModal(acc){
         access_type:document.getElementById("eType").value, group:document.getElementById("eGroup").value,
         max_concurrency:Number(document.getElementById("eConc").value)||8,
         priority:Number(document.getElementById("ePriority").value)||0,
-        default_model:document.getElementById("eDefaultModel").value, model_manifest:manifest, rpm_overrides:rpmOv
+        default_model:document.getElementById("eDefaultModel").value, model_manifest:manifest, rpm_overrides:rpmOv,
+        daily_budget:Number(document.getElementById("eBudget").value),budget_unit:"neurons"
       };
       const k = document.getElementById("eKey").value.trim(); if(k!=="") body.api_key = k;
       await api("/api/accounts/"+id,{method:"PATCH",body:JSON.stringify(body)});
@@ -660,6 +664,7 @@ async function accountAction(act,id,on){
 
 /* ---------------- 密钥 ---------------- */
 function viewKeys(){
+  const apiBase=String((state.settings||{}).public_base_url||location.origin||"http://127.0.0.1:4142").replace(/\/+$/,"")+"/v1";
   const rows = (state.keys||[]).map(k=>`
     <tr>
       <td><b>${esc(k.name)}</b><div class="muted" style="font-size:11px">${esc(k.UsedDate||k.used_date||"")}</div></td>
@@ -681,7 +686,7 @@ function viewKeys(){
       <div style="flex:1"><label>总额度（0=不限）</label><input id="kTotal" type="number" value="0"></div>
       <div style="align-self:flex-end"><button class="primary" id="btnAddKey">签发</button></div>
     </div>
-    <div class="hint">客户端把 Base URL 指向 <span class="mono">http://127.0.0.1:4142/v1</span>，模型填 <span class="mono">auto</span>，Key 填这里签发的值。</div>
+    <div class="hint">客户端把 Base URL 指向 <span class="mono">${esc(apiBase)}</span>，模型填 <span class="mono">${esc((state.settings||{}).auto_model_name||"agnes-auto")}</span>，Key 填这里签发的值。</div>
   </div>
   <div class="card">
     <h2>密钥列表</h2>
@@ -988,7 +993,7 @@ function viewSettings(){
     </div>
     <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)">
       <label for="s_auto_scenario" style="display:flex;gap:8px;align-items:center;cursor:pointer">
-        <input type="checkbox" id="s_auto_scenario" style="flex:0 0 16px;width:16px;height:16px;margin:0;padding:0" ${state.scenarioData&&state.scenarioData.auto_scenario?"checked":""}>
+        <input type="checkbox" id="s_auto_scenario" style="flex:0 0 16px;width:16px;height:16px;margin:0;padding:0" ${s.auto_scenario?"checked":""}>
         <span>自动检测接入方负载 → 一键匹配推荐情景</span>
       </label>
       <div class="hint">后台每 30s 采一次负载画像（文/图/视频占比、流式比、并发、429 压力），自动切到最贴合的情景；手动应用情景会同时保留此开关。</div>
@@ -1053,7 +1058,11 @@ function viewSettings(){
       ${fld("s_imconc","图片并发上限", s.image_concurrency??4)}
       ${fld("s_vconc","视频在任务上限", s.video_max_inflight??2,"number","独立于 RPM 的任务级限制：只做 RPM 不做任务数会出现「RPM 没超但视频一直失败」")}
       ${fld("s_brev","熔断自动复活（秒）", s.breaker_revive_sec??1800,"number","401/403/402 熔断后到这个时间自动复活低速试探")}
-      ${fld("s_rqtimeout","请求超时（毫秒）", s.request_timeout_ms??30000,"number","单次上游请求最长等待时间，防 hang 死连接")}
+      ${fld("s_rqtimeout","请求超时（毫秒）", s.request_timeout_ms??30000,"number","限制响应头等待和非流式正文的空闲时间；持续有数据时不会截断。0 = 不限")}
+      ${fld("s_idle","流式空闲超时（毫秒）", s.stream_idle_timeout_ms??60000,"number","持续收到上游字节时不会中断；只限制无新内容的等待时间")}
+      ${fld("s_continue","截断续写次数", s.continuation_max_rounds??2,"number","0 = 关闭自动续写")}
+      ${fld("s_soft_retry","空回复重试次数", s.soft_fail_retry_max??2,"number","0 = 关闭内容软失败重试")}
+      <div><label>断流自动恢复</label><select id="s_resume"><option value="1" ${s.stream_auto_resume!==false?"selected":""}>开启</option><option value="0" ${s.stream_auto_resume===false?"selected":""}>关闭</option></select></div>
       ${fld("s_free_text_rpm","agnes 免费档文本 RPM", s.free_text_rpm??10,"number","agnes 免费账号文本池标称 RPM（已降至 10）；修改后立即生效。per-account 的 rpm_overrides 仍优先此值")}
     </div>
   </div>
@@ -1076,6 +1085,14 @@ function viewSettings(){
       ${fld("s_rmax","退避上限（毫秒）", s.retry_max_backoff_ms??8000)}
       ${fld("s_probe","探测模型", s.probe_model||"default-model","text","账号测试按钮用的最小文本模型")}
       ${fld("s_ttl","粘性绑定 TTL（小时）", s.session_ttl_hours??72)}
+      <div><label>账号预算优先级</label><select id="s_routing_mode">
+        <option value="rate_first" ${s.routing_mode!=="budget_first"&&s.routing_mode!=="balanced"?"selected":""}>速率型账号优先</option>
+        <option value="budget_first" ${s.routing_mode==="budget_first"?"selected":""}>每日用量型账号优先</option>
+        <option value="balanced" ${s.routing_mode==="balanced"?"selected":""}>按负载均衡</option>
+      </select></div>
+      <div><label>上游请求压缩</label><select id="s_gzip"><option value="1" ${s.upstream_request_gzip?"selected":""}>开启</option><option value="0" ${!s.upstream_request_gzip?"selected":""}>关闭</option></select><div class="hint">上游支持 gzip 时可减少上传带宽；不支持时请关闭。</div></div>
+      <div><label>Anthropic 提示词缓存</label><select id="s_prompt_cache"><option value="1" ${s.anthropic_prompt_cache?"selected":""}>开启</option><option value="0" ${!s.anthropic_prompt_cache?"selected":""}>关闭</option></select></div>
+      <div><label>去除客户端附加策略段</label><select id="s_strip_policy"><option value="1" ${s.strip_content_policy?"selected":""}>开启</option><option value="0" ${!s.strip_content_policy?"selected":""}>关闭（保持原文）</option></select></div>
     </div>
   </div>
   <div class="card">
@@ -1086,10 +1103,13 @@ function viewSettings(){
         <option value="concurrent_batch" ${s.optimization_mode==="concurrent_batch"?"selected":""}>并发批处理 (Concurrent Batch)</option>
         <option value="concurrent_parallel" ${s.optimization_mode==="concurrent_parallel"?"selected":""}>并发并行 (Concurrent Parallel)</option>
       </select><div class="hint">concurrent_batch: 多账号并发处理批次请求; concurrent_parallel: 完全并行处理</div></div>
-      ${fld("s_img_ret","图片记录保留天数", s.image_record_retention_days||30,"number","超过天数后自动清理历史记录")}
-      ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity||500,"number","超过后自动淘汰最旧记录；0 = 不限制")}
-      ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity||200,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+      ${fld("s_img_ret","图片记录保留天数", s.image_record_retention_days??30,"number","超过天数后自动清理历史记录；0 = 不限制")}
+      ${fld("s_img_cap","图库最大容量（条）", s.image_max_capacity??500,"number","超过后自动淘汰最旧记录；0 = 不限制")}
+      ${fld("s_vid_cap","视频库最大容量（条）", s.video_max_capacity??200,"number","超过后自动淘汰最旧记录；0 = 不限制")}
       ${fld("s_vid_mb","本地视频缓存上限（MB）", s.video_cache_max_mb??2048,"number","超出时淘汰最旧视频；0 = 不限制")}
+      ${fld("s_log_ret","用量日志保留天数", s.log_retention_days??30,"number","0 = 不按天数清理")}
+      ${fld("s_log_lines","日志最大行数", s.usage_log_max_lines??20000,"number","0 = 默认 20000，-1 = 不限")}
+      <div><label>捕获完整原始请求（RawCapture）</label><select id="s_capture"><option value="1" ${s.raw_capture_enabled?"selected":""}>开启</option><option value="0" ${!s.raw_capture_enabled?"selected":""}>关闭</option></select><div class="hint">排障用，将完整请求保存到本机数据目录，最多保留最近 100 条；关闭后不再新增捕获。</div></div>
     </div>
   </div>
   <div class="card">
@@ -1220,7 +1240,10 @@ function bindSettingsEvents(){
       video_cache_max_mb:Number(g("s_vid_mb")), public_base_url:g("s_baseurl").trim(),
       client_media_url:g("s_cmedia"),
       free_text_rpm:Number(g("s_free_text_rpm")),
-      scenario:g("s_scenario"),
+      stream_idle_timeout_ms:Number(g("s_idle")), continuation_max_rounds:Number(g("s_continue")),
+      soft_fail_retry_max:Number(g("s_soft_retry")), stream_auto_resume:g("s_resume")==="1",
+      routing_mode:g("s_routing_mode"),upstream_request_gzip:g("s_gzip")==="1",anthropic_prompt_cache:g("s_prompt_cache")==="1",strip_content_policy:g("s_strip_policy")==="1",
+      raw_capture_enabled:g("s_capture")==="1",log_retention_days:Number(g("s_log_ret")),usage_log_max_lines:Number(g("s_log_lines")),
       text_two_level_queue:document.getElementById("s_two_level")?document.getElementById("s_two_level").checked:false,
       auto_scenario:document.getElementById("s_auto_scenario")?document.getElementById("s_auto_scenario").checked:false,
       rate_limit_retry_max:Number(document.getElementById("s_rl_retry_max")?document.getElementById("s_rl_retry_max").value:0),
@@ -1681,6 +1704,8 @@ function bindAboutEvents(){
       <div class="kpi"><div class="k">最新版本</div><div class="v">${esc(last.latest_version || "—")}</div></div>
       <div class="kpi"><div class="k">更新状态</div><div class="v" style="font-size:15px">
         ${!canCheck ? '<span class="pill info">无法查询</span>'
+              : last.error ? '<span class="pill warn">查询失败</span>'
+              : !last.latest_version ? '<span class="pill info">尚未查询</span>'
               : avail ? '<span class="pill warn">有可用更新</span>'
                       : '<span class="pill ok">已是最新</span>'}</div></div>
       <div class="kpi"><div class="k">发布时间</div><div class="v" style="font-size:15px">${esc(last.release_date || "—")}</div></div>`;

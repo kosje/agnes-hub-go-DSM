@@ -108,6 +108,12 @@ func partialText(body []byte, format string) string {
 		if choices, ok := m["choices"].([]any); ok && len(choices) > 0 {
 			if c, ok := choices[0].(map[string]any); ok {
 				if msg, ok := c["message"].(map[string]any); ok {
+					if tools, ok := msg["tool_calls"].([]any); ok && len(tools) > 0 {
+						return ""
+					}
+					if msg["function_call"] != nil {
+						return ""
+					}
 					return anyContentToString(msg["content"])
 				}
 			}
@@ -115,12 +121,28 @@ func partialText(body []byte, format string) string {
 	case "gemini":
 		if cands, ok := m["candidates"].([]any); ok && len(cands) > 0 {
 			if c, ok := cands[0].(map[string]any); ok {
+				if content, ok := c["content"].(map[string]any); ok {
+					if parts, ok := content["parts"].([]any); ok {
+						for _, part := range parts {
+							if p, ok := part.(map[string]any); ok && p["functionCall"] != nil {
+								return ""
+							}
+						}
+					}
+				}
 				// Gemini content 形如 {"role":"model","parts":[{"text":...}]}，
 				// 与 OpenAI 的 string/blocks 不同形，必须用 geminiText 取。
 				return geminiText(c["content"])
 			}
 		}
 	case "anthropic":
+		if blocks, ok := m["content"].([]any); ok {
+			for _, block := range blocks {
+				if b, ok := block.(map[string]any); ok && (b["type"] == "tool_use" || b["type"] == "server_tool_use") {
+					return ""
+				}
+			}
+		}
 		return anyContentToString(m["content"])
 	}
 	return ""
@@ -137,6 +159,15 @@ func appendContinuationMessages(base []byte, partial string) []byte {
 	}
 	msgs, ok := req["messages"].([]any)
 	if !ok {
+		if contents, ok := req["contents"].([]any); ok {
+			req["contents"] = append(append([]any(nil), contents...),
+				map[string]any{"role": "model", "parts": []any{map[string]any{"text": partial}}},
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": continuationPrompt}}})
+			out, err := json.Marshal(req)
+			if err == nil {
+				return out
+			}
+		}
 		return base
 	}
 	next := make([]any, len(msgs), len(msgs)+2)
@@ -192,6 +223,11 @@ func mergeChatResponse(base []byte, cont []byte, format string) ([]byte, bool) {
 			return nil, false
 		}
 		bMsg["content"] = anyContentToString(bMsg["content"]) + anyContentToString(cMsg["content"])
+		for key, value := range cMsg {
+			if key != "content" && key != "role" {
+				bMsg[key] = value
+			}
+		}
 		if fr, ok := cm["finish_reason"]; ok {
 			bm["finish_reason"] = fr
 		}
@@ -214,7 +250,17 @@ func mergeChatResponse(base []byte, cont []byte, format string) ([]byte, bool) {
 		}
 		bm, _ := bc[0].(map[string]any)
 		cm, _ := cc[0].(map[string]any)
-		bm["content"] = anyContentToString(bm["content"]) + anyContentToString(cm["content"])
+		if bm == nil || cm == nil {
+			return nil, false
+		}
+		baseContent, ok1 := bm["content"].(map[string]any)
+		nextContent, ok2 := cm["content"].(map[string]any)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		baseParts, _ := baseContent["parts"].([]any)
+		nextParts, _ := nextContent["parts"].([]any)
+		baseContent["parts"] = append(baseParts, nextParts...)
 		if fr, ok := cm["finishReason"]; ok {
 			bm["finishReason"] = fr
 		}
@@ -239,6 +285,7 @@ func mergeChatResponse(base []byte, cont []byte, format string) ([]byte, bool) {
 		if sr, ok := c["stop_reason"]; ok {
 			b["stop_reason"] = sr
 		}
+		b["stop_sequence"] = c["stop_sequence"]
 		if bu, ok := b["usage"].(map[string]any); ok {
 			if cu, ok := c["usage"].(map[string]any); ok {
 				for _, k := range []string{"input_tokens", "output_tokens"} {
@@ -497,6 +544,9 @@ func (c *continuationStream) Read(p []byte) (int, error) {
 		// 最常见的表现。所以即便这一段是被错误中断的，也要合成一个 stop 帧。
 		var tail []byte
 		if c.f.sawOpenAI && !c.f.pass {
+			if c.f.upstreamErr || c.f.readErr != nil {
+				tail = append(tail, []byte("data: {\"error\":{\"message\":\"上游流式响应未完成，恢复预算已用尽\",\"type\":\"upstream_stream_error\"}}\n\n")...)
+			}
 			if len(c.f.finish) > 0 {
 				tail = append(tail, c.f.finish...)
 			} else {

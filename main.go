@@ -29,7 +29,7 @@ import (
 	"agneshub/internal/web"
 )
 
-var version = "1.0.32"
+var version = "1.0.33"
 
 // releaseRepo 是本项目的发布仓库（owner/name）：控制台「查看全部版本」跳转到这里，
 // 「最新版本」也从这里查。不能指向上游 —— 上游的 Release 里没有 SPK，版本号也对不上。
@@ -196,20 +196,15 @@ func main() {
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		// P1-2 优雅停机：先等在途（relay 层）请求排空再关 server，避免长视频任务 /
-		// 流式长回答被硬切。InflightTotal()==0 即排空；30s 宽限兜底（挂机的任务
-		// 不会因一次正常停机而白干，但也不会让进程永远退不出）。
-		deadline := time.Now().Add(30 * time.Second)
-		for h.InflightTotal() > 0 && time.Now().Before(deadline) {
-			log.Printf("优雅停机：等待 %d 个在途请求完成…", h.InflightTotal())
-			time.Sleep(500 * time.Millisecond)
-		}
-		if h.InflightTotal() > 0 {
-			log.Printf("优雅停机：30s 宽限到达仍有 %d 个在途请求，将随进程关闭（视频任务可通过 job_id 跨重启续查）", h.InflightTotal())
-		}
-		shutdownCtx, c := context.WithTimeout(context.Background(), 30*time.Second)
+		// Stop accepting first. Keep enough time to save state before the DSM
+		// lifecycle script's 15-second forced-stop deadline.
+		shutdownCtx, c := context.WithTimeout(context.Background(), 8*time.Second)
 		defer c()
-		_ = httpSrv.Shutdown(shutdownCtx)
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("请求收尾超时，取消剩余连接：%v", err)
+			_ = httpSrv.Close()
+		}
+		srv.WaitHandlers()
 	}()
 
 	var wg sync.WaitGroup

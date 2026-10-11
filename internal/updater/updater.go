@@ -105,10 +105,14 @@ func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 
 	release, err := u.fetchLatestRelease(ctx)
 	if err != nil {
-		return &CheckResult{
+		result := &CheckResult{
 			CurrentVersion: cur,
 			Error:          err.Error(),
-		}, nil
+		}
+		u.mu.Lock()
+		u.lastCheck = result
+		u.mu.Unlock()
+		return result, nil
 	}
 
 	tag := release.TagName

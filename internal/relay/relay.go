@@ -367,14 +367,16 @@ type Options struct {
 
 // Result 是一次转发的产物。
 type Result struct {
-	Status    int
-	Header    http.Header
-	Body      []byte
-	Stream    io.ReadCloser // 非 nil 表示上游仍在流式输出，调用方负责消费并关闭
-	Account   *config.Account
-	ModelUsed string
-	WaitMS    int64
-	Attempts  int
+	Status     int
+	Header     http.Header
+	Body       []byte
+	Stream     io.ReadCloser // 非 nil 表示上游仍在流式输出，调用方负责消费并关闭
+	Account    *config.Account
+	ModelUsed  string
+	WaitMS     int64
+	Attempts   int
+	ReadErr    error // A failed buffered read must never remain a successful response.
+	onBodyRead func([]byte)
 }
 
 // Close 释放流。
@@ -386,6 +388,8 @@ func (r *Result) Close() {
 }
 
 // ReadAll 读取完整响应体（用于非流式路径）。
+const maxBufferedResponse = 64 << 20
+
 func (r *Result) ReadAll() []byte {
 	if r == nil {
 		return []byte("{}")
@@ -396,11 +400,27 @@ func (r *Result) ReadAll() []byte {
 		}
 		return r.Body
 	}
-	raw, _ := io.ReadAll(r.Stream)
+	raw, err := io.ReadAll(io.LimitReader(r.Stream, maxBufferedResponse+1))
+	if len(raw) > maxBufferedResponse {
+		err = fmt.Errorf("上游缓冲响应超过 64 MiB 限制")
+	}
 	_ = r.Stream.Close()
 	r.Stream = nil
-	if len(raw) == 0 {
-		return []byte("{}")
+	if err != nil {
+		r.ReadErr = err
+		r.Status = http.StatusBadGateway
+		r.Header = http.Header{"Content-Type": {"application/json"}}
+		message := "上游响应未完整读取，请重试"
+		if len(raw) > maxBufferedResponse {
+			message = "上游缓冲响应超过 64 MiB，请启用流式输出"
+		}
+		r.Body = errorBody(message, "upstream_read_error")
+		return r.Body
+	}
+	r.Body = raw
+	if r.onBodyRead != nil {
+		r.onBodyRead(raw)
+		r.onBodyRead = nil
 	}
 	return raw
 }
@@ -460,7 +480,7 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 		exclude[id] = true
 	}
 	var totalWait int64
-	var rl429Used int    // 已用 429 内部重试次数
+	var rl429Used int     // 已用 429 内部重试次数
 	var rl429WaitMS int64 // 429 内部重试累计退避等待（ms），受预算约束
 	// softUsed：「HTTP 200 但内容不可用」的换号重发次数（空内容 / 内嵌 error /
 	// 非法 JSON / 审查类拒绝）。这类失败比错误码更隐蔽——客户端一收到就停，
@@ -520,7 +540,11 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 		h.Metrics.RequestsTotal.Add(1)
 		h.TrackInflight(account.ID, 1)
 		result, retry, err := attemptOnce(ctx, h, client, account, opts, body, modelUsed, totalWait, attempt+1)
-		h.TrackInflight(account.ID, -1)
+		if result != nil && result.Stream != nil {
+			result.Stream = &releaseOnClose{ReadCloser: result.Stream, release: func() { h.TrackInflight(account.ID, -1) }}
+		} else {
+			h.TrackInflight(account.ID, -1)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -552,9 +576,9 @@ func doOnce(ctx context.Context, h *hub.Hub, client *http.Client, opts Options) 
 						h.NoteError(account, "soft_fail: "+kind.String())
 						h.Metrics.RequestsError.Add(1)
 						h.Metrics.SoftFailRetries.Add(1)
-					exclude[account.ID] = true
-					lastFail = result
-					lastSoftKind = kind
+						exclude[account.ID] = true
+						lastFail = result
+						lastSoftKind = kind
 						// 退避按「软失败自身的轮次」计，不与 5xx 重试共用计数——
 						// 否则一次空内容会把后续延迟推到秒级，客户端白等。
 						sleepBackoff(ctx, s, softUsed-1)
@@ -649,9 +673,6 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	// 收到响应头之后，正文的生命周期交给调用方的 ctx（客户端断开即取消）。
 	s := h.Settings()
 	timeoutMS := s.RequestTimeoutMS
-	if timeoutMS <= 0 {
-		timeoutMS = 30000 // 默认 30s
-	}
 	idleMS := s.StreamIdleTimeoutMS
 	if idleMS <= 0 {
 		idleMS = 60000 // 默认 60s 空闲才断开
@@ -742,6 +763,9 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 		// 客户端已断开：不是上游的错，不记账号错误、不换号重试（旧实现会让后续
 		// 每次重试都在别的账号上白白占一个限流名额，并记一次假错误）。
 		<-sem
+		if wd != nil {
+			wd.stop()
+		}
 		cancel()
 		return nil, false, ctx.Err()
 	}
@@ -761,9 +785,13 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	}
 
 	status := resp.StatusCode
+	if wd == nil && timeoutMS > 0 {
+		wd = newStreamWatchdog(cancel, time.Duration(timeoutMS)*time.Millisecond)
+	}
 	if wd != nil {
 		// 响应头已到达：重置空闲计时，进入「流式体」阶段继续看门狗。
 		wd.arm()
+		resp.Body = &idleStreamBody{ReadCloser: resp.Body, wd: wd}
 	}
 
 	if status == 402 {
@@ -834,10 +862,8 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	// 连接已关闭 / context 已取消，会读到空体（表现为网关回 {}）。
 	// 直到调用方读完 body 触发 Close()，才在此 release 里 cancel()。
 	var streamBody io.ReadCloser = resp.Body
-	if opts.Stream {
-		// 流式：body 上套 idleStreamBody（读到字节就 wd.arm() 重置看门狗），
-		// 与前面 client.Do 阶段启动的看门狗衔接，连续 idleMS 无任何字节才断开。
-		streamBody = &idleStreamBody{ReadCloser: resp.Body, wd: wd}
+	if opts.Stream && account.DailyBudget > 0 && status < 400 {
+		streamBody = &budgetBody{ReadCloser: streamBody, charge: func(used float64) { h.ChargeBudget(account.ID, used) }}
 	}
 	wrapped := &releaseOnClose{ReadCloser: streamBody, release: func() {
 		cancel() // body 读取完毕后才取消 context
@@ -849,22 +875,27 @@ func attemptOnce(ctx context.Context, h *hub.Hub, client *http.Client, account *
 	return &Result{
 		Status: status, Header: SanitizeHeaders(resp.Header), Stream: wrapped,
 		Account: account, ModelUsed: modelUsed, WaitMS: totalWaitMS, Attempts: attemptNo,
+		onBodyRead: func(raw []byte) {
+			if !opts.Stream && status < 400 {
+				h.ChargeBudget(account.ID, responseNeurons(raw))
+			}
+		},
 	}, false, nil
 }
 
 type releaseOnClose struct {
 	io.ReadCloser
 	release func()
-	once    bool
+	once    sync.Once
+	err     error
 }
 
 func (s *releaseOnClose) Close() error {
-	err := s.ReadCloser.Close()
-	if !s.once {
-		s.once = true
+	s.once.Do(func() {
+		s.err = s.ReadCloser.Close()
 		s.release()
-	}
-	return err
+	})
+	return s.err
 }
 
 // describeUpstreamError 把网络错误归成给调用方看的类别。
@@ -1028,7 +1059,7 @@ func sleep429(ctx context.Context, h *hub.Hub, s config.Settings, poolClass stri
 		waitSec = 120 // 单次等待上限，防止 Retry-After 异常大值挂死
 	}
 	jitter := 0.85 + rand.Float64()*0.3
-	d := time.Duration(float64(waitSec) * jitter * 1000) * time.Millisecond
+	d := time.Duration(float64(waitSec)*jitter*1000) * time.Millisecond
 	if d <= 0 {
 		return 0
 	}
